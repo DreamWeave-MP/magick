@@ -627,54 +627,216 @@ function Image.trim(self: Image): Image
   return self:crop(right - left + 1, rows, left, top)
 end
 
-function Image:rotate90(clockwise)
-    local out=Magick.new(self.height,self.width)
-    for y=0,self.height-1 do for x=0,self.width-1 do local r,g,b,a=self:get(x,y); if clockwise then out:set(self.height-1-y,x,r,g,b,a) else out:set(y,self.width-1-x,r,g,b,a) end end end
-    return out
+--- A quarter turn, clockwise or counterclockwise.
+function Image.rotate90(self: Image, clockwise: boolean?): Image
+  local {width, height, data} = self
+  local out = Magick.new(height, width)
+
+  if width == 0 or height == 0 then return out end
+
+  -- A row becomes a column: its pixels are scattered down the output a row of the output apart,
+  -- in order when the turn is clockwise and from the bottom up when it is not.
+  local order, down = buffer.create(width * 4), `u32@{height * 4}`
+
+  into(order, 'u32')[for column in range(0, width - 1) => if clockwise then column else width - 1 - column]
+
+  for row = 0, height - 1 do
+    local to = if clockwise then height - 1 - row else row
+
+    dataPlane.scatter(data, down, row * width * 4, width, order, out.data, to * 4, width)
+  end
+
+  return out
 end
 
-function Image:resize(w,h,nearest)
-    local out=Magick.new(w,h)
-    if w==0 or h==0 or self.width==0 or self.height==0 then return out end
-    local sd=self.data; local dd=out.data; local sw=self.width; local sh=self.height
-    for y=0,h-1 do
-        local sy=(y+0.5)*sh/h-0.5
-        if nearest then
-            local iy=math.max(0,math.min(sh-1,math.floor(sy+0.5)))
-            for x=0,w-1 do
-                local sx=(x+0.5)*sw/w-0.5; local ix=math.max(0,math.min(sw-1,math.floor(sx+0.5)))
-                buffer.copy(dd,(y*w+x)*4,sd,(iy*sw+ix)*4,4)
-            end
-        else
-            local y0=math.floor(sy); local fy=sy-y0; if y0<0 then y0=0; fy=0 end; local y1=math.min(sh-1,y0+1)
-            for x=0,w-1 do
-                local sx=(x+0.5)*sw/w-0.5; local x0=math.floor(sx); local fx=sx-x0; if x0<0 then x0=0; fx=0 end; local x1=math.min(sw-1,x0+1)
-                local o00=(y0*sw+x0)*4; local o10=(y0*sw+x1)*4; local o01=(y1*sw+x0)*4; local o11=(y1*sw+x1)*4; local o=(y*w+x)*4
-                local v00=buffer.readu8(sd,o00); local v10=buffer.readu8(sd,o10); local v01=buffer.readu8(sd,o01); local v11=buffer.readu8(sd,o11); local a=v00+(v10-v00)*fx; local b=v01+(v11-v01)*fx; buffer.writeu8(dd,o,clamp8(a+(b-a)*fy))
-                v00=buffer.readu8(sd,o00+1); v10=buffer.readu8(sd,o10+1); v01=buffer.readu8(sd,o01+1); v11=buffer.readu8(sd,o11+1); a=v00+(v10-v00)*fx; b=v01+(v11-v01)*fx; buffer.writeu8(dd,o+1,clamp8(a+(b-a)*fy))
-                v00=buffer.readu8(sd,o00+2); v10=buffer.readu8(sd,o10+2); v01=buffer.readu8(sd,o01+2); v11=buffer.readu8(sd,o11+2); a=v00+(v10-v00)*fx; b=v01+(v11-v01)*fx; buffer.writeu8(dd,o+2,clamp8(a+(b-a)*fy))
-                v00=buffer.readu8(sd,o00+3); v10=buffer.readu8(sd,o10+3); v01=buffer.readu8(sd,o01+3); v11=buffer.readu8(sd,o11+3); a=v00+(v10-v00)*fx; b=v01+(v11-v01)*fx; buffer.writeu8(dd,o+3,clamp8(a+(b-a)*fy))
-            end
-        end
+--- A value between four corners: across the upper pair and the lower pair, then down between
+--- the two.
+local function between(
+  upperLeft: number,
+  upperRight: number,
+  lowerLeft: number,
+  lowerRight: number,
+  across: number,
+  down: number
+): number
+  local upper = upperLeft + (upperRight - upperLeft) * across
+  local lower = lowerLeft + (lowerRight - lowerLeft) * across
+
+  return upper + (lower - upper) * down
+end
+
+--- A copy of another size: each pixel is the nearest one of this image, or else the blend of the
+--- four around where its center falls.
+function Image.resize(self: Image, width: number, height: number, nearest: boolean?): Image
+  local out = Magick.new(width, height)
+  local {width: sourceWidth, height: sourceHeight, data: from} = self
+  local to = out.data
+
+  if width == 0 or height == 0 or sourceWidth == 0 or sourceHeight == 0 then return out end
+
+  if nearest then
+    local columns = buffer.create(width * 4)
+    local previous = -1
+
+    into(columns, 'u32')[
+      for column in range(0, width - 1)
+      => math.max(0, math.min(sourceWidth - 1, math.floor((column + 0.5) * sourceWidth / width - 0.5 + 0.5)))
+    ]
+
+    for row = 0, height - 1 do
+      local sourceRow = math.max(0, math.min(sourceHeight - 1, math.floor((row + 0.5) * sourceHeight / height - 0.5 + 0.5)))
+
+      if sourceRow == previous then
+        buffer.copy(to, row * width * 4, to, (row - 1) * width * 4, width * 4)
+      else
+        dataPlane.gather(from, 'u32', sourceRow * sourceWidth * 4, sourceWidth, columns, to, row * width * 4)
+        previous = sourceRow
+      end
     end
+
     return out
+  end
+
+  -- Where each column of the output falls is the same on every row: the byte offsets of the
+  -- pixels to its left and right within a row, and how far it is from the left one.
+  local lefts, rights, weights = buffer.create(width * 4), buffer.create(width * 4), buffer.create(width * 8)
+
+  for column = 0, width - 1 do
+    local center = (column + 0.5) * sourceWidth / width - 0.5
+    local left = math.floor(center)
+    local across = center - left
+
+    if left < 0 then
+      left, across = 0, 0
+    end
+
+    buffer.writeu32(lefts, column * 4, left * 4)
+    buffer.writeu32(rights, column * 4, math.min(sourceWidth - 1, left + 1) * 4)
+    buffer.writef64(weights, column * 8, across)
+  end
+
+  for row = 0, height - 1 do
+    local center = (row + 0.5) * sourceHeight / height - 0.5
+    local top = math.floor(center)
+    local down = center - top
+
+    if top < 0 then
+      top, down = 0, 0
+    end
+
+    local upper, lower = top * sourceWidth * 4, math.min(sourceHeight - 1, top + 1) * sourceWidth * 4
+    local offset = row * width * 4
+
+    for column = 0, width - 1 do
+      local left, right = buffer.readu32(lefts, column * 4), buffer.readu32(rights, column * 4)
+      local across = buffer.readf64(weights, column * 8)
+      local upperLeft, upperRight, lowerLeft, lowerRight = upper + left, upper + right, lower + left, lower + right
+      local red = clamp8(between(
+        buffer.readu8(from, upperLeft),
+        buffer.readu8(from, upperRight),
+        buffer.readu8(from, lowerLeft),
+        buffer.readu8(from, lowerRight),
+        across,
+        down
+      ))
+      local green = clamp8(between(
+        buffer.readu8(from, upperLeft + 1),
+        buffer.readu8(from, upperRight + 1),
+        buffer.readu8(from, lowerLeft + 1),
+        buffer.readu8(from, lowerRight + 1),
+        across,
+        down
+      ))
+      local blue = clamp8(between(
+        buffer.readu8(from, upperLeft + 2),
+        buffer.readu8(from, upperRight + 2),
+        buffer.readu8(from, lowerLeft + 2),
+        buffer.readu8(from, lowerRight + 2),
+        across,
+        down
+      ))
+      local alpha = clamp8(between(
+        buffer.readu8(from, upperLeft + 3),
+        buffer.readu8(from, upperRight + 3),
+        buffer.readu8(from, lowerLeft + 3),
+        buffer.readu8(from, lowerRight + 3),
+        across,
+        down
+      ))
+
+      buffer.writeu32(to, offset, red + green * 256 + blue * 65536 + alpha * 16777216)
+      offset += 4
+    end
+  end
+
+  return out
 end
 
-function Image:rotate(angleDegrees)
-    local rad=angleDegrees*math.pi/180; local ca=math.cos(rad); local sa=math.sin(rad)
-    local w,h=self.width,self.height
-    local nw=math.max(1,math.ceil(math.abs(w*ca)+math.abs(h*sa))+2); local nh=math.max(1,math.ceil(math.abs(w*sa)+math.abs(h*ca))+1)
-    local out=Magick.new(nw,nh); local cx=(w-1)/2; local cy=(h-1)/2; local ncx=(nw-1)/2; local ncy=(nh-1)/2
-    for y=0,nh-1 do for x=0,nw-1 do
-        local dx=x-ncx; local dy=y-ncy; local sx=ca*dx+sa*dy+cx; local sy=-sa*dx+ca*dy+cy
-        if sx>=0 and sy>=0 and sx<=w-1 and sy<=h-1 then
-            local x0=math.floor(sx); local y0=math.floor(sy); local x1=math.min(w-1,x0+1); local y1=math.min(h-1,y0+1); local fx=sx-x0; local fy=sy-y0
-            local r00,g00,b00,a00=self:get(x0,y0); local r10,g10,b10,a10=self:get(x1,y0); local r01,g01,b01,a01=self:get(x0,y1); local r11,g11,b11,a11=self:get(x1,y1)
-            local function mix(v00,v10,v01,v11) local a=v00+(v10-v00)*fx; local b=v01+(v11-v01)*fx; return a+(b-a)*fy end
-            out:set(x,y,mix(r00,r10,r01,r11),mix(g00,g10,g01,g11),mix(b00,b10,b01,b11),mix(a00,a10,a01,a11))
-        end
-    end end
-    return out
+--- A turn by any angle about the center, into an image large enough to hold it: each pixel is
+--- the blend of the four around where it came from, and clear where it came from outside.
+function Image.rotate(self: Image, angleDegrees: number): Image
+  local {width, height, data: from} = self
+  local angle = angleDegrees * math.pi / 180
+  local cosine, sine = math.cos(angle), math.sin(angle)
+  local outWidth = math.max(1, math.ceil(math.abs(width * cosine) + math.abs(height * sine)) + 2)
+  local outHeight = math.max(1, math.ceil(math.abs(width * sine) + math.abs(height * cosine)) + 1)
+  local out = Magick.new(outWidth, outHeight)
+  local centerX, centerY = (width - 1) / 2, (height - 1) / 2
+  local outCenterX, outCenterY = (outWidth - 1) / 2, (outHeight - 1) / 2
+  local to = out.data
+
+  for row = 0, outHeight - 1 do
+    local dy = row - outCenterY
+
+    for column = 0, outWidth - 1 do
+      local dx = column - outCenterX
+      local sourceX, sourceY = cosine * dx + sine * dy + centerX, -sine * dx + cosine * dy + centerY
+
+      if not (sourceX >= 0 and sourceY >= 0 and sourceX <= width - 1 and sourceY <= height - 1) then continue end
+
+      local left, top = math.floor(sourceX), math.floor(sourceY)
+      local across, down = sourceX - left, sourceY - top
+      local upper, lower = top * width * 4, math.min(height - 1, top + 1) * width * 4
+      local nearer, farther = left * 4, math.min(width - 1, left + 1) * 4
+      local upperLeft, upperRight, lowerLeft, lowerRight = upper + nearer, upper + farther, lower + nearer, lower + farther
+      local red = clamp8(between(
+        buffer.readu8(from, upperLeft),
+        buffer.readu8(from, upperRight),
+        buffer.readu8(from, lowerLeft),
+        buffer.readu8(from, lowerRight),
+        across,
+        down
+      ))
+      local green = clamp8(between(
+        buffer.readu8(from, upperLeft + 1),
+        buffer.readu8(from, upperRight + 1),
+        buffer.readu8(from, lowerLeft + 1),
+        buffer.readu8(from, lowerRight + 1),
+        across,
+        down
+      ))
+      local blue = clamp8(between(
+        buffer.readu8(from, upperLeft + 2),
+        buffer.readu8(from, upperRight + 2),
+        buffer.readu8(from, lowerLeft + 2),
+        buffer.readu8(from, lowerRight + 2),
+        across,
+        down
+      ))
+      local alpha = clamp8(between(
+        buffer.readu8(from, upperLeft + 3),
+        buffer.readu8(from, upperRight + 3),
+        buffer.readu8(from, lowerLeft + 3),
+        buffer.readu8(from, lowerRight + 3),
+        across,
+        down
+      ))
+
+      buffer.writeu32(to, (row * outWidth + column) * 4, red + green * 256 + blue * 65536 + alpha * 16777216)
+    end
+  end
+
+  return out
 end
 
 local function lcg(seed)
@@ -1198,8 +1360,12 @@ function Image.roundRect(
   return self
 end
 
-function Image:resizeFit(maxW,maxH,nearest)
-    local s=math.min(maxW/self.width,maxH/self.height); return self:resize(math.max(1,math.floor(self.width*s+0.5)),math.max(1,math.floor(self.height*s+0.5)),nearest)
+--- The image resized to fit inside a width and a height, keeping its shape.
+function Image.resizeFit(self: Image, maxWidth: number, maxHeight: number, nearest: boolean?): Image
+  local {width, height} = self
+  local scale = math.min(maxWidth / width, maxHeight / height)
+
+  return self:resize(math.max(1, math.floor(width * scale + 0.5)), math.max(1, math.floor(height * scale + 0.5)), nearest)
 end
 
 local function gaussianKernel(sigma)
