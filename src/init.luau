@@ -306,32 +306,77 @@ local function overPixel(dr,dg,db,da,sr,sg,sb,sa)
     return clamp8(r),clamp8(g),clamp8(b),clamp8(oa*255)
 end
 
-function Image:over(src,dx,dy)
-    dx=dx or 0; dy=dy or 0
-    local sx0=math.max(0,-dx); local sy0=math.max(0,-dy)
-    local sx1=math.min(src.width,self.width-dx); local sy1=math.min(src.height,self.height-dy)
-    if sx0>=sx1 or sy0>=sy1 then return self end
-    local sd=src.data; local dd=self.data; local sw=src.width; local dw=self.width
-    for sy=sy0,sy1-1 do
-        local so=(sy*sw+sx0)*4; local doff=((sy+dy)*dw+(sx0+dx))*4
-        for _=sx0,sx1-1 do
-            local sp=buffer.readu32(sd,so); local sa=bit32.rshift(sp,24)
-            if sa==255 then
-                buffer.writeu32(dd,doff,sp)
-            elseif sa~=0 then
-                local dp=buffer.readu32(dd,doff); local da=bit32.rshift(dp,24)
-                local sr=bit32.band(sp,255); local sg=bit32.band(bit32.rshift(sp,8),255); local sb=bit32.band(bit32.rshift(sp,16),255)
-                local dr=bit32.band(dp,255); local dg=bit32.band(bit32.rshift(dp,8),255); local db=bit32.band(bit32.rshift(dp,16),255)
-                local af=sa/255; local daf=da/255; local oa=af+daf*(1-af)
-                if oa>0 then
-                    local rr=clamp8((sr*af+dr*daf*(1-af))/oa); local gg=clamp8((sg*af+dg*daf*(1-af))/oa); local bb=clamp8((sb*af+db*daf*(1-af))/oa); local aa=clamp8(oa*255)
-                    buffer.writeu32(dd,doff,rr+gg*256+bb*65536+aa*16777216)
-                end
-            end
-            so+=4; doff+=4
-        end
+--- The least pixel that is opaque and the least that is not clear, as numbers: alpha is a pixel's
+--- high byte.
+local Opaque, Faint = 0xff000000, 0x01000000
+
+--- Composites the pixels `first..last` of a run over what is there, one at a time: a pixel is
+--- read after the one before it is written, which an image laid over itself depends on.
+local function blend(from: buffer, sourceAt: number, to: buffer, at: number, first: number, last: number)
+  for _ = first, last do
+    local pixel = buffer.readu32(from, sourceAt)
+    local alpha = bit32.rshift(pixel, 24)
+
+    if alpha == 255 then
+      buffer.writeu32(to, at, pixel)
+    elseif alpha ~= 0 then
+      local under = buffer.readu32(to, at)
+      local red, green, blue =
+        bit32.band(pixel, 255), bit32.band(bit32.rshift(pixel, 8), 255), bit32.band(bit32.rshift(pixel, 16), 255)
+      local underRed, underGreen, underBlue =
+        bit32.band(under, 255), bit32.band(bit32.rshift(under, 8), 255), bit32.band(bit32.rshift(under, 16), 255)
+      local opacity, underOpacity = alpha / 255, bit32.rshift(under, 24) / 255
+      local covered = opacity + underOpacity * (1 - opacity)
+
+      if covered > 0 then
+        local outRed = clamp8((red * opacity + underRed * underOpacity * (1 - opacity)) / covered)
+        local outGreen = clamp8((green * opacity + underGreen * underOpacity * (1 - opacity)) / covered)
+        local outBlue = clamp8((blue * opacity + underBlue * underOpacity * (1 - opacity)) / covered)
+
+        buffer.writeu32(to, at, outRed + outGreen * 256 + outBlue * 65536 + clamp8(covered * 255) * 16777216)
+      end
     end
-    return self
+
+    sourceAt += 4
+    at += 4
+  end
+end
+
+--- Composites `source` over the image, its top left corner at an offset from the image's.
+function Image.over(self: Image, source: Image, dx: number?, dy: number?): Image
+  local across, down = dx or 0, dy or 0
+  local left, top = math.max(0, -across), math.max(0, -down)
+  local right, bottom = math.min(source.width, self.width - across), math.min(source.height, self.height - down)
+
+  if left >= right or top >= bottom then return self end
+
+  local from, to = source.data, self.data
+  local sourceWidth, width = source.width, self.width
+  -- A row is tested and copied whole only between two buffers and at a whole offset: an image
+  -- laid over itself is composited pixel by pixel.
+  local wholeRows = from ~= to and across % 1 == 0 and down % 1 == 0
+
+  for row = top, bottom - 1 do
+    local sourceAt = (row * sourceWidth + left) * 4
+    local at = ((row + down) * width + (left + across)) * 4
+
+    if wholeRows then
+      -- The first pixel says which of the two a row can still be, so a mixed row costs one look.
+      local lead = buffer.readu32(from, sourceAt)
+      local first, last = row * sourceWidth + left + 1, row * sourceWidth + right
+
+      if lead >= Opaque and all[for pixel in from[first:last, 'u32'] => pixel >= Opaque] then
+        buffer.copy(to, at, from, sourceAt, (right - left) * 4)
+        continue
+      end
+
+      if lead < Faint and not any[for pixel in from[first:last, 'u32'] => pixel >= Faint] then continue end
+    end
+
+    blend(from, sourceAt, to, at, left, right - 1)
+  end
+
+  return self
 end
 
 function Image:overMask(mask,color,dx,dy)
@@ -400,11 +445,9 @@ function Image:crop(w,h,x,y)
     return out
 end
 
-function Image:extent(w,h,x,y,background)
-    x=x or 0; y=y or 0
-    local out=Magick.new(w,h,background)
-    out:over(self,x,y)
-    return out
+--- A new image of a size, filled with a background, with this one laid over it at an offset.
+function Image.extent(self: Image, width: number, height: number, dx: number?, dy: number?, background: Color?): Image
+  return Magick.new(width, height, background):over(self, dx or 0, dy or 0)
 end
 
 function Image:trim()
@@ -1015,10 +1058,20 @@ function Magick.shadowed(img,opacity,sigma,dx,dy)
     return out
 end
 
-function Magick.montage(images,cols,rows)
-    assert(#images>0,"magick: montage requires images"); cols=cols or #images; rows=rows or math.ceil(#images/cols); local tw=images[1].width; local th=images[1].height; local out=Magick.new(tw*cols,th*rows)
-    for i,img in images do out:over(img,((i-1)%cols)*tw,math.floor((i-1)/cols)*th) end
-    return out
+--- Lays images out in a grid of cells the size of the first, left to right and then down.
+function Magick.montage(images: { Image }, columns: number?, rows: number?): Image
+  assert(#images > 0, 'magick: montage requires images')
+
+  local across = columns or #images
+  local down = rows or math.ceil(#images / across)
+  local {width, height} = images[1]
+  local out = Magick.new(width * across, height * down)
+
+  for index, image in images do
+    out:over(image, (index - 1) % across * width, math.floor((index - 1) / across) * height)
+  end
+
+  return out
 end
 
 Magick.Image = Image
