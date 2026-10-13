@@ -330,6 +330,20 @@ suite.describe('compositing', function()
     pin('overMask wide', pixels(noisy(40, 6, 33):overMask(coverage(37, 5, 34), '#fedcba', 1, 0)))
   end)
 
+  suite.it('paints through a mask in one alpha after another as in each alone', function()
+    local mask = coverage(13, 9, 31)
+    local colors: { magick.Color } = { '#f0e0c090', '#f0e0c0', '#10203040', '#f0e0c090', { 1, 2, 3, 300 }, '#f0e0c0' }
+    local alone = { 'soft', 'opaque', 'faint', 'soft', 'beyond a byte', 'opaque' }
+
+    for index, color in colors do
+      local painted = pixels(noisy(16, 12, 32):overMask(mask, color, 1, 1))
+
+      if index <= 3 or index == 5 then pin(`overMask alone {alone[index]}`, painted) end
+
+      expect(painted).toBe(goldens.basic[`overMask alone {alone[index]}`])
+    end
+  end)
+
   suite.it('composites alpha from another image', function()
     for _, mode in { 'dstin', 'dstout', 'copy' } do
       local image = noisy(9, 7, 41)

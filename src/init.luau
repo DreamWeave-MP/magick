@@ -517,6 +517,24 @@ function Image.over(self: Image, source: Image, dx: number?, dy: number?): Image
   return self
 end
 
+--- The alpha each byte of coverage composites at under a color's alpha, as numbers: they are not
+--- stored. The table is kept from one call to the next and filled again only for another alpha,
+--- so glyphs set one after another in a color fill it once between them.
+local Strengths = buffer.create(256 * 8)
+local strengthsScale: number? = nil
+
+local function strengthsFor(alphaScale: number): buffer
+  if alphaScale ~= strengthsScale then
+    for value = 0, 255 do
+      buffer.writef64(Strengths, value * 8, clamp8(value * alphaScale))
+    end
+
+    strengthsScale = alphaScale
+  end
+
+  return Strengths
+end
+
 --- Composites a color through a mask laid at an offset: each byte of coverage, scaled by the
 --- color's alpha, is the alpha the color goes over the pixel at.
 function Image.overMask(self: Image, mask: Mask, color: Color?, dx: number?, dy: number?): Image
@@ -532,10 +550,7 @@ function Image.overMask(self: Image, mask: Mask, color: Color?, dx: number?, dy:
   local red, green, blue = channels[1], channels[2], channels[3]
   local opaqueColor, alphaScale = channels[4] == 255, channels[4] / 255
   local solid = red + green * 256 + blue * 65536 + 0xff000000
-  -- The alpha each byte of coverage composites at, as a number: it is not stored.
-  local strengths = buffer.create(256 * 8)
-
-  into(strengths, 'f64')[for value in range(0, 255) => if opaqueColor then value else clamp8(value * alphaScale)]
+  local strengths = strengthsFor(alphaScale)
 
   for row = top, bottom - 1 do
     local column, from = left, row * maskWidth + left
