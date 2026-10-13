@@ -1,7 +1,8 @@
 --!strict
 --!native
 -- @magick, timed from Luau through its public API: drawing, compositing, geometry, masks, tone,
--- generators and codecs, on images the size of a UI texture or a page's picture. Run by
+-- generators and codecs, on images the size of a UI texture or a page's picture, and a few of
+-- them again on a glyph, an icon and a border. Run by
 -- `jess run --package . bench/bench.luau [filter] [record]`, on a release build. Prints one line
 -- per workload: its name, a tab, and the seconds one call takes. Every workload's result is held
 -- to the fingerprint the package gave as imported, so a path that stopped doing the work, or does
@@ -91,6 +92,16 @@ local Expected: { [string]: string } = {
   ['gaussianBlur 1.5'] = '256x256:bdd00bd7',
   ['gaussianBlur 12'] = '256x256:3b250ea3',
   ['shadowed'] = '276x276:a577571b',
+  ['overMask glyphs'] = '64x64:9dca7fd2',
+  ['overMask soft glyphs'] = '64x64:396b78a8',
+  ['maskToImage glyph'] = '12x16:27c2543a',
+  ['paintMask glyph'] = '12x16:6ab649b1',
+  ['threshold icon'] = '16x16:f8b9904c',
+  ['colorize icon'] = '16x16:0c42a5f2',
+  ['polynomial icon'] = '16x16:7a006ab9',
+  ['strokeRect border'] = '64x64:2fa2ea62',
+  ['rect columns'] = '64x64:2019bb38',
+  ['verticalGradient icon'] = '16x16:d9d9f2a2',
   ['png'] = '241249:fa4c204e',
   ['png stored'] = '262508:7b4259c6',
   ['readPNG unfiltered'] = '256x256:8ee9af74',
@@ -388,6 +399,55 @@ workload('verticalGradient', function() return magick.verticalGradient(Large, La
 workload('gaussianBlur 1.5', function() return magick.gaussianBlur(half, 1.5) end)
 workload('gaussianBlur 12', function() return magick.gaussianBlur(half, 12) end)
 workload('shadowed', function() return magick.shadowed(halfCutout, 40, 5, 5, 7) end)
+
+-- Small images: glyphs, an icon and a border one pixel wide, where what an operation sets up
+-- before its first pixel is most of what it costs.
+local Icon, Panel = 16, 64
+local icon, panel = picture(Icon, Icon, 13), picture(Panel, Panel, 14)
+local glyph = coverage(12, 16, 15)
+local iconWork, panelWork = magick.new(Icon, Icon), magick.new(Panel, Panel)
+
+local function freshIcon(): Image
+  buffer.copy(iconWork.data, 0, icon.data, 0)
+
+  return iconWork
+end
+
+local function freshPanel(): Image
+  buffer.copy(panelWork.data, 0, panel.data, 0)
+
+  return panelWork
+end
+
+--- Sixteen glyphs set in four lines on the panel, in a color.
+local function typeset(color: string): Image
+  local image = freshPanel()
+
+  for index = 0, 15 do
+    image:overMask(glyph, color, index % 4 * 13, index // 4 * 16)
+  end
+
+  return image
+end
+
+workload('overMask glyphs', function() return typeset '#f0e0c0' end)
+workload('overMask soft glyphs', function() return typeset '#f0e0c090' end)
+workload('maskToImage glyph', function() return magick.maskToImage(glyph, '#f0e0c090') end)
+workload('paintMask glyph', function() return magick.paintMask(glyph, '#f0e0c090') end)
+workload('threshold icon', function() return freshIcon():threshold(0.5) end)
+workload('colorize icon', function() return freshIcon():colorize('#336699', 40) end)
+workload('polynomial icon', function() return freshIcon():polynomial(1.5, -0.2) end)
+workload('strokeRect border', function() return freshPanel():strokeRect(2, 2, 61, 61, '#ffffff', 1) end)
+workload('rect columns', function()
+  local image = freshPanel()
+
+  for column = 4, 60, 8 do
+    image:rect(column, 0, column + 2, Panel - 1, '#c0803080')
+  end
+
+  return image
+end)
+workload('verticalGradient icon', function() return magick.verticalGradient(Icon, Icon, '#f5f5f5', '#5c5c5c') end)
 
 -- Codecs. A decoder is given the filters and layouts other encoders write, not only this one's.
 local Signature = '\137PNG\r\n\26\n'
