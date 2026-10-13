@@ -1,0 +1,465 @@
+--!strict
+--!native
+-- @magick, timed from Luau through its public API: drawing, compositing, geometry, masks, tone,
+-- generators and codecs, on images the size of a UI texture or a page's picture. Run by
+-- `jess run --package . bench/bench.luau [filter] [record]`, on a release build. Prints one line
+-- per workload: its name, a tab, and the seconds one call takes. Every workload's result is held
+-- to the fingerprint the package gave as imported, so a path that stopped doing the work, or does
+-- other work, fails here instead of posting a time. With `record` the fingerprints are printed as
+-- lines of the table below instead of being checked.
+local bytes = require '@dream/bytes'
+local magick = require '@magick'
+
+-- A build without the verified toolchain runs Luau slower than a release does, so a number from
+-- one says nothing about what ships.
+if not jess.bench.verified then
+  error('magick bench: this jess was built without the verified toolchain: measure on a release build', 0)
+end
+
+type Image = typeof(magick.new(1, 1))
+type Mask = typeof(magick.mask(1, 1, buffer.create(1)))
+type Result = Image | Mask | buffer | number
+
+local filter: string?, mode: string? = ...
+local only = if filter and filter ~= '' then filter else nil
+local recording = mode == 'record'
+
+--- What each workload returns: the geometry of an image and the CRC-32 of its bytes, the length
+--- of a file and its CRC-32, or a number.
+local Expected: { [string]: string } = {
+  ['new filled'] = '512x512:4765911f',
+  ['fill'] = '512x512:4765911f',
+  ['rect color'] = '512x512:44f63c3e',
+  ['rect tiled'] = '512x512:79da90f2',
+  ['tile'] = '512x512:0e7344b5',
+  ['polygon'] = '256x256:d1579c38',
+  ['polygon tiled'] = '256x256:76f75009',
+  ['polygonOver'] = '256x256:b330b7ba',
+  ['circle'] = '256x256:cf24138f',
+  ['rectOver color'] = '256x256:21617866',
+  ['rectOver tiled'] = '256x256:10c57edb',
+  ['roundRect'] = '256x256:bd68e4f4',
+  ['line and strokeRect'] = '256x256:f6336d57',
+  ['get and set every pixel'] = '256x256:2beccfbe',
+  ['over opaque'] = '512x512:f9335681',
+  ['over sprite'] = '512x512:7c154eba',
+  ['over soft'] = '512x512:c17250ac',
+  ['over offset'] = '512x512:d263bbb8',
+  ['overMask opaque color'] = '512x512:8983ba23',
+  ['overMask soft color'] = '512x512:bb1ad6b0',
+  ['copyAlpha dstin'] = '256x256:b2772ea5',
+  ['copyAlpha copy'] = '256x256:c39c4384',
+  ['darken'] = '256x256:fb5d5cae',
+  ['mathCompose'] = '256x256:91fc801a',
+  ['extent'] = '600x600:cc464061',
+  ['montage'] = '256x256:65a8208a',
+  ['clone'] = '512x512:94045468',
+  ['crop'] = '300x300:0246691e',
+  ['trim'] = '384x384:af9e1f06',
+  ['rotate90'] = '512x512:e8e6bcde',
+  ['rotate'] = '280x279:775b92e4',
+  ['resize nearest'] = '300x300:bcca1828',
+  ['resize down'] = '300x300:0eaf3dc3',
+  ['resize up'] = '512x512:f00c7903',
+  ['roll'] = '512x512:6f521340',
+  ['alphaMask'] = '512x512:5eb31990',
+  ['maskToImage'] = '512x512:1dcddd50',
+  ['paintMask color'] = '256x256:066c89de',
+  ['paintMask tiled'] = '256x256:51d4b836',
+  ['dilateMask 1'] = '256x256:83cd945a',
+  ['dilateMask 3'] = '256x256:4ada6669',
+  ['blurMask'] = '512x512:4a3abdb2',
+  ['subtractMask'] = '256x256:38cc6865',
+  ['modulate'] = '256x256:1a20200f',
+  ['emboss'] = '256x256:c75b563a',
+  ['tint'] = '256x256:8253f795',
+  ['grayscale'] = '512x512:cd40a79d',
+  ['threshold'] = '512x512:cf149157',
+  ['colorize'] = '512x512:543b55c7',
+  ['transparent'] = '512x512:b5ffbc01',
+  ['opaque'] = '512x512:f2a90723',
+  ['setAlpha'] = '512x512:69c595e6',
+  ['polynomial'] = '512x512:6b7cb51c',
+  ['contrastStretch'] = '256x256:250b0989',
+  ['sigmoidalContrast'] = '256x256:0bffdeeb',
+  ['median'] = '114',
+  ['stats'] = '197489.71913146973',
+  ['noise'] = '256x256:43717d3d',
+  ['randomNoise'] = '256x256:5365d7c3',
+  ['addGaussianNoise'] = '256x256:fa9fdde0',
+  ['verticalGradient'] = '512x512:5479046b',
+  ['gaussianBlur 1.5'] = '256x256:bdd00bd7',
+  ['gaussianBlur 12'] = '256x256:3b250ea3',
+  ['shadowed'] = '276x276:a577571b',
+  ['png'] = '241249:fa4c204e',
+  ['png stored'] = '262508:7b4259c6',
+  ['readPNG unfiltered'] = '256x256:8ee9af74',
+  ['readPNG filtered rgba'] = '256x256:3a71ef5e',
+  ['readPNG filtered rgb'] = '256x256:6271879a',
+  ['readPNG filtered gray'] = '256x256:98b72e9a',
+  ['dds'] = '1048704:3cb9c134',
+  ['readDDS'] = '512x512:94045468',
+  ['readBMP'] = '512x512:bb8eb2dd',
+  ['readTGA'] = '512x512:954a715a',
+  ['readTGA packets'] = '512x512:0d9557be',
+}
+
+local function fingerprint(result: Result): string
+  if type(result) == 'number' then return tostring(result) end
+
+  if type(result) == 'buffer' then
+    return `{buffer.len(result)}:{string.format('%08x', bytes.crc32(result))}`
+  end
+
+  return `{result.width}x{result.height}:{string.format('%08x', bytes.crc32(result.data))}`
+end
+
+local function median(samples: { number }): number
+  table.sort(samples)
+
+  return samples[(#samples + 1) // 2]
+end
+
+--- Seconds per call of `body`: warmed up, then the median of seven batches of a size that takes
+--- about a tenth of a second, with a full collection before each so one batch's garbage is not
+--- the next one's pause. `verify` is given the result of the first call and of one more after the
+--- last batch, outside the time.
+local function measure(body: () -> Result, verify: (result: Result) -> ()): number
+  jess.bench.collect()
+  verify(body())
+
+  local start = os.clock()
+  body()
+
+  local once = math.max(os.clock() - start, 1e-7)
+  local iterations = math.max(1, math.floor(0.1 / once))
+  local samples: { number } = {}
+
+  for batch = 1, 7 do
+    jess.bench.collect()
+    start = os.clock()
+
+    for _ = 1, iterations do
+      body()
+    end
+
+    samples[batch] = (os.clock() - start) / iterations
+  end
+
+  verify(body())
+
+  return median(samples)
+end
+
+local function workload(name: string, body: () -> Result)
+  if only and not string.find(name, only, 1, true) then return end
+
+  local function verify(result: Result)
+    local observed = fingerprint(result)
+
+    if recording then
+      if Expected[name] ~= observed then
+        Expected[name] = observed
+        print(`  ['{name}'] = '{observed}',`)
+      end
+
+      return
+    end
+
+    if Expected[name] ~= observed then
+      error(`magick bench: {name} gave {observed}, not {Expected[name]}`, 0)
+    end
+  end
+
+  local seconds = measure(body, verify)
+
+  if not recording then print(`{name}\t{string.format('%.9f', seconds)}`) end
+end
+
+--- A xorshift32 generator: `random(bound)` is in `0..bound-1`.
+local function generator(seed: number): (bound: number) -> number
+  local state = seed
+
+  return function(bound: number): number
+    state = bit32.bxor(state, bit32.lshift(state, 13))
+    state = bit32.bxor(state, bit32.rshift(state, 17))
+    state = bit32.bxor(state, bit32.lshift(state, 5))
+
+    return state % bound
+  end
+end
+
+local function noise(length: number, seed: number): buffer
+  local random = generator(seed)
+  local out = buffer.create(length)
+
+  for offset = 0, length - 1 do
+    buffer.writeu8(out, offset, random(256))
+  end
+
+  return out
+end
+
+--- A picture: smooth color with grain, as a photograph or a painted texture has, a quarter of
+--- it clear, a quarter opaque and the rest of any alpha.
+local function picture(width: number, height: number, seed: number): Image
+  local random = generator(seed)
+  local pixels = buffer.create(width * height * 4)
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      local offset = (row * width + column) * 4
+      local kind = random(4)
+
+      buffer.writeu8(pixels, offset, (column * 255 // width + random(24)) % 256)
+      buffer.writeu8(pixels, offset + 1, (row * 255 // height + random(24)) % 256)
+      buffer.writeu8(pixels, offset + 2, ((column + row) * 127 // (width + height) + random(48)) % 256)
+      buffer.writeu8(pixels, offset + 3, if kind == 0 then 0 elseif kind == 1 then 255 else random(256))
+    end
+  end
+
+  return magick.fromRGBA(width, height, pixels)
+end
+
+--- A sprite: a clear margin an eighth of the image wide, a soft band, and an opaque body.
+local function sprite(width: number, height: number, seed: number): Image
+  local image = picture(width, height, seed)
+  local margin = math.min(width, height) // 8
+  local pixels = image.data
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      local edge = math.min(column, row, width - 1 - column, height - 1 - row)
+      local alpha = if edge < margin then 0 elseif edge < margin + 6 then (edge - margin + 1) * 36 else 255
+
+      buffer.writeu8(pixels, (row * width + column) * 4 + 3, alpha)
+    end
+  end
+
+  return image
+end
+
+--- A coverage mask as rasterized text has: runs of clear and of full bytes with soft edges.
+local function coverage(width: number, height: number, seed: number): Mask
+  local random = generator(seed)
+  local count = width * height
+  local covered = buffer.create(count)
+  local offset = 0
+
+  while offset < count do
+    local kind = random(4)
+
+    for _ = 1, math.min(1 + random(if kind == 3 then 3 else 24), count - offset) do
+      buffer.writeu8(covered, offset, if kind < 2 then 0 elseif kind == 2 then 255 else random(256))
+      offset += 1
+    end
+  end
+
+  return magick.mask(width, height, covered)
+end
+
+local Large, Medium, Small = 512, 256, 64
+
+local photo, other = picture(Large, Large, 1), picture(Large, Large, 2)
+local solid = picture(Large, Large, 3):setAlpha(255)
+local cutout = sprite(Large, Large, 4)
+local keyed = picture(Large, Large, 12):setAlpha(255):rect(96, 96, 415, 415, '#0a141e')
+local half, halfOther = picture(Medium, Medium, 5), picture(Medium, Medium, 6)
+local halfCutout = sprite(Medium, Medium, 7)
+local tile = picture(Small, Small, 8):setAlpha(255)
+local text, halfText, halfOtherText = coverage(Large, Large, 9), coverage(Medium, Medium, 10), coverage(Medium, Medium, 11)
+local work, halfWork = magick.new(Large, Large), magick.new(Medium, Medium)
+
+--- The large scratch image, holding a copy of `source`'s pixels: what an operation that changes
+--- its image in place is given, so every call starts from the same pixels and allocates nothing.
+local function fresh(source: Image): Image
+  buffer.copy(work.data, 0, source.data, 0)
+
+  return work
+end
+
+local function freshHalf(source: Image): Image
+  buffer.copy(halfWork.data, 0, source.data, 0)
+
+  return halfWork
+end
+
+local Pentagon = { { 128, 10 }, { 246, 96 }, { 200, 240 }, { 56, 240 }, { 10, 96 } }
+
+-- Drawing.
+workload('new filled', function() return magick.new(Large, Large, '#336699cc') end)
+workload('fill', function() return fresh(photo):fill '#336699cc' end)
+workload('rect color', function() return fresh(photo):rect(40, 56, 471, 455, '#c0803080') end)
+workload('rect tiled', function() return fresh(photo):rect(40, 56, 471, 455, tile) end)
+workload('tile', function() return magick.tile(Large, Large, tile) end)
+workload('polygon', function() return freshHalf(half):polygon(Pentagon, '#c08030') end)
+workload('polygon tiled', function() return freshHalf(half):polygon(Pentagon, tile) end)
+workload('polygonOver', function() return freshHalf(half):polygonOver(Pentagon, '#c0803080') end)
+workload('circle', function() return freshHalf(half):circle(128, 128, 110, 90, '#c08030') end)
+workload('rectOver color', function() return freshHalf(half):rectOver(20, 28, 235, 227, '#c0803080') end)
+workload('rectOver tiled', function() return freshHalf(half):rectOver(20, 28, 235, 227, tile) end)
+workload('roundRect', function() return freshHalf(half):roundRect(16, 16, 239, 239, 24, '#c08030') end)
+workload('line and strokeRect', function()
+  local image = freshHalf(half)
+
+  image:line(8, 8, 247, 200, '#ffffff', 3)
+
+  return image:strokeRect(4, 4, 251, 251, tile, 4)
+end)
+
+workload('get and set every pixel', function()
+  local image = freshHalf(half)
+
+  for row = 0, Medium - 1 do
+    for column = 0, Medium - 1 do
+      local red, green, blue, alpha = image:get(column, row)
+
+      image:set(column, row, blue, red, green, alpha / 2)
+    end
+  end
+
+  return image
+end)
+
+-- Compositing.
+workload('over opaque', function() return fresh(photo):over(solid) end)
+workload('over sprite', function() return fresh(photo):over(cutout) end)
+workload('over soft', function() return fresh(photo):over(other) end)
+workload('over offset', function() return fresh(photo):over(other, -100, 37) end)
+workload('overMask opaque color', function() return fresh(solid):overMask(text, '#f0e0c0') end)
+workload('overMask soft color', function() return fresh(photo):overMask(text, '#f0e0c090') end)
+workload('copyAlpha dstin', function() return freshHalf(half):copyAlpha(halfOther, 'dstin') end)
+workload('copyAlpha copy', function() return freshHalf(half):copyAlpha(halfOther, 'copy') end)
+workload('darken', function() return freshHalf(half):darken(halfOther, 3, 5) end)
+workload('mathCompose', function() return magick.mathCompose(half, halfOther, 0, 1, -1, 0.5) end)
+workload('extent', function() return photo:extent(600, 600, 44, 44, '#102030') end)
+workload('montage', function()
+  local tiles = table.create(16, tile)
+
+  return magick.montage(tiles, 4)
+end)
+
+-- Geometry.
+workload('clone', function() return photo:clone() end)
+workload('crop', function() return photo:crop(300, 300, 100, 100) end)
+workload('trim', function() return cutout:trim() end)
+workload('rotate90', function() return photo:rotate90(true) end)
+workload('rotate', function() return half:rotate(-5) end)
+workload('resize nearest', function() return photo:resize(300, 300, true) end)
+workload('resize down', function() return photo:resize(300, 300) end)
+workload('resize up', function() return half:resize(Large, Large) end)
+workload('roll', function() return photo:roll(100, -37) end)
+
+-- Masks.
+workload('alphaMask', function() return photo:alphaMask() end)
+workload('maskToImage', function() return magick.maskToImage(text, '#f0e0c090') end)
+workload('paintMask color', function() return magick.paintMask(halfText, '#f0e0c090') end)
+workload('paintMask tiled', function() return magick.paintMask(halfText, tile) end)
+workload('dilateMask 1', function() return magick.dilateMask(halfText, 1) end)
+workload('dilateMask 3', function() return magick.dilateMask(halfText, 3) end)
+workload('blurMask', function() return magick.blurMask(text, 4) end)
+workload('subtractMask', function() return magick.subtractMask(halfText, halfOtherText) end)
+
+-- Tone.
+workload('modulate', function() return magick.modulate(freshHalf(half), 150, 60) end)
+workload('emboss', function() return magick.emboss(freshHalf(half), 1.5) end)
+workload('tint', function() return magick.tint(freshHalf(half), '#ff8040', 60) end)
+workload('grayscale', function() return fresh(photo):grayscale() end)
+workload('threshold', function() return fresh(photo):threshold(0.5) end)
+workload('colorize', function() return fresh(photo):colorize('#336699', 40) end)
+workload('transparent', function() return fresh(keyed):transparent '#0a141e' end)
+workload('opaque', function() return fresh(keyed):opaque('#0a141e', '#f0e0c0') end)
+workload('setAlpha', function() return fresh(photo):setAlpha(0.5) end)
+workload('polynomial', function() return fresh(photo):polynomial(1.5, -0.2) end)
+workload('contrastStretch', function() return freshHalf(half):contrastStretch(1, 1) end)
+workload('sigmoidalContrast', function() return freshHalf(half):sigmoidalContrast(5, 40) end)
+workload('median', function() return half:median() end)
+workload('stats', function()
+  local stats = magick.stats(photo)
+
+  return stats.mean[1] + stats.mean[2] * 2 + stats.mean[3] * 3 + stats.mean[4] * 5 + stats.nonzeroAlpha
+end)
+
+-- Generators.
+workload('noise', function() return magick.noise(Medium, Medium, '#806040', 7) end)
+workload('randomNoise', function() return magick.randomNoise(Medium, Medium, 7) end)
+workload('addGaussianNoise', function() return magick.addGaussianNoise(half, 3302, 0.02) end)
+workload('verticalGradient', function() return magick.verticalGradient(Large, Large, '#f5f5f5', '#5c5c5c') end)
+workload('gaussianBlur 1.5', function() return magick.gaussianBlur(half, 1.5) end)
+workload('gaussianBlur 12', function() return magick.gaussianBlur(half, 12) end)
+workload('shadowed', function() return magick.shadowed(halfCutout, 40, 5, 5, 7) end)
+
+-- Codecs. A decoder is given the filters and layouts other encoders write, not only this one's.
+local Signature = '\137PNG\r\n\26\n'
+
+local function chunk(kind: string, payload: string): string
+  return string.pack('>I4', #payload) .. kind .. payload .. string.pack('>I4', bytes.crc32(kind .. payload))
+end
+
+--- A PNG of noise whose rows take the four filters that add (sub, up, average, Paeth) by turns.
+local function filtered(width: number, height: number, colorType: number, channels: number, seed: number): buffer
+  local rows: { string } = {}
+
+  for row = 0, height - 1 do
+    rows[row + 1] = string.char(1 + row % 4) .. buffer.tostring(noise(width * channels, seed + row))
+  end
+
+  local packed = buffer.tostring(bytes.deflate(table.concat(rows), { format = 'zlib', level = 1 }))
+  local header = string.pack('>I4I4BBBBB', width, height, 8, colorType, 0, 0, 0)
+
+  return buffer.fromstring(Signature .. chunk('IHDR', header) .. chunk('IDAT', packed) .. chunk('IEND', ''))
+end
+
+local function bmp(width: number, height: number, seed: number): buffer
+  local stride = (width * 3 + 3) // 4 * 4
+  local body = buffer.tostring(noise(stride * height, seed))
+
+  return buffer.fromstring(
+    'BM'
+      .. string.pack('<I4I4I4', 54 + #body, 0, 54)
+      .. string.pack('<I4i4i4I2I2I4', 40, width, height, 1, 24, 0)
+      .. string.rep('\0', 20)
+      .. body
+  )
+end
+
+local function tgaHeader(width: number, height: number, imageType: number, bits: number): string
+  return string.pack('<BBB', 0, 0, imageType) .. string.rep('\0', 9) .. string.pack('<I2I2BB', width, height, bits, 8)
+end
+
+--- A run-length TGA: runs and literal packets by turns, covering exactly the image.
+local function packedTga(width: number, height: number, seed: number): buffer
+  local random = generator(seed)
+  local parts = { tgaHeader(width, height, 10, 32) }
+  local left = width * height
+
+  while left > 0 do
+    local length = math.min(1 + random(64), left)
+    local run = random(2) == 0
+
+    table.insert(parts, string.char(if run then 0x80 + length - 1 else length - 1))
+    table.insert(parts, buffer.tostring(noise(if run then 4 else 4 * length, seed + left)))
+    left -= length
+  end
+
+  return buffer.fromstring(table.concat(parts))
+end
+
+local encoded, encodedDds = magick.png(half), magick.dds(photo)
+local rgba, rgb = filtered(Medium, Medium, 6, 4, 20), filtered(Medium, Medium, 2, 3, 21)
+local gray = filtered(Medium, Medium, 0, 1, 22)
+local bitmap = bmp(Large, Large, 23)
+local targa = buffer.fromstring(tgaHeader(Large, Large, 2, 32) .. buffer.tostring(noise(Large * Large * 4, 24)))
+local packedTarga = packedTga(Large, Large, 25)
+
+workload('png', function() return magick.png(half) end)
+workload('png stored', function() return magick.png(half, 0) end)
+workload('readPNG unfiltered', function() return magick.readPNG(encoded) end)
+workload('readPNG filtered rgba', function() return magick.readPNG(rgba) end)
+workload('readPNG filtered rgb', function() return magick.readPNG(rgb) end)
+workload('readPNG filtered gray', function() return magick.readPNG(gray) end)
+workload('dds', function() return magick.dds(photo) end)
+workload('readDDS', function() return magick.readDDS(encodedDds) end)
+workload('readBMP', function() return magick.readBMP(bitmap) end)
+workload('readTGA', function() return magick.readTGA(targa) end)
+workload('readTGA packets', function() return magick.readTGA(packedTarga) end)
