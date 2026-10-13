@@ -668,6 +668,23 @@ suite.describe('generators', function()
     pin('verticalGradient empty', pixels(magick.verticalGradient(0, 0, '#102030', '#ffffff')))
   end)
 
+  suite.it('fills few pixels and many, a narrow rectangle and a wide one, alike', function()
+    for _, shape in { { 1, 1 }, { 8, 8 }, { 13, 5 }, { 64, 1 }, { 65, 1 }, { 70, 3 } } do
+      local width, height = shape[1], shape[2]
+
+      pin(`new {width}x{height} filled`, pixels(magick.new(width, height, '#336699cc')))
+      pin(`fill {width}x{height}`, pixels(noisy(width, height, 140):fill { 300.5, 2, 3, 128 }))
+      pin(`verticalGradient {width}x{height}`, pixels(magick.verticalGradient(width, height, '#f5f5f5', '#5c5c5c80')))
+    end
+
+    for columns = 1, 9 do
+      pin(`rect {columns} wide`, pixels(noisy(14, 11, 141):rect(2, 1, 1 + columns, 9, '#c0803080')))
+    end
+
+    pin('rect a row of 64', pixels(noisy(70, 4, 142):rect(3, 1, 66, 2, '#c0803080')))
+    pin('rect a row of 65', pixels(noisy(70, 4, 142):rect(3, 1, 67, 2, '#c0803080')))
+  end)
+
   suite.it('blurs with a Gaussian', function()
     local source = noisy(23, 17, 82)
 

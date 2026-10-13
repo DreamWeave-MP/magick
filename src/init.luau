@@ -92,15 +92,33 @@ local function replicate(target: buffer, offset: number, size: number, length: n
   end
 end
 
+--- How many pixels are stored one by one sooner than copied: a copy is a call, and that many
+--- stores cost no more than the calls that would double one pixel into them.
+local Few = 64
+
+--- How many pixels wide a rectangle is before its rows are copied from its first: a row up to
+--- this wide is stored afresh for less than the call a copy is.
+local Narrow = 8
+
+--- Stores a pixel `count` times from `offset`: one by one when they are few, and by doubling
+--- copies of the first when they are many.
+local function spread(target: buffer, offset: number, pixel: number, count: number)
+  if count <= Few then
+    for at = offset, offset + count * 4 - 4, 4 do
+      buffer.writeu32(target, at, pixel)
+    end
+
+    return
+  end
+
+  buffer.writeu32(target, offset, pixel)
+  replicate(target, offset, 4, count * 4)
+end
+
 function Image.fill(self: Image, color: Color?): Image
   local pixels = self.data
-  local length = buffer.len(pixels)
-  local pixel = packed(colorTable(color))
 
-  if length < 4 then return self end
-
-  buffer.writeu32(pixels, 0, pixel)
-  replicate(pixels, 0, 4, length - length % 4)
+  spread(pixels, 0, packed(colorTable(color)), buffer.len(pixels) // 4)
 
   return self
 end
@@ -263,8 +281,21 @@ function Image.rect(self: Image, x0: number, y0: number, x1: number, y1: number,
     return self
   end
 
-  buffer.writeu32(pixels, first, packed(colorTable(source :: Color?)))
-  replicate(pixels, first, 4, span)
+  local pixel, columns = packed(colorTable(source :: Color?)), right - left + 1
+
+  if columns <= Narrow then
+    for row = top, bottom do
+      local at = row * stride + left * 4
+
+      for offset = at, at + span - 4, 4 do
+        buffer.writeu32(pixels, offset, pixel)
+      end
+    end
+
+    return self
+  end
+
+  spread(pixels, first, pixel, columns)
 
   for row = top + 1, bottom do
     buffer.copy(pixels, row * stride + left * 4, pixels, first, span)
@@ -2523,10 +2554,8 @@ function Magick.verticalGradient(width: number, height: number, top: Color?, bot
     local green = clamp8(from[2] + (to[2] - from[2]) * along)
     local blue = clamp8(from[3] + (to[3] - from[3]) * along)
     local alpha = clamp8(from[4] + (to[4] - from[4]) * along)
-    local at = row * stride
 
-    buffer.writeu32(pixels, at, red + green * 256 + blue * 65536 + alpha * 16777216)
-    replicate(pixels, at, 4, stride)
+    spread(pixels, row * stride, red + green * 256 + blue * 65536 + alpha * 16777216, width)
   end
 
   return out
