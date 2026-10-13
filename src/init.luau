@@ -3,6 +3,7 @@
 -- Pure-Luau raster subset used by the Morrowind UI generator port.
 -- Semantics are intentionally ImageMagick-shaped, not a full CLI clone.
 local bytes = require '@dream/bytes'
+local dataPlane = require '@dream/data'
 
 local Magick = {}
 local Image = {}
@@ -558,18 +559,26 @@ function Image:copyAlpha(mask, mode)
     return self
 end
 
-function Image:crop(w,h,x,y)
-    local out=Magick.new(w,h)
-    if w<=0 or h<=0 then return out end
-    local sx0=math.max(0,x); local sy0=math.max(0,y)
-    local sx1=math.min(self.width,x+w); local sy1=math.min(self.height,y+h)
-    if sx0>=sx1 or sy0>=sy1 then return out end
-    local bytesPerRow=(sx1-sx0)*4; local dd=out.data
-    for sy=sy0,sy1-1 do
-        local dy=sy-y
-        buffer.copy(dd,(dy*w+(sx0-x))*4,self.data,(sy*self.width+sx0)*4,bytesPerRow)
-    end
-    return out
+--- A copy of a rectangle of the image, clear where the rectangle is outside it.
+function Image.crop(self: Image, width: number, height: number, left: number, top: number): Image
+  local out = Magick.new(width, height)
+
+  if width <= 0 or height <= 0 then return out end
+
+  local firstColumn, firstRow = math.max(0, left), math.max(0, top)
+  local endColumn, endRow = math.min(self.width, left + width), math.min(self.height, top + height)
+
+  if firstColumn >= endColumn or firstRow >= endRow then return out end
+
+  local span = (endColumn - firstColumn) * 4
+
+  for row = firstRow, endRow - 1 do
+    local to, from = ((row - top) * width + (firstColumn - left)) * 4, (row * self.width + firstColumn) * 4
+
+    buffer.copy(out.data, to, self.data, from, span)
+  end
+
+  return out
 end
 
 --- A new image of a size, filled with a background, with this one laid over it at an offset.
@@ -577,11 +586,45 @@ function Image.extent(self: Image, width: number, height: number, dx: number?, d
   return Magick.new(width, height, background):over(self, dx or 0, dy or 0)
 end
 
-function Image:trim()
-    local minx,miny,maxx,maxy=self.width,self.height,-1,-1
-    for y=0,self.height-1 do for x=0,self.width-1 do local _,_,_,a=self:get(x,y); if a~=0 then minx=math.min(minx,x); miny=math.min(miny,y); maxx=math.max(maxx,x); maxy=math.max(maxy,y) end end end
-    if maxx < minx then return Magick.new(1,1) end
-    return self:crop(maxx-minx+1,maxy-miny+1,minx,miny)
+--- The image cropped to the box of its pixels that are not clear, or one clear pixel when it has
+--- none.
+function Image.trim(self: Image): Image
+  local {width, height, data} = self
+  local top, bottom = height, height - 1
+
+  for row = 0, height - 1 do
+    local first, last = row * width + 1, (row + 1) * width
+
+    if any[for pixel in data[first:last, 'u32'] => pixel >= Faint] then
+      top = row
+      break
+    end
+  end
+
+  if top == height then return Magick.new(1, 1) end
+
+  for row = height - 1, top, -1 do
+    local first, last = row * width + 1, (row + 1) * width
+
+    if any[for pixel in data[first:last, 'u32'] => pixel >= Faint] then
+      bottom = row
+      break
+    end
+  end
+
+  -- The row at the top has a pixel that is not clear, so both walks stop inside the image.
+  local rows, alphaDown = bottom - top + 1, `u8@{width * 4}`
+  local left, right = 0, width - 1
+
+  while not dataPlane.any(data, alphaDown, (top * width + left) * 4 + 3, rows, 'ne', 0) do
+    left += 1
+  end
+
+  while not dataPlane.any(data, alphaDown, (top * width + right) * 4 + 3, rows, 'ne', 0) do
+    right -= 1
+  end
+
+  return self:crop(right - left + 1, rows, left, top)
 end
 
 function Image:rotate90(clockwise)
