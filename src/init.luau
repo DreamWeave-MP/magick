@@ -856,28 +856,59 @@ function Image.rotate(self: Image, angleDegrees: number): Image
   return out
 end
 
-local function lcg(seed)
-    local state = math.floor(seed or 1) % 2147483647
-    if state <= 0 then state = 1 end
-    return function()
-        state = (state * 48271) % 2147483647
-        return state / 2147483647
-    end
+--- Where a seeded generator starts: a whole number in `1..2^31-2`.
+local function seeded(seed: number?): number
+  local state = math.floor(seed or 1) % 2147483647
+
+  return if state <= 0 then 1 else state
 end
 
-function Magick.noise(width,height,color,seed,attenuate)
-    local c=colorTable(color); local out=Magick.new(width,height); local random=lcg(seed or 1)
-    -- ImageMagick's Gaussian noise on a flat color behaves multiplicatively: zero channels stay
-    -- exactly zero and nonzero channels share almost the same per-pixel factor.  At attenuate=.25
-    -- the measured sigma is ~7.84% of the channel value.
-    local sigma=(attenuate or 0.25)*0.3137254901960784
-    local spare=nil
-    local function gaussian()
-        if spare then local v=spare; spare=nil; return v end
-        local u=math.max(1e-12,random()); local v=random(); local m=math.sqrt(-2*math.log(u)); local a=2*math.pi*v; spare=m*math.sin(a); return m*math.cos(a)
+--- The next two standard normal deviates of the generator (Lehmer's, by 48271, turned to
+--- deviates as Box and Muller do), and its state after them. The first is the one a caller that
+--- wants one at a time takes first.
+local function deviates(state: number): (number, number, number)
+  local first = state * 48271 % 2147483647
+  local second = first * 48271 % 2147483647
+  local reach = math.sqrt(-2 * math.log(math.max(1e-12, first / 2147483647)))
+  local turn = 2 * math.pi * (second / 2147483647)
+
+  return reach * math.cos(turn), reach * math.sin(turn), second
+end
+
+--- An image of a color with seeded Gaussian noise in its color channels.
+function Magick.noise(width: number, height: number, color: Color?, seed: number?, attenuate: number?): Image
+  local channels = colorTable(color)
+  local out = Magick.new(width, height)
+  local pixels, length = out.data, width * height * 4
+  local state = seeded(seed or 1)
+  -- ImageMagick's Gaussian noise on a flat color behaves multiplicatively: zero channels stay
+  -- exactly zero and nonzero channels share almost the same per-pixel factor.  At attenuate=.25
+  -- the measured sigma is ~7.84% of the channel value.
+  local sigma = (attenuate or 0.25) * 0.3137254901960784
+  local red, green, blue, alpha = channels[1], channels[2], channels[3], clamp8(channels[4])
+
+  -- A pixel takes one deviate and they come two at a time, so pixels are made in pairs.
+  for offset = 0, length - 4, 8 do
+    local first, second
+    first, second, state = deviates(state)
+
+    local factor = 1 + first * sigma
+
+    buffer.writeu8(pixels, offset, clamp8(red * factor))
+    buffer.writeu8(pixels, offset + 1, clamp8(green * factor))
+    buffer.writeu8(pixels, offset + 2, clamp8(blue * factor))
+    buffer.writeu8(pixels, offset + 3, alpha)
+
+    if offset + 4 < length then
+      factor = 1 + second * sigma
+      buffer.writeu8(pixels, offset + 4, clamp8(red * factor))
+      buffer.writeu8(pixels, offset + 5, clamp8(green * factor))
+      buffer.writeu8(pixels, offset + 6, clamp8(blue * factor))
+      buffer.writeu8(pixels, offset + 7, alpha)
     end
-    for y=0,height-1 do for x=0,width-1 do local f=1+gaussian()*sigma; out:set(x,y,clamp8(c[1]*f),clamp8(c[2]*f),clamp8(c[3]*f),c[4]) end end
-    return out
+  end
+
+  return out
 end
 
 --- Wraps bytes of coverage, a byte a pixel, as a mask of a size. The mask shares the buffer.
@@ -1100,22 +1131,85 @@ function Magick.subtractMask(mask: Mask, removed: Mask): Mask
   return Magick.mask(mask.width, mask.height, out)
 end
 
-function Magick.modulate(img,brightness,saturation)
-    brightness=(brightness or 100)/100; saturation=(saturation or 100)/100
-    for y=0,img.height-1 do for x=0,img.width-1 do local r,g,b,a=img:get(x,y); local gray=0.2126*r+0.7152*g+0.0722*b; r=(gray+(r-gray)*saturation)*brightness; g=(gray+(g-gray)*saturation)*brightness; b=(gray+(b-gray)*saturation)*brightness; img:set(x,y,r,g,b,a) end end
-    return img
+--- Scales an image's brightness and its saturation, each a percentage, in place.
+function Magick.modulate(image: Image, brightness: number?, saturation: number?): Image
+  local bright, vivid = (brightness or 100) / 100, (saturation or 100) / 100
+  local pixels = image.data
+
+  for offset = 0, image.width * image.height * 4 - 4, 4 do
+    local pixel = buffer.readu32(pixels, offset)
+    local red, green, blue =
+      bit32.band(pixel, 255), bit32.band(bit32.rshift(pixel, 8), 255), bit32.band(bit32.rshift(pixel, 16), 255)
+    local gray = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    buffer.writeu8(pixels, offset, clamp8((gray + (red - gray) * vivid) * bright))
+    buffer.writeu8(pixels, offset + 1, clamp8((gray + (green - gray) * vivid) * bright))
+    buffer.writeu8(pixels, offset + 2, clamp8((gray + (blue - gray) * vivid) * bright))
+  end
+
+  return image
 end
 
-function Magick.emboss(img,strength)
-    strength=strength or 1; local src=img:clone()
-    for y=0,img.height-1 do for x=0,img.width-1 do local r,g,b,a=src:get(x,y); local pr,pg,pb=src:get(x-1,y-1); local nr,ng,nb=src:get(x+1,y+1); img:set(x,y,r+(nr-pr)*strength,g+(ng-pg)*strength,b+(nb-pb)*strength,a) end end
-    return img
+--- Embosses an image in place: each color channel gains the difference between the pixel below
+--- and to the right of it and the one above and to the left, times a strength.
+function Magick.emboss(image: Image, strength: number?): Image
+  local force = strength or 1
+  local {width, height, data: pixels} = image
+  -- A copy with a clear pixel all around it, so a neighbor past an edge is read like any other.
+  local paddedWidth = width + 2
+  local padded = buffer.create(paddedWidth * (height + 2) * 4)
+  local diagonal = (paddedWidth + 1) * 4
+
+  for row = 0, height - 1 do
+    buffer.copy(padded, ((row + 1) * paddedWidth + 1) * 4, pixels, row * width * 4, width * 4)
+  end
+
+  for row = 0, height - 1 do
+    local offset, center = row * width * 4, ((row + 1) * paddedWidth + 1) * 4
+
+    for _ = 0, width - 1 do
+      local pixel = buffer.readu32(padded, center)
+      local before, after = buffer.readu32(padded, center - diagonal), buffer.readu32(padded, center + diagonal)
+      local red = bit32.band(pixel, 255) + (bit32.band(after, 255) - bit32.band(before, 255)) * force
+      local green = bit32.band(bit32.rshift(pixel, 8), 255)
+        + (bit32.band(bit32.rshift(after, 8), 255) - bit32.band(bit32.rshift(before, 8), 255)) * force
+      local blue = bit32.band(bit32.rshift(pixel, 16), 255)
+        + (bit32.band(bit32.rshift(after, 16), 255) - bit32.band(bit32.rshift(before, 16), 255)) * force
+
+      buffer.writeu8(pixels, offset, clamp8(red))
+      buffer.writeu8(pixels, offset + 1, clamp8(green))
+      buffer.writeu8(pixels, offset + 2, clamp8(blue))
+      offset += 4
+      center += 4
+    end
+  end
+
+  return image
 end
 
-function Magick.tint(img,color,amount)
-    local c=colorTable(color); local t=(amount or 100)/100
-    for y=0,img.height-1 do for x=0,img.width-1 do local r,g,b,a=img:get(x,y); local lum=(r+g+b)/3/255; local tr=c[1]*lum; local tg=c[2]*lum; local tb=c[3]*lum; img:set(x,y,r+(tr-r)*t,g+(tg-g)*t,b+(tb-b)*t,a) end end
-    return img
+--- How light a pixel is by the sum of its color channels: their mean, as a share of full.
+local Lights = buffer.create(766 * 8)
+
+into(Lights, 'f64')[for total in range(0, 765) => total / 3 / 255]
+
+--- Tints an image in place: each color channel moves a percentage of the way to a color's, the
+--- color dimmed to how light the pixel is.
+function Magick.tint(image: Image, color: Color?, amount: number?): Image
+  local channels, share = colorTable(color), (amount or 100) / 100
+  local pixels = image.data
+
+  for offset = 0, image.width * image.height * 4 - 4, 4 do
+    local pixel = buffer.readu32(pixels, offset)
+    local red, green, blue =
+      bit32.band(pixel, 255), bit32.band(bit32.rshift(pixel, 8), 255), bit32.band(bit32.rshift(pixel, 16), 255)
+    local light = buffer.readf64(Lights, (red + green + blue) * 8)
+
+    buffer.writeu8(pixels, offset, clamp8(red + (channels[1] * light - red) * share))
+    buffer.writeu8(pixels, offset + 1, clamp8(green + (channels[2] * light - green) * share))
+    buffer.writeu8(pixels, offset + 2, clamp8(blue + (channels[3] * light - blue) * share))
+  end
+
+  return image
 end
 
 local function write32(buf,o,v) buffer.writeu32(buf,o,v) end
@@ -1780,10 +1874,36 @@ function Magick.gaussianBlur(img,sigma)
     return out
 end
 
-function Magick.mathCompose(a,b,k1,k2,k3,k4)
-    assert(a.width==b.width and a.height==b.height,"magick: geometry mismatch"); local out=Magick.new(a.width,a.height); k1=k1 or 0;k2=k2 or 1;k3=k3 or 0;k4=k4 or 0
-    for y=0,a.height-1 do for x=0,a.width-1 do local ar,ag,ab,aa=a:get(x,y); local br,bg,bb=b:get(x,y); local function f(u,v) return clamp8((k1*(u/255)*(v/255)+k2*(u/255)+k3*(v/255)+k4)*255) end; out:set(x,y,f(ar,br),f(ag,bg),f(ab,bb),aa) end end
-    return out
+--- A channel value as a share of full.
+local Shares = buffer.create(256 * 8)
+
+into(Shares, 'f64')[for value in range(0, 255) => value / 255]
+
+--- A new image whose color channels are a polynomial of two images' channels as shares of full,
+--- `k1 * left * right + k2 * left + k3 * right + k4`; its alpha is the first image's.
+function Magick.mathCompose(left: Image, right: Image, k1: number?, k2: number?, k3: number?, k4: number?): Image
+  assert(left.width == right.width and left.height == right.height, 'magick: geometry mismatch')
+
+  local out = Magick.new(left.width, left.height)
+  local product, first, second, constant = k1 or 0, k2 or 1, k3 or 0, k4 or 0
+  local leftPixels, rightPixels, pixels = left.data, right.data, out.data
+
+  for offset = 0, left.width * left.height * 4 - 4, 4 do
+    local leftPixel, rightPixel = buffer.readu32(leftPixels, offset), buffer.readu32(rightPixels, offset)
+    local leftRed = buffer.readf64(Shares, bit32.band(leftPixel, 255) * 8)
+    local leftGreen = buffer.readf64(Shares, bit32.band(bit32.rshift(leftPixel, 8), 255) * 8)
+    local leftBlue = buffer.readf64(Shares, bit32.band(bit32.rshift(leftPixel, 16), 255) * 8)
+    local rightRed = buffer.readf64(Shares, bit32.band(rightPixel, 255) * 8)
+    local rightGreen = buffer.readf64(Shares, bit32.band(bit32.rshift(rightPixel, 8), 255) * 8)
+    local rightBlue = buffer.readf64(Shares, bit32.band(bit32.rshift(rightPixel, 16), 255) * 8)
+
+    buffer.writeu8(pixels, offset, clamp8((product * leftRed * rightRed + first * leftRed + second * rightRed + constant) * 255))
+    buffer.writeu8(pixels, offset + 1, clamp8((product * leftGreen * rightGreen + first * leftGreen + second * rightGreen + constant) * 255))
+    buffer.writeu8(pixels, offset + 2, clamp8((product * leftBlue * rightBlue + first * leftBlue + second * rightBlue + constant) * 255))
+    buffer.writeu8(pixels, offset + 3, bit32.rshift(leftPixel, 24))
+  end
+
+  return out
 end
 
 --- Maps every color channel through a line: a slope, and an intercept as a share of full.
@@ -1891,17 +2011,54 @@ function Magick.verticalGradient(width: number, height: number, top: Color?, bot
   return out
 end
 
-function Magick.randomNoise(width,height,seed)
-    local random=lcg(seed or 1); local out=Magick.new(width,height)
-    for y=0,height-1 do for x=0,width-1 do local v=math.floor(random()*256); out:set(x,y,v,v,v,255) end end
-    return out
+--- An opaque image of seeded gray noise, every level as likely as any other.
+function Magick.randomNoise(width: number, height: number, seed: number?): Image
+  local out = Magick.new(width, height, '#000000')
+  local pixels = out.data
+  local state = seeded(seed or 1)
+
+  for offset = 0, width * height * 4 - 4, 4 do
+    state = state * 48271 % 2147483647
+
+    local gray = math.floor(state / 2147483647 * 256)
+
+    buffer.writeu8(pixels, offset, gray)
+    buffer.writeu8(pixels, offset + 1, gray)
+    buffer.writeu8(pixels, offset + 2, gray)
+  end
+
+  return out
 end
 
-function Magick.addGaussianNoise(img,seed,attenuate)
-    local out=img:clone(); local random=lcg(seed or 1); local spare=nil; local sigma=(attenuate or 0.02)*255
-    local function gaussian() if spare then local v=spare; spare=nil; return v end local u=math.max(1e-12,random()); local v=random(); local m=math.sqrt(-2*math.log(u)); local a=2*math.pi*v; spare=m*math.sin(a); return m*math.cos(a) end
-    for y=0,out.height-1 do for x=0,out.width-1 do local r,g,b,a=out:get(x,y); out:set(x,y,r+gaussian()*sigma,g+gaussian()*sigma,b+gaussian()*sigma,a) end end
-    return out
+--- A copy of an image with seeded Gaussian noise added to its color channels, its deviation a
+--- share of full.
+function Magick.addGaussianNoise(image: Image, seed: number?, attenuate: number?): Image
+  local out = image:clone()
+  local pixels, length = out.data, out.width * out.height * 4
+  local state = seeded(seed or 1)
+  local sigma = (attenuate or 0.02) * 255
+
+  -- A pixel takes three deviates and they come two at a time, so two pixels take three pairs.
+  for offset = 0, length - 4, 8 do
+    local first, second, third, fourth
+    first, second, state = deviates(state)
+    third, fourth, state = deviates(state)
+
+    buffer.writeu8(pixels, offset, clamp8(buffer.readu8(pixels, offset) + first * sigma))
+    buffer.writeu8(pixels, offset + 1, clamp8(buffer.readu8(pixels, offset + 1) + second * sigma))
+    buffer.writeu8(pixels, offset + 2, clamp8(buffer.readu8(pixels, offset + 2) + third * sigma))
+
+    if offset + 4 < length then
+      local fifth, sixth
+      fifth, sixth, state = deviates(state)
+
+      buffer.writeu8(pixels, offset + 4, clamp8(buffer.readu8(pixels, offset + 4) + fourth * sigma))
+      buffer.writeu8(pixels, offset + 5, clamp8(buffer.readu8(pixels, offset + 5) + fifth * sigma))
+      buffer.writeu8(pixels, offset + 6, clamp8(buffer.readu8(pixels, offset + 6) + sixth * sigma))
+    end
+  end
+
+  return out
 end
 
 function Magick.shadowed(img,opacity,sigma,dx,dy)
