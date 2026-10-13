@@ -610,6 +610,30 @@ function Image.copyAlpha(self: Image, mask: Image, mode: string): Image
 
   if count == 0 then return self end
 
+  -- A mask with a `get` of its own is asked for each pixel through it, and one with none, a
+  -- mask of coverage for one, is refused by the first call.
+  if mask.get ~= plainGet then
+    for row = 0, self.height - 1 do
+      for column = 0, self.width - 1 do
+        local red, green, blue, alpha = self:get(column, row)
+        local _, _, _, maskAlpha = mask:get(column, row)
+        local kept = maskAlpha
+
+        if mode == 'dstin' then
+          kept = clamp8(alpha * maskAlpha / 255)
+        elseif mode == 'dstout' then
+          kept = clamp8(alpha * (255 - maskAlpha) / 255)
+        elseif mode ~= 'copy' then
+          error('magick: unknown alpha composite mode ' .. tostring(mode), 2)
+        end
+
+        self:set(column, row, red, green, blue, kept)
+      end
+    end
+
+    return self
+  end
+
   if mode == 'copy' then
     dataPlane.scale(maskPixels, 'u8@4', 3, count, 1, pixels, 3)
 
@@ -2016,14 +2040,18 @@ function Image.darken(self: Image, source: Image, dx: number?, dy: number?): Ima
   local {width: sourceWidth, height: sourceHeight, data: from} = source
 
   -- An offset that is not whole lands between pixels, which only a get and a set per pixel
-  -- reproduce.
-  if across % 1 ~= 0 or down % 1 ~= 0 then
+  -- reproduce, and a source with a `get` of its own is asked for each pixel through it, only for
+  -- the pixels that land on the image.
+  if across % 1 ~= 0 or down % 1 ~= 0 or source.get ~= plainGet then
     for row = 0, sourceHeight - 1 do
       for column = 0, sourceWidth - 1 do
         local toColumn, toRow = column + across, row + down
+
+        if not (toRow >= 0 and toRow < height and toColumn >= 0 and toColumn < width) then continue end
+
         local red, green, blue, alpha = source:get(column, row)
 
-        if toRow >= 0 and toRow < height and toColumn >= 0 and toColumn < width and alpha > 0 then
+        if alpha > 0 then
           local underRed, underGreen, underBlue, underAlpha = self:get(toColumn, toRow)
 
           self:set(

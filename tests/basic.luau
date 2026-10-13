@@ -717,6 +717,32 @@ suite.describe('sources the fast paths decline', function()
     expect(pixels(magick.tile(9, 7, own))).toBe(pixels(magick.tile(9, 7, moved)))
   end)
 
+  suite.it('takes the alpha and the darker of an image that has a get of its own through it', function()
+    local source = noisy(7, 6, 44)
+    local own, moved = shifted(source), source:roll(-1, -1)
+
+    for _, mode in { 'dstin', 'dstout', 'copy' } do
+      pin(`copyAlpha {mode} through a get`, pixels(noisy(7, 6, 43):copyAlpha(own, mode)))
+      expect(pixels(noisy(7, 6, 43):copyAlpha(own, mode))).toBe(pixels(noisy(7, 6, 43):copyAlpha(moved, mode)))
+    end
+
+    pin('darken through a get', pixels(noisy(12, 9, 43):darken(own, 2, 1)))
+    expect(pixels(noisy(12, 9, 43):darken(own, 2, 1))).toBe(pixels(noisy(12, 9, 43):darken(moved, 2, 1)))
+  end)
+
+  suite.it('refuses a mask of coverage where an image is asked for, and leaves the image as it was', function()
+    local image, darker = noisy(6, 5, 120), noisy(6, 5, 121)
+    local before, beforeDarker = pixels(image), pixels(darker)
+    local covered = (coverage(6, 5, 122) :: unknown) :: Image
+    local refusal = "attempt to call missing method 'get' of table"
+
+    expect(function() image:copyAlpha(covered, 'dstin') end).toThrow(refusal)
+    expect(function() image:copyAlpha(covered, 'copy') end).toThrow(refusal)
+    expect(function() darker:darken(covered) end).toThrow(refusal)
+    expect(pixels(image)).toBe(before)
+    expect(pixels(darker)).toBe(beforeDarker)
+  end)
+
   suite.it('draws an image from itself pixel by pixel', function()
     local polygon, circle, over = noisy(8, 8, 110), noisy(8, 8, 111), noisy(8, 8, 112)
     local alpha, darker = noisy(8, 8, 113), noisy(8, 8, 114)
