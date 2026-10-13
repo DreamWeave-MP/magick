@@ -684,6 +684,39 @@ suite.describe('sources the fast paths decline', function()
     expect(pixels(magick.paintMask(soft, wrapped(tile)))).toBe(pixels(magick.paintMask(soft, tile)))
   end)
 
+  --- A copy of an image with a `get` of its own, which gives the pixel a column and a row over,
+  --- wrapping: what `image:roll(-1, -1)` holds.
+  local function shifted(image: Image): Image
+    local tile = image:clone()
+    local fields = (tile :: unknown) :: { get: (Image, number, number) -> (number, number, number, number) }
+
+    fields.get = function(self: Image, column: number, row: number): (number, number, number, number)
+      return magick.Image.get(self, (column + 1) % self.width, (row + 1) % self.height)
+    end
+
+    return tile
+  end
+
+  suite.it('fills from an image that has a get of its own through it', function()
+    local tile = noisy(4, 3, 6)
+    local own, moved = shifted(tile), tile:roll(-1, -1)
+    local triangle = { { 1, 1 }, { 10, 3 }, { 4, 8 } }
+    local soft = coverage(9, 7, 61)
+
+    pin('rect through a get', pixels(noisy(12, 9, 5):rect(1, 1, 10, 7, own)))
+    expect(pixels(noisy(12, 9, 5):rect(1, 1, 10, 7, own))).toBe(pixels(noisy(12, 9, 5):rect(1, 1, 10, 7, moved)))
+    pin('polygon through a get', pixels(noisy(12, 9, 5):polygon(triangle, own)))
+    expect(pixels(noisy(12, 9, 5):polygon(triangle, own))).toBe(pixels(noisy(12, 9, 5):polygon(triangle, moved)))
+    pin('circle through a get', pixels(noisy(12, 9, 5):circle(5.5, 4.5, 4, 2, own)))
+    expect(pixels(noisy(12, 9, 5):circle(5.5, 4.5, 4, 2, own))).toBe(pixels(noisy(12, 9, 5):circle(5.5, 4.5, 4, 2, moved)))
+    pin('rectOver through a get', pixels(noisy(12, 9, 5):rectOver(1, 1, 10, 7, own)))
+    expect(pixels(noisy(12, 9, 5):rectOver(1, 1, 10, 7, own))).toBe(pixels(noisy(12, 9, 5):rectOver(1, 1, 10, 7, moved)))
+    pin('paintMask through a get', pixels(magick.paintMask(soft, own)))
+    expect(pixels(magick.paintMask(soft, own))).toBe(pixels(magick.paintMask(soft, moved)))
+    pin('tile through a get', pixels(magick.tile(9, 7, own)))
+    expect(pixels(magick.tile(9, 7, own))).toBe(pixels(magick.tile(9, 7, moved)))
+  end)
+
   suite.it('draws an image from itself pixel by pixel', function()
     local polygon, circle, over = noisy(8, 8, 110), noisy(8, 8, 111), noisy(8, 8, 112)
     local alpha, darker = noisy(8, 8, 113), noisy(8, 8, 114)

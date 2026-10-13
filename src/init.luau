@@ -147,6 +147,10 @@ function Image.get(self: Image, column: number, row: number): (number, number, n
     buffer.readu8(data, offset + 3)
 end
 
+--- The `get` every image is made with. An image given one of its own, or anything else that
+--- stands in for an image, is read through that one, a pixel at a time.
+local plainGet = Image.get
+
 --- Stores a pixel, each channel clamped and rounded to a byte; a pixel outside the image is not
 --- stored.
 function Image.set(self: Image, column: number, row: number, red: number, green: number, blue: number, alpha: number): Image
@@ -186,13 +190,15 @@ local function sampleTile(tile: Image, column: number, row: number): (number, nu
   return tile:get(wrappedColumn, wrappedRow)
 end
 
---- Whether a tile's pixels can be copied a run at a time into `target`: it is an image made here,
---- of at least a pixel, whose buffer holds exactly its rows and is not the one being drawn on.
---- Anything else is sampled pixel by pixel through its own `get`.
+--- Whether a tile's pixels can be copied a run at a time into `target`: it is an image made here
+--- and read by the `get` every image has, of at least a pixel, whose buffer holds exactly its rows
+--- and is not the one being drawn on. Anything else is sampled pixel by pixel through its own
+--- `get`.
 local function repeatable(tile: Image, target: buffer): boolean
   local {width, height, data} = tile
 
   return getmetatable(tile) == Image
+    and tile.get == plainGet
     and data ~= target
     and width >= 1
     and height >= 1
