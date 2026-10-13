@@ -549,6 +549,39 @@ suite.describe('tone', function()
     pin('colorize beyond', pixels(noisy(9, 7, 72):colorize('#ff0080', 180)))
   end)
 
+  suite.it('thresholds every mean at a cut on it, beside it and beyond every one', function()
+    --- An image of 766 pixels, one for each sum three channels can have.
+    local function sums(): Image
+      local image = magick.new(766, 1)
+
+      for total = 0, 765 do
+        local red = math.min(total, 255)
+        local green = math.min(total - red, 255)
+
+        image:set(total, 0, red, green, total - red - green, total % 256)
+      end
+
+      return image
+    end
+
+    local levels = { 85, 85.00000000000001, 84.99999999999999, 1 / 3, 0.2, 254.9, 255, 255.1, 1.0000001, -4, 0 / 0 }
+
+    for index, level in levels do
+      local image, plain = sums():threshold(level), sums()
+      local cut = if level <= 1 then level * 255 else level
+
+      for total = 0, 765 do
+        local red, green, blue, alpha = plain:get(total, 0)
+        local white = if (red + green + blue) / 3 >= cut then 255 else 0
+
+        plain:set(total, 0, white, white, white, alpha)
+      end
+
+      expect(pixels(image)).toBe(pixels(plain))
+      pin(`threshold cut {index}`, pixels(image))
+    end
+  end)
+
   suite.it('swaps colors and sets alpha', function()
     local image = noisy(9, 7, 73)
     image:set(2, 2, 10, 20, 30, 200)

@@ -1964,8 +1964,22 @@ function Image.threshold(self: Image, level: number): Image
   local pixels = self.data
   local cut = if level <= 1 then level * 255 else level
   local whites = buffer.create(766)
+  -- The least sum of three channels whose mean reaches the cut, or one past the greatest when
+  -- none does. A mean never falls as its sum grows, so the sums from there up are the white ones,
+  -- and the least is found by halving instead of by trying every sum.
+  local least, beyond = 0, 766
 
-  into(whites, 'u8')[for total in range(0, 765) => if total / 3 >= cut then 255 else 0]
+  while least < beyond do
+    local middle = (least + beyond) // 2
+
+    if middle / 3 >= cut then
+      beyond = middle
+    else
+      least = middle + 1
+    end
+  end
+
+  if least < 766 then buffer.fill(whites, least, 255) end
 
   for offset = 0, buffer.len(pixels) - 4, 4 do
     local pixel = buffer.readu32(pixels, offset)
