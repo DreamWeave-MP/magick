@@ -269,41 +269,168 @@ function Image.rect(self: Image, x0: number, y0: number, x1: number, y1: number,
   return self
 end
 
-local function pointInPolygon(px,py,points)
-    local inside=false
-    local j=#points
-    for i=1,#points do
-        local xi,yi=points[i][1],points[i][2]; local xj,yj=points[j][1],points[j][2]
-        if ((yi>py) ~= (yj>py)) and (px < (xj-xi)*(py-yi)/((yj-yi) == 0 and 1e-12 or (yj-yi))+xi) then inside=not inside end
-        j=i
+local Scratch = buffer.create(4)
+
+--- The pixel `set` stores for four channels: each clamped and rounded to its own byte.
+local function stored(red: number, green: number, blue: number, alpha: number): number
+  buffer.writeu8(Scratch, 0, clamp8(red))
+  buffer.writeu8(Scratch, 1, clamp8(green))
+  buffer.writeu8(Scratch, 2, clamp8(blue))
+  buffer.writeu8(Scratch, 3, clamp8(alpha))
+
+  return buffer.readu32(Scratch, 0)
+end
+
+--- Stores what a shape's source gives for a column and a row: the pixel of a tile, sampled
+--- through its `get`, or the source's color. The color is read here, at a pixel the shape
+--- covers, so a shape that covers nothing never refuses its color; the pixel it packs to is
+--- returned for the shape to store itself from then on.
+local function paint(image: Image, offset: number, column: number, row: number, source: Source?, tile: Image?): number?
+  if tile then
+    local red, green, blue, alpha = sampleTile(tile, column, row)
+
+    image:set(column, row, red, green, blue, alpha)
+
+    return nil
+  end
+
+  local channels = colorTable(source :: Color?)
+  local pixel = stored(channels[1], channels[2], channels[3], channels[4])
+
+  buffer.writeu32(image.data, offset, pixel)
+
+  return pixel
+end
+
+--- Fills a polygon by the even-odd rule: a pixel is inside when an odd number of edges cross its
+--- row to the right of its center.
+function Image.polygon(self: Image, points: { { number } }, source: Source?): Image
+  local {width, height, data} = self
+  local left, top, right, bottom = width - 1, height - 1, 0, 0
+
+  for _, point in points do
+    left, top = math.min(left, point[1]), math.min(top, point[2])
+    right, bottom = math.max(right, point[1]), math.max(bottom, point[2])
+  end
+
+  left, top = math.max(0, math.floor(left)), math.max(0, math.floor(top))
+  right, bottom = math.min(width - 1, math.ceil(right)), math.min(height - 1, math.ceil(bottom))
+
+  if left > right then return self end
+
+  local tile = tileOf(source)
+  local tilePixels = if tile and repeatable(tile, data) then tile.data else nil
+  local tileWidth, tileHeight = if tile then tile.width else 0, if tile then tile.height else 0
+  local count = #points
+  local crossings: { number } = table.create(count)
+  local color: number? = nil
+
+  for row = top, bottom do
+    local level = row + 0.5
+    local crossed, last = 0, count
+
+    for index = 1, count do
+      local fromColumn, fromRow = points[index][1], points[index][2]
+      local toColumn, toRow = points[last][1], points[last][2]
+
+      if (fromRow > level) ~= (toRow > level) then
+        local rise = if toRow - fromRow == 0 then 1e-12 else toRow - fromRow
+
+        crossed += 1
+        crossings[crossed] = (toColumn - fromColumn) * (level - fromRow) / rise + fromColumn
+      end
+
+      last = index
     end
-    return inside
+
+    local offset = (row * width + left) * 4
+
+    for column = left, right do
+      local center = column + 0.5
+      local inside = false
+
+      for index = 1, crossed do
+        if center < crossings[index] then inside = not inside end
+      end
+
+      if not inside then
+        offset += 4
+        continue
+      end
+
+      if color then
+        buffer.writeu32(data, offset, color)
+      elseif tilePixels then
+        buffer.writeu32(data, offset, buffer.readu32(tilePixels, (row % tileHeight * tileWidth + column % tileWidth) * 4))
+      else
+        color = paint(self, offset, column, row, source, tile)
+      end
+
+      offset += 4
+    end
+  end
+
+  return self
 end
 
-function Image:polygon(points,source)
-    local minx,miny,maxx,maxy=self.width-1,self.height-1,0,0
-    for _,p in points do minx=math.min(minx,p[1]); miny=math.min(miny,p[2]); maxx=math.max(maxx,p[1]); maxy=math.max(maxy,p[2]) end
-    minx=math.max(0,math.floor(minx)); miny=math.max(0,math.floor(miny)); maxx=math.min(self.width-1,math.ceil(maxx)); maxy=math.min(self.height-1,math.ceil(maxy))
-    for y=miny,maxy do for x=minx,maxx do if pointInPolygon(x+0.5,y+0.5,points) then local r,g,b,a=sourcePixel(source,x,y); self:set(x,y,r,g,b,a) end end end
-    return self
+--- Fills an ellipse about a center: a pixel is inside when its center is.
+function Image.circle(self: Image, cx: number, cy: number, rx: number, ry: number?, source: Source?): Image
+  local {width, height, data} = self
+  local radiusY = ry or rx
+  local left, right = math.max(0, math.floor(cx - rx)), math.min(width - 1, math.ceil(cx + rx))
+  local top, bottom = math.max(0, math.floor(cy - radiusY)), math.min(height - 1, math.ceil(cy + radiusY))
+  local tile = tileOf(source)
+  local tilePixels = if tile and repeatable(tile, data) then tile.data else nil
+  local tileWidth, tileHeight = if tile then tile.width else 0, if tile then tile.height else 0
+  local color: number? = nil
+
+  for row = top, bottom do
+    local down = (row + 0.5 - cy) / radiusY
+    local offset = (row * width + left) * 4
+
+    for column = left, right do
+      local across = (column + 0.5 - cx) / rx
+      local inside = across * across + down * down <= 1
+
+      if not inside then
+        offset += 4
+        continue
+      end
+
+      if color then
+        buffer.writeu32(data, offset, color)
+      elseif tilePixels then
+        buffer.writeu32(data, offset, buffer.readu32(tilePixels, (row % tileHeight * tileWidth + column % tileWidth) * 4))
+      else
+        color = paint(self, offset, column, row, source, tile)
+      end
+
+      offset += 4
+    end
+  end
+
+  return self
 end
 
-function Image:circle(cx,cy,rx,ry,source)
-    ry = ry or rx
-    local minx=math.max(0,math.floor(cx-rx)); local maxx=math.min(self.width-1,math.ceil(cx+rx))
-    local miny=math.max(0,math.floor(cy-ry)); local maxy=math.min(self.height-1,math.ceil(cy+ry))
-    for y=miny,maxy do for x=minx,maxx do
-        local dx=(x+0.5-cx)/rx; local dy=(y+0.5-cy)/ry
-        if dx*dx+dy*dy <= 1 then local r,g,b,a=sourcePixel(source,x,y); self:set(x,y,r,g,b,a) end
-    end end
-    return self
-end
+local function overPixel(
+  underRed: number,
+  underGreen: number,
+  underBlue: number,
+  underAlpha: number,
+  red: number,
+  green: number,
+  blue: number,
+  alpha: number
+): (number, number, number, number)
+  local opacity, underOpacity = alpha / 255, underAlpha / 255
+  local covered = opacity + underOpacity * (1 - opacity)
 
-local function overPixel(dr,dg,db,da,sr,sg,sb,sa)
-    local af=sa/255; local daf=da/255; local oa=af + daf*(1-af)
-    if oa <= 0 then return 0,0,0,0 end
-    local r=(sr*af + dr*daf*(1-af))/oa; local g=(sg*af + dg*daf*(1-af))/oa; local b=(sb*af + db*daf*(1-af))/oa
-    return clamp8(r),clamp8(g),clamp8(b),clamp8(oa*255)
+  if covered <= 0 then return 0, 0, 0, 0 end
+
+  return clamp8((red * opacity + underRed * underOpacity * (1 - opacity)) / covered),
+    clamp8((green * opacity + underGreen * underOpacity * (1 - opacity)) / covered),
+    clamp8((blue * opacity + underBlue * underOpacity * (1 - opacity)) / covered),
+    clamp8(covered * 255)
 end
 
 --- The least pixel that is opaque and the least that is not clear, as numbers: alpha is a pixel's
@@ -788,19 +915,98 @@ function Magick.write(path,img)
     if e=="png" then return Magick.writePNG(path,img) elseif e=="dds" then return Magick.writeDDS(path,img) else error("magick: unsupported output format ."..e,2) end
 end
 
-function Image:rectOver(x0,y0,x1,y1,source)
-    if x0>x1 then x0,x1=x1,x0 end; if y0>y1 then y0,y1=y1,y0 end
-    x0=math.max(0,math.floor(x0)); y0=math.max(0,math.floor(y0)); x1=math.min(self.width-1,math.floor(x1)); y1=math.min(self.height-1,math.floor(y1))
-    for y=y0,y1 do for x=x0,x1 do local sr,sg,sb,sa=sourcePixel(source,x,y); if sa>0 then local dr,dg,db,da=self:get(x,y); self:set(x,y,overPixel(dr,dg,db,da,sr,sg,sb,sa)) end end end
+--- Composites a rectangle of a color or of a tile over what is there.
+function Image.rectOver(self: Image, x0: number, y0: number, x1: number, y1: number, source: Source?): Image
+  if x0 > x1 then x0, x1 = x1, x0 end
+  if y0 > y1 then y0, y1 = y1, y0 end
+
+  local {width, data} = self
+  local left, top = math.max(0, math.floor(x0)), math.max(0, math.floor(y0))
+  local right, bottom = math.min(width - 1, math.floor(x1)), math.min(self.height - 1, math.floor(y1))
+
+  if left > right or top > bottom then return self end
+
+  local tile = tileOf(source)
+
+  if tile and repeatable(tile, data) then
+    local {width: tileWidth, height: tileHeight, data: tilePixels} = tile
+
+    for row = top, bottom do
+      local from = row % tileHeight * tileWidth * 4
+      local column = left
+
+      while column <= right do
+        local phase = column % tileWidth
+        local run = math.min(tileWidth - phase, right - column + 1)
+
+        blend(tilePixels, from + phase * 4, data, (row * width + column) * 4, 1, run)
+        column += run
+      end
+    end
+
     return self
+  end
+
+  if tile then
+    for row = top, bottom do
+      for column = left, right do
+        local red, green, blue, alpha = sampleTile(tile, column, row)
+
+        if alpha > 0 then
+          local underRed, underGreen, underBlue, underAlpha = self:get(column, row)
+
+          self:set(column, row, overPixel(underRed, underGreen, underBlue, underAlpha, red, green, blue, alpha))
+        end
+      end
+    end
+
+    return self
+  end
+
+  local channels = colorTable(source :: Color?)
+  local red, green, blue, alpha = channels[1], channels[2], channels[3], channels[4]
+
+  if not (alpha > 0) then return self end
+
+  local opacity = alpha / 255
+  local rest = 1 - opacity
+  local redShare, greenShare, blueShare = red * opacity, green * opacity, blue * opacity
+
+  for row = top, bottom do
+    local offset = (row * width + left) * 4
+
+    for _ = left, right do
+      local under = buffer.readu32(data, offset)
+      local underOpacity = bit32.rshift(under, 24) / 255
+      local covered = opacity + underOpacity * rest
+
+      if covered <= 0 then
+        buffer.writeu32(data, offset, 0)
+      else
+        local underRed, underGreen, underBlue =
+          bit32.band(under, 255), bit32.band(bit32.rshift(under, 8), 255), bit32.band(bit32.rshift(under, 16), 255)
+
+        buffer.writeu8(data, offset, clamp8((redShare + underRed * underOpacity * rest) / covered))
+        buffer.writeu8(data, offset + 1, clamp8((greenShare + underGreen * underOpacity * rest) / covered))
+        buffer.writeu8(data, offset + 2, clamp8((blueShare + underBlue * underOpacity * rest) / covered))
+        buffer.writeu8(data, offset + 3, clamp8(covered * 255))
+      end
+
+      offset += 4
+    end
+  end
+
+  return self
 end
 
-function Image:polygonOver(points,source)
-    local layer=Magick.new(self.width,self.height); layer:polygon(points,source); self:over(layer); return self
+--- Composites a polygon over what is there.
+function Image.polygonOver(self: Image, points: { { number } }, source: Source?): Image
+  return self:over(Magick.new(self.width, self.height):polygon(points, source))
 end
 
-function Magick.tile(width,height,tile)
-    local out=Magick.new(width,height); out:rect(0,0,width-1,height-1,tile); return out
+--- An image of a size, filled with a tile repeated from its top left corner.
+function Magick.tile(width: number, height: number, tile: Source?): Image
+  return Magick.new(width, height):rect(0, 0, width - 1, height - 1, tile)
 end
 
 function Image:alphaMask()
@@ -887,25 +1093,66 @@ function Image:darken(src,dx,dy)
     return self
 end
 
-function Image:line(x0,y0,x1,y1,source,width)
-    width=math.max(1,math.floor((width or 1)+0.5)); local dx=x1-x0; local dy=y1-y0; local steps=math.max(math.abs(dx),math.abs(dy)); if steps<1 then steps=1 end
-    local rad=(width-1)/2
-    for i=0,steps do local t=i/steps; local x=x0+dx*t; local y=y0+dy*t; self:rect(math.floor(x-rad),math.floor(y-rad),math.floor(x+rad),math.floor(y+rad),source) end
-    return self
+--- Draws a line as a square of the line's width at every step along it.
+function Image.line(self: Image, x0: number, y0: number, x1: number, y1: number, source: Source?, width: number?): Image
+  local thickness = math.max(1, math.floor((width or 1) + 0.5))
+  local across, down = x1 - x0, y1 - y0
+  local steps = math.max(math.abs(across), math.abs(down))
+  local reach = (thickness - 1) / 2
+
+  if steps < 1 then steps = 1 end
+
+  for step = 0, steps do
+    local along = step / steps
+    local column, row = x0 + across * along, y0 + down * along
+
+    self:rect(math.floor(column - reach), math.floor(row - reach), math.floor(column + reach), math.floor(row + reach), source)
+  end
+
+  return self
 end
 
-function Image:strokeRect(x0,y0,x1,y1,source,width)
-    width=math.max(1,math.floor((width or 1)+0.5)); self:rect(x0,y0,x1,y0+width-1,source); self:rect(x0,y1-width+1,x1,y1,source); self:rect(x0,y0+width,x0+width-1,y1-width,source); self:rect(x1-width+1,y0+width,x1,y1-width,source); return self
+--- Draws the outline of a rectangle, its width inside the corners.
+function Image.strokeRect(self: Image, x0: number, y0: number, x1: number, y1: number, source: Source?, width: number?): Image
+  local thickness = math.max(1, math.floor((width or 1) + 0.5))
+
+  self:rect(x0, y0, x1, y0 + thickness - 1, source)
+  self:rect(x0, y1 - thickness + 1, x1, y1, source)
+  self:rect(x0, y0 + thickness, x0 + thickness - 1, y1 - thickness, source)
+  self:rect(x1 - thickness + 1, y0 + thickness, x1, y1 - thickness, source)
+
+  return self
 end
 
-function Image:roundRect(x0,y0,x1,y1,radius,source,width)
-    radius=math.max(0,math.floor(radius or 0)); if not width then
-        self:rect(x0+radius,y0,x1-radius,y1,source); self:rect(x0,y0+radius,x1,y1-radius,source)
-        self:circle(x0+radius,y0+radius,radius,radius,source); self:circle(x1-radius,y0+radius,radius,radius,source); self:circle(x0+radius,y1-radius,radius,radius,source); self:circle(x1-radius,y1-radius,radius,radius,source)
-    else
-        self:strokeRect(x0+radius,y0,x1-radius,y1,source,width); self:line(x0,y0+radius,x0,y1-radius,source,width); self:line(x1,y0+radius,x1,y1-radius,source,width)
-    end
+--- Fills a rectangle with rounded corners, or draws its outline when given a width.
+function Image.roundRect(
+  self: Image,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  radius: number?,
+  source: Source?,
+  width: number?
+): Image
+  local corner = math.max(0, math.floor(radius or 0))
+
+  if width then
+    self:strokeRect(x0 + corner, y0, x1 - corner, y1, source, width)
+    self:line(x0, y0 + corner, x0, y1 - corner, source, width)
+    self:line(x1, y0 + corner, x1, y1 - corner, source, width)
+
     return self
+  end
+
+  self:rect(x0 + corner, y0, x1 - corner, y1, source)
+  self:rect(x0, y0 + corner, x1, y1 - corner, source)
+  self:circle(x0 + corner, y0 + corner, corner, corner, source)
+  self:circle(x1 - corner, y0 + corner, corner, corner, source)
+  self:circle(x0 + corner, y1 - corner, corner, corner, source)
+  self:circle(x1 - corner, y1 - corner, corner, corner, source)
+
+  return self
 end
 
 function Image:resizeFit(maxW,maxH,nearest)
