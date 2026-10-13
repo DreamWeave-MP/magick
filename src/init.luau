@@ -31,6 +31,13 @@ local function clamp8(value: number): number
   return math.floor(math.clamp(value, 0, 255) + 0.5)
 end
 
+--- A channel that is a blend of bytes as the byte it is stored as. A blend lies between what it
+--- blends, give or take a rounding error far short of half, so it is rounded as `clamp8` would
+--- round it with nothing to clamp.
+local function round8(value: number): number
+  return math.floor(value + 0.5)
+end
+
 local function colorTable(color: Color?): { number }
   -- `false` is not a color and is refused below; only nothing at all is the clear color.
   if type(color) == 'nil' then return { 0, 0, 0, 0 } end
@@ -446,12 +453,13 @@ local function blend(from: buffer, sourceAt: number, to: buffer, at: number, fir
       local opacity, underOpacity = alpha / 255, bit32.rshift(under, 24) / 255
       local covered = opacity + underOpacity * (1 - opacity)
 
+      -- Each channel is a blend of the two pixels', and what is covered a share of full.
       if covered > 0 then
-        local outRed = clamp8((red * opacity + underRed * underOpacity * (1 - opacity)) / covered)
-        local outGreen = clamp8((green * opacity + underGreen * underOpacity * (1 - opacity)) / covered)
-        local outBlue = clamp8((blue * opacity + underBlue * underOpacity * (1 - opacity)) / covered)
+        local outRed = round8((red * opacity + underRed * underOpacity * (1 - opacity)) / covered)
+        local outGreen = round8((green * opacity + underGreen * underOpacity * (1 - opacity)) / covered)
+        local outBlue = round8((blue * opacity + underBlue * underOpacity * (1 - opacity)) / covered)
 
-        buffer.writeu32(to, at, outRed + outGreen * 256 + outBlue * 65536 + clamp8(covered * 255) * 16777216)
+        buffer.writeu32(to, at, outRed + outGreen * 256 + outBlue * 65536 + round8(covered * 255) * 16777216)
       end
     end
 
@@ -785,7 +793,7 @@ function Image.resize(self: Image, width: number, height: number, nearest: boole
       local left, right = buffer.readu32(lefts, column * 4), buffer.readu32(rights, column * 4)
       local across = buffer.readf64(weights, column * 8)
       local upperLeft, upperRight, lowerLeft, lowerRight = upper + left, upper + right, lower + left, lower + right
-      local red = clamp8(between(
+      local red = round8(between(
         buffer.readu8(from, upperLeft),
         buffer.readu8(from, upperRight),
         buffer.readu8(from, lowerLeft),
@@ -793,7 +801,7 @@ function Image.resize(self: Image, width: number, height: number, nearest: boole
         across,
         down
       ))
-      local green = clamp8(between(
+      local green = round8(between(
         buffer.readu8(from, upperLeft + 1),
         buffer.readu8(from, upperRight + 1),
         buffer.readu8(from, lowerLeft + 1),
@@ -801,7 +809,7 @@ function Image.resize(self: Image, width: number, height: number, nearest: boole
         across,
         down
       ))
-      local blue = clamp8(between(
+      local blue = round8(between(
         buffer.readu8(from, upperLeft + 2),
         buffer.readu8(from, upperRight + 2),
         buffer.readu8(from, lowerLeft + 2),
@@ -809,7 +817,7 @@ function Image.resize(self: Image, width: number, height: number, nearest: boole
         across,
         down
       ))
-      local alpha = clamp8(between(
+      local alpha = round8(between(
         buffer.readu8(from, upperLeft + 3),
         buffer.readu8(from, upperRight + 3),
         buffer.readu8(from, lowerLeft + 3),
@@ -853,7 +861,7 @@ function Image.rotate(self: Image, angleDegrees: number): Image
       local upper, lower = top * width * 4, math.min(height - 1, top + 1) * width * 4
       local nearer, farther = left * 4, math.min(width - 1, left + 1) * 4
       local upperLeft, upperRight, lowerLeft, lowerRight = upper + nearer, upper + farther, lower + nearer, lower + farther
-      local red = clamp8(between(
+      local red = round8(between(
         buffer.readu8(from, upperLeft),
         buffer.readu8(from, upperRight),
         buffer.readu8(from, lowerLeft),
@@ -861,7 +869,7 @@ function Image.rotate(self: Image, angleDegrees: number): Image
         across,
         down
       ))
-      local green = clamp8(between(
+      local green = round8(between(
         buffer.readu8(from, upperLeft + 1),
         buffer.readu8(from, upperRight + 1),
         buffer.readu8(from, lowerLeft + 1),
@@ -869,7 +877,7 @@ function Image.rotate(self: Image, angleDegrees: number): Image
         across,
         down
       ))
-      local blue = clamp8(between(
+      local blue = round8(between(
         buffer.readu8(from, upperLeft + 2),
         buffer.readu8(from, upperRight + 2),
         buffer.readu8(from, lowerLeft + 2),
@@ -877,7 +885,7 @@ function Image.rotate(self: Image, angleDegrees: number): Image
         across,
         down
       ))
-      local alpha = clamp8(between(
+      local alpha = round8(between(
         buffer.readu8(from, upperLeft + 3),
         buffer.readu8(from, upperRight + 3),
         buffer.readu8(from, lowerLeft + 3),
@@ -1885,7 +1893,7 @@ function Image.grayscale(self: Image): Image
     local pixel = buffer.readu32(pixels, offset)
     local red, green, blue =
       bit32.band(pixel, 255), bit32.band(bit32.rshift(pixel, 8), 255), bit32.band(bit32.rshift(pixel, 16), 255)
-    local gray = clamp8(0.212656 * red + 0.715158 * green + 0.072186 * blue)
+    local gray = round8(0.212656 * red + 0.715158 * green + 0.072186 * blue)
 
     buffer.writeu32(pixels, offset, gray * 65793 + bit32.band(pixel, 0xff000000))
   end
@@ -2198,21 +2206,21 @@ local function accumulate(
   end
 end
 
---- Stores `count` sums as bytes from `at`, each clamped and rounded: four a turn, then what is
---- left.
+--- Stores `count` sums as bytes from `at`, each rounded: four a turn, then what is left. The
+--- weights of a kernel sum to one, so a sum is a blend of the bytes it weighs.
 local function settle(sums: buffer, target: buffer, at: number, count: number)
   local whole = count - count % 4
 
   for index = 0, whole - 4, 4 do
     local from = index * 8
-    local first, second = clamp8(buffer.readf64(sums, from)), clamp8(buffer.readf64(sums, from + 8))
-    local third, fourth = clamp8(buffer.readf64(sums, from + 16)), clamp8(buffer.readf64(sums, from + 24))
+    local first, second = round8(buffer.readf64(sums, from)), round8(buffer.readf64(sums, from + 8))
+    local third, fourth = round8(buffer.readf64(sums, from + 16)), round8(buffer.readf64(sums, from + 24))
 
     buffer.writeu32(target, at + index, first + second * 256 + third * 65536 + fourth * 16777216)
   end
 
   for index = whole, count - 1 do
-    buffer.writeu8(target, at + index, clamp8(buffer.readf64(sums, index * 8)))
+    buffer.writeu8(target, at + index, round8(buffer.readf64(sums, index * 8)))
   end
 end
 
