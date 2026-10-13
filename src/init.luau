@@ -1273,33 +1273,85 @@ function Image.roll(self: Image, dx: number?, dy: number?): Image
   return out
 end
 
-function Image:grayscale()
-    local d=self.data
-    for o=0,buffer.len(d)-4,4 do
-        local r=buffer.readu8(d,o); local g=buffer.readu8(d,o+1); local b=buffer.readu8(d,o+2)
-        local v=clamp8(0.212656*r+0.715158*g+0.072186*b)
-        buffer.writeu8(d,o,v); buffer.writeu8(d,o+1,v); buffer.writeu8(d,o+2,v)
-    end
-    return self
+--- The gray level of a pixel by the sum of its color channels: their mean, rounded.
+local Levels = buffer.create(766)
+
+into(Levels, 'u8')[for total in range(0, 765) => clamp8(total / 3)]
+
+--- Replaces each color channel of the pixels in the first `length` bytes by its entry in a table
+--- of 256 bytes, one table a channel; alpha stays as it is.
+local function mapColors(pixels: buffer, length: number, reds: buffer, greens: buffer, blues: buffer)
+  for offset = 0, length - 4, 4 do
+    local pixel = buffer.readu32(pixels, offset)
+    local red = buffer.readu8(reds, bit32.band(pixel, 255))
+    local green = buffer.readu8(greens, bit32.band(bit32.rshift(pixel, 8), 255))
+    local blue = buffer.readu8(blues, bit32.band(bit32.rshift(pixel, 16), 255))
+
+    buffer.writeu32(pixels, offset, red + green * 256 + blue * 65536 + bit32.band(pixel, 0xff000000))
+  end
 end
 
-function Image:threshold(level)
-    if level<=1 then level*=255 end
-    local d=self.data
-    for o=0,buffer.len(d)-4,4 do
-        local v=((buffer.readu8(d,o)+buffer.readu8(d,o+1)+buffer.readu8(d,o+2))/3)>=level and 255 or 0
-        buffer.writeu8(d,o,v); buffer.writeu8(d,o+1,v); buffer.writeu8(d,o+2,v)
-    end
-    return self
+--- How many of the first `count` pixels are at each gray level: 256 counts, four bytes each.
+local function levels(pixels: buffer, count: number): buffer
+  local histogram = buffer.create(256 * 4)
+
+  for offset = 0, count * 4 - 4, 4 do
+    local pixel = buffer.readu32(pixels, offset)
+    local total = bit32.band(pixel, 255) + bit32.band(bit32.rshift(pixel, 8), 255) + bit32.band(bit32.rshift(pixel, 16), 255)
+    local at = buffer.readu8(Levels, total) * 4
+
+    buffer.writeu32(histogram, at, buffer.readu32(histogram, at) + 1)
+  end
+
+  return histogram
 end
 
-function Image:colorize(color,amount)
-    local c=colorTable(color); local t=(amount or 100)/100; local d=self.data
-    for o=0,buffer.len(d)-4,4 do
-        local r=buffer.readu8(d,o); local g=buffer.readu8(d,o+1); local b=buffer.readu8(d,o+2)
-        buffer.writeu8(d,o,clamp8(r+(c[1]-r)*t)); buffer.writeu8(d,o+1,clamp8(g+(c[2]-g)*t)); buffer.writeu8(d,o+2,clamp8(b+(c[3]-b)*t))
-    end
-    return self
+--- Makes every pixel the gray of its luminance; alpha stays.
+function Image.grayscale(self: Image): Image
+  local pixels = self.data
+
+  for offset = 0, buffer.len(pixels) - 4, 4 do
+    local pixel = buffer.readu32(pixels, offset)
+    local red, green, blue =
+      bit32.band(pixel, 255), bit32.band(bit32.rshift(pixel, 8), 255), bit32.band(bit32.rshift(pixel, 16), 255)
+    local gray = clamp8(0.212656 * red + 0.715158 * green + 0.072186 * blue)
+
+    buffer.writeu32(pixels, offset, gray * 65793 + bit32.band(pixel, 0xff000000))
+  end
+
+  return self
+end
+
+--- Makes every pixel white when the mean of its color channels reaches a level, and black when
+--- not; a level up to 1 is a share of full. Alpha stays.
+function Image.threshold(self: Image, level: number): Image
+  local pixels = self.data
+  local cut = if level <= 1 then level * 255 else level
+  local whites = buffer.create(766)
+
+  into(whites, 'u8')[for total in range(0, 765) => if total / 3 >= cut then 255 else 0]
+
+  for offset = 0, buffer.len(pixels) - 4, 4 do
+    local pixel = buffer.readu32(pixels, offset)
+    local total = bit32.band(pixel, 255) + bit32.band(bit32.rshift(pixel, 8), 255) + bit32.band(bit32.rshift(pixel, 16), 255)
+
+    buffer.writeu32(pixels, offset, buffer.readu8(whites, total) * 65793 + bit32.band(pixel, 0xff000000))
+  end
+
+  return self
+end
+
+--- Moves every color channel a share of the way to a color's; alpha stays.
+function Image.colorize(self: Image, color: Color?, amount: number?): Image
+  local channels, share = colorTable(color), (amount or 100) / 100
+  local reds, greens, blues = buffer.create(256), buffer.create(256), buffer.create(256)
+
+  into(reds, 'u8')[for value in range(0, 255) => clamp8(value + (channels[1] - value) * share)]
+  into(greens, 'u8')[for value in range(0, 255) => clamp8(value + (channels[2] - value) * share)]
+  into(blues, 'u8')[for value in range(0, 255) => clamp8(value + (channels[3] - value) * share)]
+  mapColors(self.data, buffer.len(self.data), reds, greens, blues)
+
+  return self
 end
 
 function Image:transparent(color)
@@ -1460,40 +1512,87 @@ function Magick.mathCompose(a,b,k1,k2,k3,k4)
     return out
 end
 
-function Image:polynomial(slope,intercept)
-    local d=self.data; local bias=intercept*255
-    for o=0,buffer.len(d)-4,4 do
-        buffer.writeu8(d,o,clamp8(buffer.readu8(d,o)*slope+bias))
-        buffer.writeu8(d,o+1,clamp8(buffer.readu8(d,o+1)*slope+bias))
-        buffer.writeu8(d,o+2,clamp8(buffer.readu8(d,o+2)*slope+bias))
+--- Maps every color channel through a line: a slope, and an intercept as a share of full.
+function Image.polynomial(self: Image, slope: number, intercept: number): Image
+  local bias = intercept * 255
+  local mapped = buffer.create(256)
+
+  into(mapped, 'u8')[for value in range(0, 255) => clamp8(value * slope + bias)]
+  mapColors(self.data, buffer.len(self.data), mapped, mapped, mapped)
+
+  return self
+end
+
+--- Stretches the color channels so the gray level a share of the pixels lie at or below becomes
+--- black and the level a share lie above becomes white, each share a percentage.
+function Image.contrastStretch(self: Image, lowPercent: number?, highPercent: number?): Image
+  local count = self.width * self.height
+  local histogram = levels(self.data, count)
+  local lowTarget, highTarget = count * (lowPercent or 0) / 100, count * (1 - (highPercent or 0) / 100)
+  local low, high, seen = 0, 255, 0
+
+  for level = 0, 255 do
+    seen += buffer.readu32(histogram, level * 4)
+
+    if seen >= lowTarget then
+      low = level
+      break
     end
-    return self
+  end
+
+  seen = 0
+
+  for level = 0, 255 do
+    seen += buffer.readu32(histogram, level * 4)
+
+    if seen >= highTarget then
+      high = level
+      break
+    end
+  end
+
+  if high <= low then return self end
+
+  local scale = 255 / (high - low)
+  local mapped = buffer.create(256)
+
+  into(mapped, 'u8')[for value in range(0, 255) => clamp8((value - low) * scale)]
+  mapColors(self.data, count * 4, mapped, mapped, mapped)
+
+  return self
 end
 
-function Image:contrastStretch(lowPct,highPct)
-    local hist={}; for i=0,255 do hist[i]=0 end; local n=self.width*self.height
-    for y=0,self.height-1 do for x=0,self.width-1 do local r,g,b=self:get(x,y); hist[clamp8((r+g+b)/3)]+=1 end end
-    local loTarget=n*(lowPct or 0)/100; local hiTarget=n*(1-(highPct or 0)/100); local acc=0; local lo=0; local hi=255
-    for i=0,255 do acc+=hist[i]; if acc>=loTarget then lo=i; break end end
-    acc=0; for i=0,255 do acc+=hist[i]; if acc>=hiTarget then hi=i; break end end
-    if hi<=lo then return self end
-    local scale=255/(hi-lo)
-    for y=0,self.height-1 do for x=0,self.width-1 do local r,g,b,a=self:get(x,y); self:set(x,y,(r-lo)*scale,(g-lo)*scale,(b-lo)*scale,a) end end
-    return self
+--- Bends the color channels along a sigmoid about a midpoint, a share of full or a percentage.
+function Image.sigmoidalContrast(self: Image, contrast: number?, midpoint: number?): Image
+  local steepness, middle = contrast or 2, midpoint or 0.5
+
+  if middle > 1 then middle /= 100 end
+
+  local function sigmoid(value: number): number return 1 / (1 + math.exp(steepness * (middle - value))) end
+
+  local low, high = sigmoid(0), sigmoid(1)
+  local span = high - low
+  local mapped = buffer.create(256)
+
+  into(mapped, 'u8')[for value in range(0, 255) => clamp8((sigmoid(value / 255) - low) / span * 255)]
+  mapColors(self.data, self.width * self.height * 4, mapped, mapped, mapped)
+
+  return self
 end
 
-function Image:sigmoidalContrast(contrast,midpoint)
-    local c=contrast or 2; local m=(midpoint or 0.5); if m>1 then m/=100 end
-    local function sig(x) return 1/(1+math.exp(c*(m-x))) end
-    local lo=sig(0); local hi=sig(1); local denom=hi-lo
-    for y=0,self.height-1 do for x=0,self.width-1 do local r,g,b,a=self:get(x,y); local function f(v) return (sig(v/255)-lo)/denom*255 end; self:set(x,y,f(r),f(g),f(b),a) end end
-    return self
-end
+--- The gray level half of the pixels lie at or below.
+function Image.median(self: Image): number
+  local count = self.width * self.height
+  local histogram = levels(self.data, count)
+  local seen = 0
 
-function Image:median()
-    local hist={}; for i=0,255 do hist[i]=0 end; local n=self.width*self.height
-    for y=0,self.height-1 do for x=0,self.width-1 do local r,g,b=self:get(x,y); hist[clamp8((r+g+b)/3)]+=1 end end
-    local acc=0; for i=0,255 do acc+=hist[i]; if acc*2>=n then return i end end; return 0
+  for level = 0, 255 do
+    seen += buffer.readu32(histogram, level * 4)
+
+    if seen * 2 >= count then return level end
+  end
+
+  return 0
 end
 
 function Magick.verticalGradient(width: number, height: number, top: Color?, bottom: Color?): Image
