@@ -37,6 +37,53 @@ local function speckled(width: number, height: number, seed: number): support.Ma
   return magick.mask(width, height, covered)
 end
 
+--- The Gaussian blur written the plain way: every channel of a pixel is the weighted sum of the
+--- pixels within three sigmas of it along its row, rounded to a byte, and then the same along its
+--- column, with a pixel past an edge taken for the edge's.
+local function plainBlur(image: Image, sigma: number): Image
+  local spread = math.max(0.01, sigma)
+  local radius = math.max(1, math.ceil(spread * 3))
+  local weights: { number } = {}
+  local total = 0
+
+  for offset = -radius, radius do
+    local weight = math.exp(-(offset * offset) / (2 * spread * spread))
+
+    table.insert(weights, weight)
+    total += weight
+  end
+
+  for index = 1, #weights do
+    weights[index] /= total
+  end
+
+  local function pass(source: Image, alongRow: boolean): Image
+    local out = magick.new(source.width, source.height)
+
+    for row = 0, source.height - 1 do
+      for column = 0, source.width - 1 do
+        local sums = { 0, 0, 0, 0 }
+
+        for offset = -radius, radius do
+          local fromColumn = if alongRow then math.clamp(column + offset, 0, source.width - 1) else column
+          local fromRow = if alongRow then row else math.clamp(row + offset, 0, source.height - 1)
+          local channels = { source:get(fromColumn, fromRow) }
+
+          for channel = 1, 4 do
+            sums[channel] += channels[channel] * weights[offset + radius + 1]
+          end
+        end
+
+        out:set(column, row, sums[1], sums[2], sums[3], sums[4])
+      end
+    end
+
+    return out
+  end
+
+  return pass(pass(image, true), false)
+end
+
 suite.describe('colors', function()
   suite.it('reads tables, hex strings and nothing', function()
     local named = {}
@@ -577,6 +624,27 @@ suite.describe('generators', function()
     pin('gaussianBlur none', pixels(unblurred))
     pin('gaussianBlur negative', pixels(magick.gaussianBlur(source, -2)))
     pin('gaussianBlur source', pixels(source))
+  end)
+
+  suite.it('blurs as the plain sums do, an image narrower than the kernel too', function()
+    local shapes = {
+      { 23, 17, 0.8 },
+      { 40, 9, 3 },
+      { 4, 4, 1 },
+      { 5, 3, 1 },
+      { 1, 1, 2 },
+      { 3, 20, 2.5 },
+      { 40, 2, 1.5 },
+      { 17, 30, 2 },
+    }
+
+    for index, shape in shapes do
+      local source = noisy(shape[1], shape[2], 90 + index)
+      local blurred = magick.gaussianBlur(source, shape[3])
+
+      expect(pixels(blurred)).toBe(pixels(plainBlur(source, shape[3])))
+      pin(`gaussianBlur {shape[1]}x{shape[2]} by {shape[3]}`, pixels(blurred))
+    end
   end)
 
   suite.it('drops a shadow', function()

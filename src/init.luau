@@ -710,7 +710,7 @@ function Magick.gaussianBlur(img,sigma)
         local leftEnd=math.min(width-1,r-1)
         for x=0,leftEnd do
             local rr,gg,bb,aa=0,0,0,0
-            for i=-r,r do local sx=math.max(0,x+i); local so=row+sx*4; local weight=k[i+r+1]; rr+=buffer.readu8(src,so)*weight; gg+=buffer.readu8(src,so+1)*weight; bb+=buffer.readu8(src,so+2)*weight; aa+=buffer.readu8(src,so+3)*weight end
+            for i=-r,r do local sx=math.max(0,math.min(width-1,x+i)); local so=row+sx*4; local weight=k[i+r+1]; rr+=buffer.readu8(src,so)*weight; gg+=buffer.readu8(src,so+1)*weight; bb+=buffer.readu8(src,so+2)*weight; aa+=buffer.readu8(src,so+3)*weight end
             local o=row+x*4; buffer.writeu8(td,o,clamp8(rr)); buffer.writeu8(td,o+1,clamp8(gg)); buffer.writeu8(td,o+2,clamp8(bb)); buffer.writeu8(td,o+3,clamp8(aa))
         end
         if interiorX0<=interiorX1 then
@@ -723,7 +723,7 @@ function Magick.gaussianBlur(img,sigma)
         local rightStart=math.max(leftEnd+1,width-r)
         for x=rightStart,width-1 do
             local rr,gg,bb,aa=0,0,0,0
-            for i=-r,r do local sx=math.min(width-1,x+i); local so=row+sx*4; local weight=k[i+r+1]; rr+=buffer.readu8(src,so)*weight; gg+=buffer.readu8(src,so+1)*weight; bb+=buffer.readu8(src,so+2)*weight; aa+=buffer.readu8(src,so+3)*weight end
+            for i=-r,r do local sx=math.max(0,math.min(width-1,x+i)); local so=row+sx*4; local weight=k[i+r+1]; rr+=buffer.readu8(src,so)*weight; gg+=buffer.readu8(src,so+1)*weight; bb+=buffer.readu8(src,so+2)*weight; aa+=buffer.readu8(src,so+3)*weight end
             local o=row+x*4; buffer.writeu8(td,o,clamp8(rr)); buffer.writeu8(td,o+1,clamp8(gg)); buffer.writeu8(td,o+2,clamp8(bb)); buffer.writeu8(td,o+3,clamp8(aa))
         end
     end
