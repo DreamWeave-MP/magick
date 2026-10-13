@@ -205,6 +205,8 @@ return table.freeze {
     ['colorize'] = '9x7:762b8fa8',
     ['colorize part'] = '9x7:5d8da0cc',
     ['colorize beyond'] = '9x7:15ea3b55',
+    ['colorize many pixels'] = '48x30:40001529',
+    ['maskToImage many pixels'] = '48x30:62045aa6',
     ['transparent'] = '9x7:56fa6163',
     ['opaque'] = '9x7:2c473e86',
     ['opaque clamped'] = '9x7:d9c2c0ab',

@@ -582,6 +582,21 @@ suite.describe('tone', function()
     end
   end)
 
+  suite.it('colorizes and shades an image of many pixels as it does its halves, which are few', function()
+    local wide, soft = noisy(48, 30, 130), coverage(48, 30, 131)
+    local color: magick.Color = { 250.5, 3, 128, 100 }
+    local colorized = wide:clone():colorize(color, 40)
+    local shaded = magick.maskToImage(soft, color)
+    local upper, lower = magick.mask(48, 15, soft.data[1:720]), magick.mask(48, 15, soft.data[721:1440])
+
+    expect(pixels(colorized:crop(24, 30, 0, 0))).toBe(pixels(wide:crop(24, 30, 0, 0):colorize(color, 40)))
+    expect(pixels(colorized:crop(24, 30, 24, 0))).toBe(pixels(wide:crop(24, 30, 24, 0):colorize(color, 40)))
+    expect(pixels(shaded:crop(48, 15, 0, 0))).toBe(pixels(magick.maskToImage(upper, color)))
+    expect(pixels(shaded:crop(48, 15, 0, 15))).toBe(pixels(magick.maskToImage(lower, color)))
+    pin('colorize many pixels', pixels(colorized))
+    pin('maskToImage many pixels', pixels(shaded))
+  end)
+
   suite.it('swaps colors and sets alpha', function()
     local image = noisy(9, 7, 73)
     image:set(2, 2, 10, 20, 30, 200)

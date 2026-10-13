@@ -1014,6 +1014,10 @@ function Magick.mask(width: number, height: number, covered: buffer): Mask
   return { width = width, height = height, data = covered }
 end
 
+--- How many pixels an operation must have before tables of 256 entries, filled for that one call,
+--- cost less than working each pixel out: below it, filling the tables is most of the work.
+local TableWorth = 1024
+
 --- Stores, for each of `count` bytes of coverage, the pixel `shades` holds for its value: 256
 --- pixels, four bytes each.
 local function shade(covered: buffer, count: number, shades: buffer, pixels: buffer)
@@ -1029,10 +1033,20 @@ function Magick.maskToImage(mask: Mask, color: Color?): Image
   local {width, height, data: covered} = mask
   local out = Magick.new(width, height)
   local hue, alphaScale = channels[1] + channels[2] * 256 + channels[3] * 65536, channels[4] / 255
+  local count, pixels = width * height, out.data
+
+  if count < TableWorth then
+    for index = 0, count - 1 do
+      buffer.writeu32(pixels, index * 4, hue + clamp8(buffer.readu8(covered, index) * alphaScale) * 16777216)
+    end
+
+    return out
+  end
+
   local shades = buffer.create(256 * 4)
 
   into(shades, 'u32')[for value in range(0, 255) => hue + clamp8(value * alphaScale) * 16777216]
-  shade(covered, width * height, shades, out.data)
+  shade(covered, count, shades, pixels)
 
   return out
 end
@@ -1994,12 +2008,29 @@ end
 --- Moves every color channel a share of the way to a color's; alpha stays.
 function Image.colorize(self: Image, color: Color?, amount: number?): Image
   local channels, share = colorTable(color), (amount or 100) / 100
+  local pixels = self.data
+  local length = buffer.len(pixels)
+
+  if length < TableWorth * 4 then
+    local toRed, toGreen, toBlue = channels[1], channels[2], channels[3]
+
+    for offset = 0, length - 4, 4 do
+      local red, green, blue = buffer.readu8(pixels, offset), buffer.readu8(pixels, offset + 1), buffer.readu8(pixels, offset + 2)
+
+      buffer.writeu8(pixels, offset, clamp8(red + (toRed - red) * share))
+      buffer.writeu8(pixels, offset + 1, clamp8(green + (toGreen - green) * share))
+      buffer.writeu8(pixels, offset + 2, clamp8(blue + (toBlue - blue) * share))
+    end
+
+    return self
+  end
+
   local reds, greens, blues = buffer.create(256), buffer.create(256), buffer.create(256)
 
   into(reds, 'u8')[for value in range(0, 255) => clamp8(value + (channels[1] - value) * share)]
   into(greens, 'u8')[for value in range(0, 255) => clamp8(value + (channels[2] - value) * share)]
   into(blues, 'u8')[for value in range(0, 255) => clamp8(value + (channels[3] - value) * share)]
-  mapColors(self.data, buffer.len(self.data), reds, greens, blues)
+  mapColors(pixels, length, reds, greens, blues)
 
   return self
 end
