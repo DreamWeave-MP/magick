@@ -1244,10 +1244,26 @@ function Magick.tile(width: number, height: number, tile: Source?): Image
   return Magick.new(width, height):rect(0, 0, width - 1, height - 1, tile)
 end
 
-function Image:alphaMask()
-    local n=self.width*self.height; local b=buffer.create(n); local d=self.data
-    for i=0,n-1 do buffer.writeu8(b,i,buffer.readu8(d,i*4+3)) end
-    return Magick.mask(self.width,self.height,b)
+--- The alpha of every pixel, as a mask.
+function Image.alphaMask(self: Image): Mask
+  local {width, height, data} = self
+  local count = width * height
+  local alphas = buffer.create(count)
+  local whole = count - count % 4
+
+  for index = 0, whole - 4, 4 do
+    local at = index * 4 + 3
+    local first, second, third, fourth =
+      buffer.readu8(data, at), buffer.readu8(data, at + 4), buffer.readu8(data, at + 8), buffer.readu8(data, at + 12)
+
+    buffer.writeu32(alphas, index, first + second * 256 + third * 65536 + fourth * 16777216)
+  end
+
+  for index = whole, count - 1 do
+    buffer.writeu8(alphas, index, buffer.readu8(data, index * 4 + 3))
+  end
+
+  return Magick.mask(width, height, alphas)
 end
 
 --- Moves every pixel right and down by whole pixels; what leaves an edge comes back in at the
@@ -1354,16 +1370,51 @@ function Image.colorize(self: Image, color: Color?, amount: number?): Image
   return self
 end
 
-function Image:transparent(color)
-    local c=colorTable(color)
-    for y=0,self.height-1 do for x=0,self.width-1 do local r,g,b,a=self:get(x,y); if r==c[1] and g==c[2] and b==c[3] then self:set(x,y,r,g,b,0) end end end
-    return self
+--- Whether a channel is a byte, which is all that a stored channel can equal.
+local function isByte(value: number): boolean
+  return value >= 0 and value <= 255 and value % 1 == 0
 end
 
-function Image:opaque(fromColor,toColor)
-    local f=colorTable(fromColor); local t=colorTable(toColor)
-    for y=0,self.height-1 do for x=0,self.width-1 do local r,g,b,a=self:get(x,y); if r==f[1] and g==f[2] and b==f[3] then self:set(x,y,t[1],t[2],t[3],a) end end end
-    return self
+--- Makes every pixel of a color clear.
+function Image.transparent(self: Image, color: Color?): Image
+  local channels = colorTable(color)
+  local pixels = self.data
+
+  if not (isByte(channels[1]) and isByte(channels[2]) and isByte(channels[3])) then return self end
+
+  local key = channels[1] + channels[2] * 256 + channels[3] * 65536
+
+  for offset = 0, self.width * self.height * 4 - 4, 4 do
+    local pixel = buffer.readu32(pixels, offset)
+    -- 0 for a pixel of the color and 1 for any other, so the loop stores every pixel and
+    -- chooses nothing.
+    local other = math.min(bit32.bxor(bit32.band(pixel, 0xffffff), key), 1)
+
+    buffer.writeu32(pixels, offset, pixel - (1 - other) * bit32.band(pixel, 0xff000000))
+  end
+
+  return self
+end
+
+--- Gives every pixel of one color another; alpha stays.
+function Image.opaque(self: Image, fromColor: Color?, toColor: Color?): Image
+  local from, to = colorTable(fromColor), colorTable(toColor)
+  local pixels = self.data
+
+  if not (isByte(from[1]) and isByte(from[2]) and isByte(from[3])) then return self end
+
+  local key = from[1] + from[2] * 256 + from[3] * 65536
+  local swapped = bit32.band(stored(to[1], to[2], to[3], 0), 0xffffff)
+
+  for offset = 0, self.width * self.height * 4 - 4, 4 do
+    local pixel = buffer.readu32(pixels, offset)
+    local color = bit32.band(pixel, 0xffffff)
+    local other = math.min(bit32.bxor(color, key), 1)
+
+    buffer.writeu32(pixels, offset, pixel + (1 - other) * (swapped - color))
+  end
+
+  return self
 end
 
 --- Sets every pixel's alpha: a value up to 1 is a share of opaque, a larger one the byte itself.
@@ -1376,12 +1427,62 @@ function Image.setAlpha(self: Image, value: number): Image
   return self
 end
 
-function Image:darken(src,dx,dy)
-    dx=dx or 0; dy=dy or 0
-    for sy=0,src.height-1 do local ty=sy+dy; if ty>=0 and ty<self.height then for sx=0,src.width-1 do local tx=sx+dx; if tx>=0 and tx<self.width then
-        local sr,sg,sb,sa=src:get(sx,sy); if sa>0 then local dr,dg,db,da=self:get(tx,ty); self:set(tx,ty,math.min(dr,sr),math.min(dg,sg),math.min(db,sb),math.max(da,sa)) end
-    end end end end
+--- Keeps the darker of each color channel, and the greater alpha, wherever `source`, laid at an
+--- offset, is not clear.
+function Image.darken(self: Image, source: Image, dx: number?, dy: number?): Image
+  local across, down = dx or 0, dy or 0
+  local {width, height, data: to} = self
+  local {width: sourceWidth, height: sourceHeight, data: from} = source
+
+  -- An offset that is not whole lands between pixels, which only a get and a set per pixel
+  -- reproduce.
+  if across % 1 ~= 0 or down % 1 ~= 0 then
+    for row = 0, sourceHeight - 1 do
+      for column = 0, sourceWidth - 1 do
+        local toColumn, toRow = column + across, row + down
+        local red, green, blue, alpha = source:get(column, row)
+
+        if toRow >= 0 and toRow < height and toColumn >= 0 and toColumn < width and alpha > 0 then
+          local underRed, underGreen, underBlue, underAlpha = self:get(toColumn, toRow)
+
+          self:set(
+            toColumn,
+            toRow,
+            math.min(underRed, red),
+            math.min(underGreen, green),
+            math.min(underBlue, blue),
+            math.max(underAlpha, alpha)
+          )
+        end
+      end
+    end
+
     return self
+  end
+
+  local left, right = math.max(0, -across), math.min(sourceWidth, width - across) - 1
+
+  for row = math.max(0, -down), math.min(sourceHeight, height - down) - 1 do
+    local sourceAt = (row * sourceWidth + left) * 4
+    local at = ((row + down) * width + left + across) * 4
+
+    for _ = left, right do
+      local pixel, under = buffer.readu32(from, sourceAt), buffer.readu32(to, at)
+      local red = math.min(bit32.band(under, 255), bit32.band(pixel, 255))
+      local green = math.min(bit32.band(bit32.rshift(under, 8), 255), bit32.band(bit32.rshift(pixel, 8), 255))
+      local blue = math.min(bit32.band(bit32.rshift(under, 16), 255), bit32.band(bit32.rshift(pixel, 16), 255))
+      local alpha = math.max(bit32.rshift(under, 24), bit32.rshift(pixel, 24))
+      local darker = red + green * 256 + blue * 65536 + alpha * 16777216
+      -- 1 where the source is not clear and 0 where it is, so a clear pixel stores what was there.
+      local covered = math.min(bit32.rshift(pixel, 24), 1)
+
+      buffer.writeu32(to, at, under + covered * (darker - under))
+      sourceAt += 4
+      at += 4
+    end
+  end
+
+  return self
 end
 
 --- Draws a line as a square of the line's width at every step along it.
