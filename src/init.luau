@@ -1374,6 +1374,12 @@ function Magick.stats(image: Image): Stats
   }
 end
 
+--- The bytes of a file given as them or as a path to read them from. A file that cannot be read
+--- comes back as nothing, which the first look at its length refuses.
+local function opened(source: buffer | string): buffer
+  return (if type(source) == 'string' then jess.fs.readBuffer(source) else source) :: buffer
+end
+
 local PngSignature = '\137PNG\r\n\26\n'
 
 --- How many bytes a pixel takes for each PNG color type at eight bits a sample: gray, RGB, gray
@@ -1462,7 +1468,7 @@ end
 --- The image a PNG file holds, the file given as its bytes or as a path to read them from. The
 --- samples must be eight bits and not interlaced; any color type but a palette is read.
 function Magick.readPNG(source: buffer | string): Image
-  local file = if type(source) == 'string' then jess.fs.readBuffer(source) else source
+  local file = opened(source)
   local length = buffer.len(file)
 
   if length < 8 or buffer.readstring(file, 0, 8) ~= PngSignature then error('magick: not a PNG', 2) end
@@ -1492,7 +1498,7 @@ function Magick.readPNG(source: buffer | string): Image
     position = payload + size + 4
   end
 
-  if not width or not height or depth ~= 8 or interlace ~= 0 then
+  if not width or not height or not colorType or depth ~= 8 or interlace ~= 0 then
     error('magick: PNG requires 8-bit non-interlaced samples', 2)
   end
 
@@ -1577,7 +1583,7 @@ end
 --- The image a BMP file holds, the file given as its bytes or as a path to read them from. The
 --- pixels must be 24 or 32 bits and not compressed.
 function Magick.readBMP(source: buffer | string): Image
-  local file = if type(source) == 'string' then jess.fs.readBuffer(source) else source
+  local file = opened(source)
 
   if buffer.len(file) < 54 or buffer.readstring(file, 0, 2) ~= 'BM' then error('magick: not a BMP', 2) end
 
@@ -1612,7 +1618,7 @@ end
 --- The image a TGA file holds, the file given as its bytes or as a path to read them from: true
 --- color of 24 or 32 bits or gray of 8, plain or in run-length packets, from any corner.
 function Magick.readTGA(source: buffer | string): Image
-  local file = if type(source) == 'string' then jess.fs.readBuffer(source) else source
+  local file = opened(source)
 
   if buffer.len(file) < 18 then error('magick: truncated TGA', 2) end
 
@@ -1696,7 +1702,7 @@ function Magick.read(path: string): Image
   local kind = extension(path)
 
   if kind == 'png' then return Magick.readPNG(path) end
-  if kind == 'dds' then return Magick.readDDS(jess.fs.readBuffer(path)) end
+  if kind == 'dds' then return Magick.readDDS(opened(path)) end
   if kind == 'bmp' then return Magick.readBMP(path) end
   if kind == 'tga' then return Magick.readTGA(path) end
 
