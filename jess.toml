@@ -1,0 +1,16 @@
+manifest_version = 1
+
+[package]
+id = "org.dreamweave.magick"
+version = "0.1.2"
+jess_api = "1"
+include = ["src", "LICENSES", "README.md"]
+tests = ["tests/basic.luau", "tests/png.luau"]
+
+[modules]
+"@magick" = "src/init.luau"
+
+[[layer]]
+id = "org.dreamweave.magick"
+requires = []
+exports = ["@magick"]
