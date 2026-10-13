@@ -24,12 +24,10 @@ export type Color = string | { number } | { r: number?, g: number?, b: number?, 
 --- What a shape is filled from: a color, or an image repeated as a tile.
 export type Source = Color | Image
 
---- A channel as the byte it is stored as: clamped, and rounded half up.
+--- A channel as the byte it is stored as: clamped, and rounded half up. The clamp comes first and
+--- by `math.clamp`, not by comparing, so a loop that rounds a channel has no branch in it.
 local function clamp8(value: number): number
-  if value <= 0 then return 0 end
-  if value >= 255 then return 255 end
-
-  return math.floor(value + 0.5)
+  return math.floor(math.clamp(value, 0, 255) + 0.5)
 end
 
 local function colorTable(color: Color?): { number }
