@@ -1,3 +1,4 @@
+--!strict
 --!native
 --!optimize 2
 -- Pure-Luau raster subset used by the Morrowind UI generator port.
@@ -168,6 +169,7 @@ local function tileOf(source: unknown): Image?
   return source :: Image
 end
 
+--- The pixel of a tile that repeats without end, through the tile's own `get`.
 local function sampleTile(tile: Image, column: number, row: number): (number, number, number, number)
   local wrappedColumn, wrappedRow = column % tile.width, row % tile.height
 
@@ -175,16 +177,6 @@ local function sampleTile(tile: Image, column: number, row: number): (number, nu
   if wrappedRow < 0 then wrappedRow += tile.height end
 
   return tile:get(wrappedColumn, wrappedRow)
-end
-
-local function sourcePixel(source: Source?, column: number, row: number): (number, number, number, number)
-  local tile = tileOf(source)
-
-  if tile then return sampleTile(tile, column, row) end
-
-  local channels = colorTable(source :: Color?)
-
-  return channels[1], channels[2], channels[3], channels[4]
 end
 
 --- Whether a tile's pixels can be copied a run at a time into `target`: it is an image made here,
@@ -505,42 +497,87 @@ function Image.over(self: Image, source: Image, dx: number?, dy: number?): Image
   return self
 end
 
-function Image:overMask(mask,color,dx,dy)
-    dx=dx or 0; dy=dy or 0
-    local c=colorTable(color); local sx0=math.max(0,-dx); local sy0=math.max(0,-dy)
-    local sx1=math.min(mask.width,self.width-dx); local sy1=math.min(mask.height,self.height-dy)
-    if sx0>=sx1 or sy0>=sy1 then return self end
-    local md=mask.data; local dd=self.data; local mw=mask.width; local dw=self.width; local opaqueSource=c[4]==255; local alphaScale=c[4]/255; local rgb=c[1]+c[2]*256+c[3]*65536; local opaquePixel=rgb+4278190080
-    for sy=sy0,sy1-1 do
-        local x=sx0; local mo=sy*mw+sx0; local doff=((sy+dy)*dw+(sx0+dx))*4
-        while x<sx1 do
-            if x+4<=sx1 then
-                local maskWord=buffer.readu32(md,mo)
-                if maskWord==0 then x+=4; mo+=4; doff+=16; continue end
-                if opaqueSource and maskWord==4294967295 then
-                    buffer.writeu32(dd,doff,opaquePixel); buffer.writeu32(dd,doff+4,opaquePixel); buffer.writeu32(dd,doff+8,opaquePixel); buffer.writeu32(dd,doff+12,opaquePixel)
-                    x+=4; mo+=4; doff+=16; continue
-                end
-            end
-            local maskAlpha=buffer.readu8(md,mo); local sa=if opaqueSource then maskAlpha else clamp8(maskAlpha*alphaScale)
-            if sa==255 then
-                buffer.writeu32(dd,doff,opaquePixel)
-            elseif sa~=0 then
-                local dp=buffer.readu32(dd,doff); local da=bit32.rshift(dp,24)
-                local dr=bit32.band(dp,255); local dg=bit32.band(bit32.rshift(dp,8),255); local db=bit32.band(bit32.rshift(dp,16),255)
-                local af=sa/255
-                local rr,gg,bb,aa
-                if da==255 then
-                    local inv=1-af; rr=clamp8(c[1]*af+dr*inv); gg=clamp8(c[2]*af+dg*inv); bb=clamp8(c[3]*af+db*inv); aa=255
-                else
-                    local daf=da/255; local oa=af+daf*(1-af); rr=clamp8((c[1]*af+dr*daf*(1-af))/oa); gg=clamp8((c[2]*af+dg*daf*(1-af))/oa); bb=clamp8((c[3]*af+db*daf*(1-af))/oa); aa=clamp8(oa*255)
-                end
-                buffer.writeu32(dd,doff,rr+gg*256+bb*65536+aa*16777216)
-            end
-            x+=1; mo+=1; doff+=4
+--- Composites a color through a mask laid at an offset: each byte of coverage, scaled by the
+--- color's alpha, is the alpha the color goes over the pixel at.
+function Image.overMask(self: Image, mask: Mask, color: Color?, dx: number?, dy: number?): Image
+  local across, down = dx or 0, dy or 0
+  local channels = colorTable(color)
+  local left, top = math.max(0, -across), math.max(0, -down)
+  local right, bottom = math.min(mask.width, self.width - across), math.min(mask.height, self.height - down)
+
+  if left >= right or top >= bottom then return self end
+
+  local covered, pixels = mask.data, self.data
+  local maskWidth, width = mask.width, self.width
+  local red, green, blue = channels[1], channels[2], channels[3]
+  local opaqueColor, alphaScale = channels[4] == 255, channels[4] / 255
+  local solid = red + green * 256 + blue * 65536 + 0xff000000
+  -- The alpha each byte of coverage composites at, as a number: it is not stored.
+  local strengths = buffer.create(256 * 8)
+
+  into(strengths, 'f64')[for value in range(0, 255) => if opaqueColor then value else clamp8(value * alphaScale)]
+
+  for row = top, bottom - 1 do
+    local column, from = left, row * maskWidth + left
+    local at = ((row + down) * width + (left + across)) * 4
+
+    while column < right do
+      -- Four bytes of coverage read as one say when four pixels are all left alone, or all
+      -- stored as they are.
+      local word = if column + 4 <= right then buffer.readu32(covered, from) else -1
+
+      if word == 0 then
+        column += 4
+        from += 4
+        at += 16
+        continue
+      end
+
+      if opaqueColor and word == 0xffffffff then
+        buffer.writeu32(pixels, at, solid)
+        buffer.writeu32(pixels, at + 4, solid)
+        buffer.writeu32(pixels, at + 8, solid)
+        buffer.writeu32(pixels, at + 12, solid)
+        column += 4
+        from += 4
+        at += 16
+        continue
+      end
+
+      local alpha = buffer.readf64(strengths, buffer.readu8(covered, from) * 8)
+
+      if alpha == 255 then
+        buffer.writeu32(pixels, at, solid)
+      elseif alpha ~= 0 then
+        local under = buffer.readu32(pixels, at)
+        local underRed, underGreen, underBlue =
+          bit32.band(under, 255), bit32.band(bit32.rshift(under, 8), 255), bit32.band(bit32.rshift(under, 16), 255)
+        local opacity, underOpacity = alpha / 255, bit32.rshift(under, 24) / 255
+        local rest = 1 - opacity
+
+        if underOpacity == 1 then
+          local outRed = clamp8(red * opacity + underRed * rest)
+          local outGreen = clamp8(green * opacity + underGreen * rest)
+          local outBlue = clamp8(blue * opacity + underBlue * rest)
+
+          buffer.writeu32(pixels, at, outRed + outGreen * 256 + outBlue * 65536 + 0xff000000)
+        else
+          local over = opacity + underOpacity * rest
+          local outRed = clamp8((red * opacity + underRed * underOpacity * rest) / over)
+          local outGreen = clamp8((green * opacity + underGreen * underOpacity * rest) / over)
+          local outBlue = clamp8((blue * opacity + underBlue * underOpacity * rest) / over)
+
+          buffer.writeu32(pixels, at, outRed + outGreen * 256 + outBlue * 65536 + clamp8(over * 255) * 16777216)
         end
+      end
+
+      column += 1
+      from += 1
+      at += 4
     end
-    return self
+  end
+
+  return self
 end
 
 --- Composites the alpha of `mask`, an image of this one's size, into this one's: `dstin` keeps
@@ -1328,11 +1365,6 @@ function Magick.stats(image: Image): Stats
     nonzeroAlpha = #[for value in data[1:count, 'u8@4+3'] if value ~= 0 => value],
   }
 end
-
-
--- -----------------------------------------------------------------------------
--- General-purpose raster/codec extensions (v0.2)
--- -----------------------------------------------------------------------------
 
 local PngSignature = '\137PNG\r\n\26\n'
 
