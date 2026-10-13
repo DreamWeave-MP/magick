@@ -543,18 +543,37 @@ function Image:overMask(mask,color,dx,dy)
     return self
 end
 
-function Image:copyAlpha(mask, mode)
-    assert(self.width==mask.width and self.height==mask.height,"magick: mask geometry mismatch")
-    for y=0,self.height-1 do for x=0,self.width-1 do
-        local r,g,b,a=self:get(x,y); local _,_,_,ma=mask:get(x,y)
-        local na
-        if mode=="dstin" then na=clamp8(a*ma/255)
-        elseif mode=="dstout" then na=clamp8(a*(255-ma)/255)
-        elseif mode=="copy" then na=ma
-        else error("magick: unknown alpha composite mode "..tostring(mode),2) end
-        self:set(x,y,r,g,b,na)
-    end end
+--- Composites the alpha of `mask`, an image of this one's size, into this one's: `dstin` keeps
+--- what the mask covers, `dstout` what it leaves, and `copy` takes the mask's alpha as it is.
+function Image.copyAlpha(self: Image, mask: Image, mode: string): Image
+  assert(self.width == mask.width and self.height == mask.height, 'magick: mask geometry mismatch')
+
+  local count = self.width * self.height
+  local pixels, maskPixels = self.data, mask.data
+
+  if count == 0 then return self end
+
+  if mode == 'copy' then
+    dataPlane.scale(maskPixels, 'u8@4', 3, count, 1, pixels, 3)
+
     return self
+  end
+
+  if mode ~= 'dstin' and mode ~= 'dstout' then
+    error('magick: unknown alpha composite mode ' .. tostring(mode), 2)
+  end
+
+  -- What the mask keeps of a pixel's alpha is its own alpha or what that lacks of opaque: one
+  -- sum of whole numbers either way, so the loop does not choose per pixel.
+  local base, sign = if mode == 'dstin' then 0 else 255, if mode == 'dstin' then 1 else -1
+
+  for offset = 3, count * 4 - 1, 4 do
+    local kept = base + sign * buffer.readu8(maskPixels, offset)
+
+    buffer.writeu8(pixels, offset, clamp8(buffer.readu8(pixels, offset) * kept / 255))
+  end
+
+  return self
 end
 
 --- A copy of a rectangle of the image, clear where the rectangle is outside it.
@@ -954,11 +973,24 @@ function Magick.writeDDS(path,img)
     return path
 end
 
-function Magick.stats(img)
-    local n=img.width*img.height; local sr,sg,sb,sa=0,0,0,0; local nonzero=0
-    for y=0,img.height-1 do for x=0,img.width-1 do local r,g,b,a=img:get(x,y); sr+=r;sg+=g;sb+=b;sa+=a;if a~=0 then nonzero+=1 end end end
-    if n==0 then n=1 end
-    return {width=img.width,height=img.height,mean={sr/n,sg/n,sb/n,sa/n},nonzeroAlpha=nonzero}
+export type Stats = { width: number, height: number, mean: { number }, nonzeroAlpha: number }
+
+--- The size of an image, the mean of each of its channels, and how many pixels are not clear.
+function Magick.stats(image: Image): Stats
+  local {width, height, data} = image
+  local count = width * height
+  local divisor = if count == 0 then 1 else count
+  local red = sum[for value in data[1:count, 'u8@4'] => value]
+  local green = sum[for value in data[1:count, 'u8@4+1'] => value]
+  local blue = sum[for value in data[1:count, 'u8@4+2'] => value]
+  local alpha = sum[for value in data[1:count, 'u8@4+3'] => value]
+
+  return {
+    width = width,
+    height = height,
+    mean = { red / divisor, green / divisor, blue / divisor, alpha / divisor },
+    nonzeroAlpha = #[for value in data[1:count, 'u8@4+3'] if value ~= 0 => value],
+  }
 end
 
 
@@ -1282,10 +1314,14 @@ function Image:opaque(fromColor,toColor)
     return self
 end
 
-function Image:setAlpha(value)
-    local a=value<=1 and clamp8(value*255) or clamp8(value)
-    for y=0,self.height-1 do for x=0,self.width-1 do local r,g,b=self:get(x,y); self:set(x,y,r,g,b,a) end end
-    return self
+--- Sets every pixel's alpha: a value up to 1 is a share of opaque, a larger one the byte itself.
+function Image.setAlpha(self: Image, value: number): Image
+  local alpha = if value <= 1 then clamp8(value * 255) else clamp8(value)
+  local count = self.width * self.height
+
+  if count > 0 then dataPlane.fill(self.data, 'u8@4+3', 0, count, alpha) end
+
+  return self
 end
 
 function Image:darken(src,dx,dy)
