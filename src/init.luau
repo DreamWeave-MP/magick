@@ -188,6 +188,21 @@ local function sourcePixel(source: Source?, column: number, row: number): (numbe
   return channels[1], channels[2], channels[3], channels[4]
 end
 
+--- Whether a tile's pixels can be copied a run at a time into `target`: it is an image made here,
+--- of at least a pixel, whose buffer holds exactly its rows and is not the one being drawn on.
+--- Anything else is sampled pixel by pixel through its own `get`.
+local function repeatable(tile: Image, target: buffer): boolean
+  local {width, height, data} = tile
+
+  return getmetatable(tile) == Image
+    and data ~= target
+    and width >= 1
+    and height >= 1
+    and width % 1 == 0
+    and height % 1 == 0
+    and buffer.len(data) == width * height * 4
+end
+
 --- Fills the rectangle between two corners, both inside it, clipped to the image.
 function Image.rect(self: Image, x0: number, y0: number, x1: number, y1: number, source: Source?): Image
   if x0 > x1 then x0, x1 = x1, x0 end
@@ -199,6 +214,38 @@ function Image.rect(self: Image, x0: number, y0: number, x1: number, y1: number,
   if left > right or top > bottom then return self end
 
   local tile = tileOf(source)
+  local pixels, stride = self.data, self.width * 4
+  local first, span = top * stride + left * 4, (right - left + 1) * 4
+
+  if tile and repeatable(tile, pixels) then
+    local {width: tileWidth, height: tileHeight, data: tilePixels} = tile
+    local phase = left % tileWidth
+    local lead = math.min((tileWidth - phase) * 4, span)
+
+    for row = top, bottom do
+      local at = row * stride + left * 4
+
+      -- A row repeats the one a tile's height above it.
+      if row - top >= tileHeight then
+        buffer.copy(pixels, at, pixels, at - tileHeight * stride, span)
+        continue
+      end
+
+      local from = (row % tileHeight) * tileWidth * 4
+      local done = lead
+
+      buffer.copy(pixels, at, tilePixels, from + phase * 4, lead)
+
+      while done < span do
+        local run = math.min(tileWidth * 4, span - done)
+
+        buffer.copy(pixels, at + done, tilePixels, from, run)
+        done += run
+      end
+    end
+
+    return self
+  end
 
   if tile then
     for row = top, bottom do
@@ -211,9 +258,6 @@ function Image.rect(self: Image, x0: number, y0: number, x1: number, y1: number,
 
     return self
   end
-
-  local pixels, stride = self.data, self.width * 4
-  local first, span = top * stride + left * 4, (right - left + 1) * 4
 
   buffer.writeu32(pixels, first, packed(colorTable(source :: Color?)))
   replicate(pixels, first, 4, span)
@@ -722,10 +766,27 @@ function Image:alphaMask()
     return Magick.mask(self.width,self.height,b)
 end
 
-function Image:roll(dx,dy)
-    dx=math.floor(dx or 0); dy=math.floor(dy or 0); local out=Magick.new(self.width,self.height)
-    for y=0,self.height-1 do for x=0,self.width-1 do local tx=(x+dx)%self.width; local ty=(y+dy)%self.height; out:set(tx,ty,self:get(x,y)) end end
-    return out
+--- Moves every pixel right and down by whole pixels; what leaves an edge comes back in at the
+--- opposite one.
+function Image.roll(self: Image, dx: number?, dy: number?): Image
+  local {width, height, data} = self
+  local across, down = math.floor(dx or 0), math.floor(dy or 0)
+  local out = Magick.new(width, height)
+
+  if width == 0 or height == 0 then return out end
+
+  local stride = width * 4
+  local wrapped = across % width * 4
+  local kept = stride - wrapped
+
+  for row = 0, height - 1 do
+    local from, to = row * stride, (row + down) % height * stride
+
+    buffer.copy(out.data, to + wrapped, data, from, kept)
+    buffer.copy(out.data, to, data, from + kept, wrapped)
+  end
+
+  return out
 end
 
 function Image:grayscale()
