@@ -1822,56 +1822,175 @@ function Image.resizeFit(self: Image, maxWidth: number, maxHeight: number, neare
   return self:resize(math.max(1, math.floor(width * scale + 0.5)), math.max(1, math.floor(height * scale + 0.5)), nearest)
 end
 
-local function gaussianKernel(sigma)
-    sigma=math.max(0.01,sigma); local radius=math.max(1,math.ceil(sigma*3)); local k={}; local sum=0
-    for i=-radius,radius do local v=math.exp(-(i*i)/(2*sigma*sigma)); k[#k+1]=v; sum+=v end
-    for i=1,#k do k[i]/=sum end
-    return k,radius
+--- The weights of a Gaussian of a deviation out to three deviations either way, eight bytes
+--- each and summing to one, and how many pixels that is to a side. The weights are followed by
+--- zeros to a multiple of four, so they can be taken four at a time.
+local function gaussianKernel(sigma: number): (buffer, number)
+  local spread = math.max(0.01, sigma)
+  local radius = math.max(1, math.ceil(spread * 3))
+  local weights = [for offset in range(-radius, radius) => math.exp(-(offset * offset) / (2 * spread * spread))]
+  local total = sum[for weight in weights => weight]
+  local kernel = buffer.create(math.ceil(#weights / 4) * 4 * 8)
+
+  into(kernel, 'f64')[for weight in weights => weight / total]
+
+  return kernel, radius
 end
 
-function Magick.gaussianBlur(img,sigma)
-    if sigma<=0 then return img:clone() end
-    local k,r=gaussianKernel(sigma); local width=img.width; local height=img.height
-    local src=img.data; local tmp=Magick.new(width,height); local td=tmp.data; local out=Magick.new(width,height); local od=out.data
-    local kernelSize=#k
-    local interiorX0=r; local interiorX1=width-r-1
-    for y=0,height-1 do
-        local row=y*width*4
-        local leftEnd=math.min(width-1,r-1)
-        for x=0,leftEnd do
-            local rr,gg,bb,aa=0,0,0,0
-            for i=-r,r do local sx=math.max(0,math.min(width-1,x+i)); local so=row+sx*4; local weight=k[i+r+1]; rr+=buffer.readu8(src,so)*weight; gg+=buffer.readu8(src,so+1)*weight; bb+=buffer.readu8(src,so+2)*weight; aa+=buffer.readu8(src,so+3)*weight end
-            local o=row+x*4; buffer.writeu8(td,o,clamp8(rr)); buffer.writeu8(td,o+1,clamp8(gg)); buffer.writeu8(td,o+2,clamp8(bb)); buffer.writeu8(td,o+3,clamp8(aa))
-        end
-        if interiorX0<=interiorX1 then
-            for x=interiorX0,interiorX1 do
-                local rr,gg,bb,aa=0,0,0,0; local so=row+(x-r)*4
-                for ki=1,kernelSize do local weight=k[ki]; rr+=buffer.readu8(src,so)*weight; gg+=buffer.readu8(src,so+1)*weight; bb+=buffer.readu8(src,so+2)*weight; aa+=buffer.readu8(src,so+3)*weight; so+=4 end
-                local o=row+x*4; buffer.writeu8(td,o,clamp8(rr)); buffer.writeu8(td,o+1,clamp8(gg)); buffer.writeu8(td,o+2,clamp8(bb)); buffer.writeu8(td,o+3,clamp8(aa))
-            end
-        end
-        local rightStart=math.max(leftEnd+1,width-r)
-        for x=rightStart,width-1 do
-            local rr,gg,bb,aa=0,0,0,0
-            for i=-r,r do local sx=math.max(0,math.min(width-1,x+i)); local so=row+sx*4; local weight=k[i+r+1]; rr+=buffer.readu8(src,so)*weight; gg+=buffer.readu8(src,so+1)*weight; bb+=buffer.readu8(src,so+2)*weight; aa+=buffer.readu8(src,so+3)*weight end
-            local o=row+x*4; buffer.writeu8(td,o,clamp8(rr)); buffer.writeu8(td,o+1,clamp8(gg)); buffer.writeu8(td,o+2,clamp8(bb)); buffer.writeu8(td,o+3,clamp8(aa))
-        end
+--- Adds to each of `count` sums four terms, in order: the bytes of `source` as far from `first`,
+--- `second`, `third` and `fourth`, each times the weight of its tap, the four of `kernel` from
+--- `tap`. A sum is read once and stored once for the four, and a term of weight zero leaves it
+--- as it was.
+local function accumulate(
+  sums: buffer,
+  count: number,
+  source: buffer,
+  first: number,
+  second: number,
+  third: number,
+  fourth: number,
+  kernel: buffer,
+  tap: number
+)
+  local firstWeight, secondWeight = buffer.readf64(kernel, tap * 8), buffer.readf64(kernel, tap * 8 + 8)
+  local thirdWeight, fourthWeight = buffer.readf64(kernel, tap * 8 + 16), buffer.readf64(kernel, tap * 8 + 24)
+  local whole = count - count % 4
+
+  for index = 0, whole - 4, 4 do
+    local at = index * 8
+
+    buffer.writef64(
+      sums,
+      at,
+      buffer.readf64(sums, at)
+        + buffer.readu8(source, first + index) * firstWeight
+        + buffer.readu8(source, second + index) * secondWeight
+        + buffer.readu8(source, third + index) * thirdWeight
+        + buffer.readu8(source, fourth + index) * fourthWeight
+    )
+    buffer.writef64(
+      sums,
+      at + 8,
+      buffer.readf64(sums, at + 8)
+        + buffer.readu8(source, first + index + 1) * firstWeight
+        + buffer.readu8(source, second + index + 1) * secondWeight
+        + buffer.readu8(source, third + index + 1) * thirdWeight
+        + buffer.readu8(source, fourth + index + 1) * fourthWeight
+    )
+    buffer.writef64(
+      sums,
+      at + 16,
+      buffer.readf64(sums, at + 16)
+        + buffer.readu8(source, first + index + 2) * firstWeight
+        + buffer.readu8(source, second + index + 2) * secondWeight
+        + buffer.readu8(source, third + index + 2) * thirdWeight
+        + buffer.readu8(source, fourth + index + 2) * fourthWeight
+    )
+    buffer.writef64(
+      sums,
+      at + 24,
+      buffer.readf64(sums, at + 24)
+        + buffer.readu8(source, first + index + 3) * firstWeight
+        + buffer.readu8(source, second + index + 3) * secondWeight
+        + buffer.readu8(source, third + index + 3) * thirdWeight
+        + buffer.readu8(source, fourth + index + 3) * fourthWeight
+    )
+  end
+
+  for index = whole, count - 1 do
+    buffer.writef64(
+      sums,
+      index * 8,
+      buffer.readf64(sums, index * 8)
+        + buffer.readu8(source, first + index) * firstWeight
+        + buffer.readu8(source, second + index) * secondWeight
+        + buffer.readu8(source, third + index) * thirdWeight
+        + buffer.readu8(source, fourth + index) * fourthWeight
+    )
+  end
+end
+
+--- Stores `count` sums as bytes from `at`, each clamped and rounded: four a turn, then what is
+--- left.
+local function settle(sums: buffer, target: buffer, at: number, count: number)
+  local whole = count - count % 4
+
+  for index = 0, whole - 4, 4 do
+    local from = index * 8
+    local first, second = clamp8(buffer.readf64(sums, from)), clamp8(buffer.readf64(sums, from + 8))
+    local third, fourth = clamp8(buffer.readf64(sums, from + 16)), clamp8(buffer.readf64(sums, from + 24))
+
+    buffer.writeu32(target, at + index, first + second * 256 + third * 65536 + fourth * 16777216)
+  end
+
+  for index = whole, count - 1 do
+    buffer.writeu8(target, at + index, clamp8(buffer.readf64(sums, index * 8)))
+  end
+end
+
+--- Blurs rows of `width` pixels of `channels` bytes each into `target`, by a Gaussian of a
+--- deviation. Every channel of a pixel becomes the weighted sum of the pixels within the kernel
+--- along its row, rounded, and then the same along its column; a pixel past an edge is taken for
+--- the edge's. A sum adds its terms from the first pixel of the kernel to the last, a whole row
+--- of sums at a time.
+local function blur(source: buffer, target: buffer, width: number, height: number, channels: number, sigma: number)
+  local kernel, radius = gaussianKernel(sigma)
+  local stride, last = width * channels, radius * 2
+
+  if stride == 0 or height == 0 then return end
+
+  local alongRows, sums = buffer.create(stride * height), buffer.create(stride * 8)
+  -- A row with its first pixel and its last repeated a radius beyond it, so that no sum along
+  -- it has an edge to mind.
+  local edge, bottom = radius * channels, height - 1
+  local padded = buffer.create(stride + edge * 2)
+
+  for row = 0, height - 1 do
+    local start = row * stride
+
+    buffer.copy(padded, 0, source, start, channels)
+    replicate(padded, 0, channels, edge)
+    buffer.copy(padded, edge, source, start, stride)
+    buffer.copy(padded, edge + stride, source, start + stride - channels, channels)
+    replicate(padded, edge + stride, channels, edge)
+    buffer.fill(sums, 0, 0)
+
+    -- A tap past the last has no weight; it reads where the last one does.
+    for tap = 0, last, 4 do
+      local second, third, fourth = math.min(tap + 1, last), math.min(tap + 2, last), math.min(tap + 3, last)
+
+      accumulate(sums, stride, padded, tap * channels, second * channels, third * channels, fourth * channels, kernel, tap)
     end
-    local stride=width*4; local interiorY0=r; local interiorY1=height-r-1
-    for y=0,height-1 do
-        local middle=y>=interiorY0 and y<=interiorY1
-        for x=0,width-1 do
-            local rr,gg,bb,aa=0,0,0,0
-            if middle then
-                local so=(y-r)*stride+x*4
-                for ki=1,kernelSize do local weight=k[ki]; rr+=buffer.readu8(td,so)*weight; gg+=buffer.readu8(td,so+1)*weight; bb+=buffer.readu8(td,so+2)*weight; aa+=buffer.readu8(td,so+3)*weight; so+=stride end
-            else
-                for i=-r,r do local sy=math.max(0,math.min(height-1,y+i)); local so=sy*stride+x*4; local weight=k[i+r+1]; rr+=buffer.readu8(td,so)*weight; gg+=buffer.readu8(td,so+1)*weight; bb+=buffer.readu8(td,so+2)*weight; aa+=buffer.readu8(td,so+3)*weight end
-            end
-            local o=y*stride+x*4; buffer.writeu8(od,o,clamp8(rr)); buffer.writeu8(od,o+1,clamp8(gg)); buffer.writeu8(od,o+2,clamp8(bb)); buffer.writeu8(od,o+3,clamp8(aa))
-        end
+
+    settle(sums, alongRows, start, stride)
+  end
+
+  for row = 0, height - 1 do
+    buffer.fill(sums, 0, 0)
+
+    for tap = 0, last, 4 do
+      local above = row - radius + tap
+      local first, second = math.max(0, math.min(bottom, above)), math.max(0, math.min(bottom, above + 1))
+      local third, fourth = math.max(0, math.min(bottom, above + 2)), math.max(0, math.min(bottom, above + 3))
+
+      accumulate(sums, stride, alongRows, first * stride, second * stride, third * stride, fourth * stride, kernel, tap)
     end
-    return out
+
+    settle(sums, target, row * stride, stride)
+  end
+end
+
+--- A copy of an image blurred by a Gaussian of a deviation in pixels, or as it is when the
+--- deviation is none.
+function Magick.gaussianBlur(image: Image, sigma: number): Image
+  if sigma <= 0 then return image:clone() end
+
+  local {width, height, data} = image
+  local out = Magick.new(width, height)
+
+  blur(data, out.data, width, height, 4, sigma)
+
+  return out
 end
 
 --- A channel value as a share of full.
@@ -2061,21 +2180,45 @@ function Magick.addGaussianNoise(image: Image, seed: number?, attenuate: number?
   return out
 end
 
-function Magick.shadowed(img,opacity,sigma,dx,dy)
-    opacity=(opacity or 80)/100; sigma=sigma or 3; dx=dx or 0; dy=dy or 0
-    local margin=math.max(1,math.ceil(sigma*2))
-    local padded=Magick.new(img.width+margin*2,img.height+margin*2)
-    for y=0,img.height-1 do for x=0,img.width-1 do local _,_,_,a=img:get(x,y); if a>0 then padded:set(x+margin,y+margin,255,255,255,a) end end end
-    local blurred=Magick.gaussianBlur(padded,sigma)
-    local shadow=Magick.new(padded.width,padded.height)
-    for y=0,blurred.height-1 do for x=0,blurred.width-1 do local _,_,_,a=blurred:get(x,y); if a>0 then shadow:set(x,y,0,0,0,a*opacity) end end end
-    local sx=dx-margin; local sy=dy-margin
-    local minx=math.min(0,sx); local miny=math.min(0,sy)
-    local maxx=math.max(img.width,sx+shadow.width); local maxy=math.max(img.height,sy+shadow.height)
-    local out=Magick.new(maxx-minx,maxy-miny)
-    out:over(shadow,sx-minx,sy-miny)
-    out:over(img,-minx,-miny)
-    return out
+--- An image with a shadow under it: its alpha blurred by a Gaussian, drawn black at a percentage
+--- of opaque and at an offset, in an image large enough for both.
+function Magick.shadowed(image: Image, opacity: number?, sigma: number?, dx: number?, dy: number?): Image
+  local strength, spread = (opacity or 80) / 100, sigma or 3
+  local across, down = dx or 0, dy or 0
+  local margin = math.max(1, math.ceil(spread * 2))
+  local {width, height, data} = image
+  local shadow = Magick.new(width + margin * 2, height + margin * 2)
+  local count = shadow.width * shadow.height
+  -- The shadow is black, so of the image only its alpha is blurred: one byte a pixel, inside a
+  -- margin for the blur to spread into.
+  local alphas, shades = buffer.create(count), buffer.create(256 * 4)
+
+  for row = 0, height - 1 do
+    local at, from = (row + margin) * shadow.width + margin, row * width * 4 + 3
+
+    for column = 0, width - 1 do
+      buffer.writeu8(alphas, at + column, buffer.readu8(data, from + column * 4))
+    end
+  end
+
+  if not (spread <= 0) then
+    local sharp = alphas
+
+    alphas = buffer.create(count)
+    blur(sharp, alphas, shadow.width, shadow.height, 1, spread)
+  end
+
+  for alpha = 1, 255 do
+    buffer.writeu32(shades, alpha * 4, stored(0, 0, 0, alpha * strength))
+  end
+
+  shade(alphas, count, shades, shadow.data)
+
+  local shadowLeft, shadowTop = across - margin, down - margin
+  local left, top = math.min(0, shadowLeft), math.min(0, shadowTop)
+  local right, bottom = math.max(width, shadowLeft + shadow.width), math.max(height, shadowTop + shadow.height)
+
+  return Magick.new(right - left, bottom - top):over(shadow, shadowLeft - left, shadowTop - top):over(image, -left, -top)
 end
 
 --- Lays images out in a grid of cells the size of the first, left to right and then down.
