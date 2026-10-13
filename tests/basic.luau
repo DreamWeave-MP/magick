@@ -658,6 +658,67 @@ suite.describe('generators', function()
   end)
 end)
 
+suite.describe('sources the fast paths decline', function()
+  --- A tile that is an image in all but its metatable, which only looks the methods up: its
+  --- pixels are sampled through its `get`, one at a time.
+  local function wrapped(image: Image): Image
+    local tile = setmetatable({ width = image.width, height = image.height, data = image.data }, { __index = magick.Image })
+
+    return (tile :: unknown) :: Image
+  end
+
+  suite.it('fills from a tile sampled pixel by pixel as from one copied in runs', function()
+    local tile = noisy(4, 3, 6)
+    local triangle = { { 1, 1 }, { 10, 3 }, { 4, 8 } }
+    local soft = coverage(9, 7, 61)
+
+    pin('rect sampled', pixels(noisy(12, 9, 5):rect(1, 1, 10, 7, wrapped(tile))))
+    expect(pixels(noisy(12, 9, 5):rect(1, 1, 10, 7, wrapped(tile)))).toBe(pixels(noisy(12, 9, 5):rect(1, 1, 10, 7, tile)))
+    pin('polygon sampled', pixels(noisy(12, 9, 5):polygon(triangle, wrapped(tile))))
+    expect(pixels(noisy(12, 9, 5):polygon(triangle, wrapped(tile)))).toBe(pixels(noisy(12, 9, 5):polygon(triangle, tile)))
+    pin('circle sampled', pixels(noisy(12, 9, 5):circle(5.5, 4.5, 4, 2, wrapped(tile))))
+    expect(pixels(noisy(12, 9, 5):circle(5.5, 4.5, 4, 2, wrapped(tile)))).toBe(pixels(noisy(12, 9, 5):circle(5.5, 4.5, 4, 2, tile)))
+    pin('rectOver sampled', pixels(noisy(12, 9, 5):rectOver(1, 1, 10, 7, wrapped(tile))))
+    expect(pixels(noisy(12, 9, 5):rectOver(1, 1, 10, 7, wrapped(tile)))).toBe(pixels(noisy(12, 9, 5):rectOver(1, 1, 10, 7, tile)))
+    pin('paintMask sampled', pixels(magick.paintMask(soft, wrapped(tile))))
+    expect(pixels(magick.paintMask(soft, wrapped(tile)))).toBe(pixels(magick.paintMask(soft, tile)))
+  end)
+
+  suite.it('draws an image from itself pixel by pixel', function()
+    local polygon, circle, over = noisy(8, 8, 110), noisy(8, 8, 111), noisy(8, 8, 112)
+    local alpha, darker = noisy(8, 8, 113), noisy(8, 8, 114)
+
+    pin('polygon from itself', pixels(polygon:polygon({ { 0, 0 }, { 8, 1 }, { 3, 8 } }, polygon)))
+    pin('circle from itself', pixels(circle:circle(4, 4, 3, 3, circle)))
+    pin('rectOver from itself', pixels(over:rectOver(1, 1, 6, 6, over)))
+    pin('copyAlpha from itself', pixels(alpha:copyAlpha(alpha, 'dstin')))
+    pin('darken from itself', pixels(darker:darken(darker, 1, 2)))
+  end)
+
+  suite.it('lays an image at an offset between pixels as it always has', function()
+    pin('over by half a pixel', pixels(noisy(14, 10, 21):over(noisy(9, 8, 23), 0.5, 2)))
+    pin('darken by half a pixel', pixels(noisy(12, 9, 43):darken(noisy(7, 6, 44), 2.5, 1)))
+  end)
+
+  suite.it('takes channels that are not bytes as it always has', function()
+    local keyed = noisy(6, 6, 115)
+    keyed:set(2, 2, 44, 1, 0, 200)
+
+    pin('transparent beyond a byte', pixels(keyed:clone():transparent { 300, 0, 0 }))
+    pin('opaque beyond a byte', pixels(keyed:clone():opaque({ 300, 0, 0 }, { 1, 2, 3 })))
+    pin('opaque between bytes', pixels(keyed:clone():opaque({ 44, 1, 0.5 }, { 1, 2, 3 })))
+    pin('maskToImage carried', pixels(magick.maskToImage(coverage(9, 7, 61), { 300.5, 2, 3, 128 })))
+    pin('paintMask clamped', pixels(magick.paintMask(coverage(9, 7, 61), { 300, -4, 12.5, 200 })))
+    pin('overMask carried', pixels(noisy(16, 12, 32):overMask(coverage(13, 9, 31), { 300.5, -2, 3, 255 }, 1, 1)))
+    pin('rectOver beyond a byte', pixels(noisy(12, 9, 5):rectOver(1, 1, 10, 7, { 300, -20, 12.5, 400 })))
+    pin('rectOver faint', pixels(noisy(12, 9, 5):rectOver(1, 1, 10, 7, { 10, 20, 30, 0.4 })))
+    pin('setAlpha empty', pixels(magick.new(0, 0):setAlpha(0.5)))
+    pin('shadowed sharp', pixels(magick.shadowed(sprite(20, 12, 87), 60, 0, 2, 3)))
+    pin('rotate90 one row', pixels(noisy(9, 1, 116):rotate90(true)))
+    pin('rotate90 one column', pixels(noisy(1, 9, 117):rotate90(false)))
+  end)
+end)
+
 suite.it('holds every golden to something', function() expect(unused()).toEqual {} end)
 
 return suite
