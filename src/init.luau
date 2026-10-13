@@ -880,51 +880,224 @@ function Magick.noise(width,height,color,seed,attenuate)
     return out
 end
 
-function Magick.mask(width,height,bytes)
-    if buffer.len(bytes) ~= width*height then error("magick: mask byte length mismatch",2) end
-    return {width=width,height=height,data=bytes}
+--- Wraps bytes of coverage, a byte a pixel, as a mask of a size. The mask shares the buffer.
+function Magick.mask(width: number, height: number, covered: buffer): Mask
+  if buffer.len(covered) ~= width * height then error('magick: mask byte length mismatch', 2) end
+
+  return { width = width, height = height, data = covered }
 end
 
-function Magick.maskToImage(mask,color)
-    local c=colorTable(color or "#ffffff"); local out=Magick.new(mask.width,mask.height); local od=out.data; local md=mask.data
-    local rgb=c[1]+c[2]*256+c[3]*65536; local alphaScale=c[4]/255
-    for i=0,mask.width*mask.height-1 do local a=clamp8(buffer.readu8(md,i)*alphaScale); buffer.writeu32(od,i*4,rgb+a*16777216) end
-    return out
+--- Stores, for each of `count` bytes of coverage, the pixel `shades` holds for its value: 256
+--- pixels, four bytes each.
+local function shade(covered: buffer, count: number, shades: buffer, pixels: buffer)
+  for index = 0, count - 1 do
+    buffer.writeu32(pixels, index * 4, buffer.readu32(shades, buffer.readu8(covered, index) * 4))
+  end
 end
 
-function Magick.paintMask(mask,source)
-    local out=Magick.new(mask.width,mask.height)
-    for y=0,mask.height-1 do for x=0,mask.width-1 do local a=buffer.readu8(mask.data,y*mask.width+x); if a~=0 then local r,g,b,sa=sourcePixel(source,x,y); out:set(x,y,r,g,b,clamp8(sa*a/255)) end end end
-    return out
+--- An image of a color, white when none is given, with the mask's coverage scaled by the color's
+--- alpha as its own.
+function Magick.maskToImage(mask: Mask, color: Color?): Image
+  local channels = colorTable(color or '#ffffff')
+  local {width, height, data: covered} = mask
+  local out = Magick.new(width, height)
+  local hue, alphaScale = channels[1] + channels[2] * 256 + channels[3] * 65536, channels[4] / 255
+  local shades = buffer.create(256 * 4)
+
+  into(shades, 'u32')[for value in range(0, 255) => hue + clamp8(value * alphaScale) * 16777216]
+  shade(covered, width * height, shades, out.data)
+
+  return out
 end
 
-function Magick.dilateMask(mask,radius)
-    radius=math.max(0,math.floor(radius)); local out=buffer.create(mask.width*mask.height)
-    for y=0,mask.height-1 do for x=0,mask.width-1 do local best=0
-        for yy=math.max(0,y-radius),math.min(mask.height-1,y+radius) do for xx=math.max(0,x-radius),math.min(mask.width-1,x+radius) do local v=buffer.readu8(mask.data,yy*mask.width+xx); if v>best then best=v end end end
-        buffer.writeu8(out,y*mask.width+x,best)
-    end end
-    return Magick.mask(mask.width,mask.height,out)
-end
+--- An image filled from a color or a tile wherever the mask covers, the mask's coverage scaling
+--- the alpha of what it is filled from, and clear wherever it does not.
+function Magick.paintMask(mask: Mask, source: Source?): Image
+  local {width, height, data: covered} = mask
+  local count = width * height
+  local out = Magick.new(width, height)
+  local pixels = out.data
+  local tile = tileOf(source)
 
-function Magick.blurMask(mask,radius)
-    radius=math.max(0,math.floor(radius+0.5)); if radius==0 then local b=buffer.create(buffer.len(mask.data)); buffer.copy(b,0,mask.data,0,buffer.len(mask.data)); return Magick.mask(mask.width,mask.height,b) end
-    local w,h=mask.width,mask.height; local temp=buffer.create(w*h); local out=buffer.create(w*h); local span=radius*2+1
-    for y=0,h-1 do local sum=0
-        for xx=-radius,radius do local sx=math.max(0,math.min(w-1,xx)); sum += buffer.readu8(mask.data,y*w+sx) end
-        for x=0,w-1 do buffer.writeu8(temp,y*w+x,clamp8(sum/span)); local outx=math.max(0,x-radius); local inx=math.min(w-1,x+radius+1); sum += buffer.readu8(mask.data,y*w+inx)-buffer.readu8(mask.data,y*w+outx) end
+  if tile and repeatable(tile, pixels) then
+    local {width: tileWidth, height: tileHeight, data: tilePixels} = tile
+
+    for row = 0, height - 1 do
+      local from, start = row % tileHeight * tileWidth * 4, row * width
+
+      for column = 0, width - 1 do
+        local cover = buffer.readu8(covered, start + column)
+        local pixel = buffer.readu32(tilePixels, from + column % tileWidth * 4)
+        local alpha = clamp8(bit32.rshift(pixel, 24) * cover / 255)
+
+        -- A pixel the mask leaves out stays clear, color and all: its pixel is multiplied away.
+        buffer.writeu32(pixels, (start + column) * 4, math.min(cover, 1) * (bit32.band(pixel, 0xffffff) + alpha * 16777216))
+      end
     end
-    for x=0,w-1 do local sum=0
-        for yy=-radius,radius do local sy=math.max(0,math.min(h-1,yy)); sum += buffer.readu8(temp,sy*w+x) end
-        for y=0,h-1 do buffer.writeu8(out,y*w+x,clamp8(sum/span)); local outy=math.max(0,y-radius); local iny=math.min(h-1,y+radius+1); sum += buffer.readu8(temp,iny*w+x)-buffer.readu8(temp,outy*w+x) end
+
+    return out
+  end
+
+  if tile then
+    for row = 0, height - 1 do
+      for column = 0, width - 1 do
+        local cover = buffer.readu8(covered, row * width + column)
+
+        if cover ~= 0 then
+          local red, green, blue, alpha = sampleTile(tile, column, row)
+
+          out:set(column, row, red, green, blue, clamp8(alpha * cover / 255))
+        end
+      end
     end
-    return Magick.mask(w,h,out)
+
+    return out
+  end
+
+  -- A mask that covers nothing never reads its color, so it never refuses one either.
+  if not any[for cover in covered[1:count] => cover ~= 0] then return out end
+
+  local channels = colorTable(source :: Color?)
+  local shades = buffer.create(256 * 4)
+
+  for cover = 1, 255 do
+    local pixel = stored(channels[1], channels[2], channels[3], clamp8(channels[4] * cover / 255))
+
+    buffer.writeu32(shades, cover * 4, pixel)
+  end
+
+  shade(covered, count, shades, pixels)
+
+  return out
 end
 
-function Magick.subtractMask(a,b)
-    assert(a.width==b.width and a.height==b.height,"magick: mask geometry mismatch"); local out=buffer.create(a.width*a.height)
-    for i=0,a.width*a.height-1 do buffer.writeu8(out,i,math.max(0,buffer.readu8(a.data,i)-buffer.readu8(b.data,i))) end
-    return Magick.mask(a.width,a.height,out)
+--- Raises each of `count` bytes of `target` from `at` to the byte of `source` as far from
+--- `from`, where that one is greater: four bytes a turn, then what is left.
+local function raise(target: buffer, at: number, source: buffer, from: number, count: number)
+  local whole = count - count % 4
+
+  for index = 0, whole - 4, 4 do
+    local to, of = at + index, from + index
+
+    buffer.writeu8(target, to, math.max(buffer.readu8(target, to), buffer.readu8(source, of)))
+    buffer.writeu8(target, to + 1, math.max(buffer.readu8(target, to + 1), buffer.readu8(source, of + 1)))
+    buffer.writeu8(target, to + 2, math.max(buffer.readu8(target, to + 2), buffer.readu8(source, of + 2)))
+    buffer.writeu8(target, to + 3, math.max(buffer.readu8(target, to + 3), buffer.readu8(source, of + 3)))
+  end
+
+  for index = whole, count - 1 do
+    buffer.writeu8(target, at + index, math.max(buffer.readu8(target, at + index), buffer.readu8(source, from + index)))
+  end
+end
+
+--- A mask whose every byte is the greatest of the bytes within a radius of it, along its row and
+--- its column.
+function Magick.dilateMask(mask: Mask, radius: number): Mask
+  local {width, height, data: covered} = mask
+  local reach = math.max(0, math.floor(radius))
+  local count = width * height
+  local alongRows, out = buffer.create(count), buffer.create(count)
+
+  -- The greatest in a square is the greatest of the greatest in each of its rows, and the
+  -- greatest in a run is what a byte is raised to by each neighbor in reach, a whole row of
+  -- bytes at a time.
+  buffer.copy(alongRows, 0, covered, 0, count)
+
+  for row = 0, height - 1 do
+    local start = row * width
+
+    for distance = 1, math.min(reach, width - 1) do
+      raise(alongRows, start, covered, start + distance, width - distance)
+      raise(alongRows, start + distance, covered, start, width - distance)
+    end
+  end
+
+  buffer.copy(out, 0, alongRows, 0, count)
+
+  for row = 0, height - 1 do
+    local start = row * width
+
+    for distance = 1, math.min(reach, height - 1) do
+      if row + distance < height then raise(out, start, alongRows, start + distance * width, width) end
+      if row >= distance then raise(out, start, alongRows, start - distance * width, width) end
+    end
+  end
+
+  return Magick.mask(width, height, out)
+end
+
+--- A mask whose every byte is the mean of the bytes within a radius of it along its row, and
+--- then along its column, each mean rounded; a byte past an edge is taken for the edge's.
+function Magick.blurMask(mask: Mask, radius: number): Mask
+  local {width, height, data: covered} = mask
+  local reach = math.max(0, math.floor(radius + 0.5))
+  local count = buffer.len(covered)
+
+  if reach == 0 then return Magick.mask(width, height, covered[1:count]) end
+
+  local alongRows, out = buffer.create(width * height), buffer.create(width * height)
+  local span = reach * 2 + 1
+
+  for row = 0, height - 1 do
+    local start = row * width
+    local total = 0
+
+    for offset = -reach, reach do
+      total += buffer.readu8(covered, start + math.max(0, math.min(width - 1, offset)))
+    end
+
+    for column = 0, width - 1 do
+      local entering = buffer.readu8(covered, start + math.min(width - 1, column + reach + 1))
+      local leaving = buffer.readu8(covered, start + math.max(0, column - reach))
+
+      buffer.writeu8(alongRows, start + column, clamp8(total / span))
+      total += entering - leaving
+    end
+  end
+
+  for column = 0, width - 1 do
+    local total = 0
+
+    for offset = -reach, reach do
+      total += buffer.readu8(alongRows, math.max(0, math.min(height - 1, offset)) * width + column)
+    end
+
+    for row = 0, height - 1 do
+      local entering = buffer.readu8(alongRows, math.min(height - 1, row + reach + 1) * width + column)
+      local leaving = buffer.readu8(alongRows, math.max(0, row - reach) * width + column)
+
+      buffer.writeu8(out, row * width + column, clamp8(total / span))
+      total += entering - leaving
+    end
+  end
+
+  return Magick.mask(width, height, out)
+end
+
+--- A mask of what one mask covers beyond another: the difference of their bytes, or nothing
+--- where the second covers more.
+function Magick.subtractMask(mask: Mask, removed: Mask): Mask
+  assert(mask.width == removed.width and mask.height == removed.height, 'magick: mask geometry mismatch')
+
+  local count = mask.width * mask.height
+  local covered, taken = mask.data, removed.data
+  local out = buffer.create(count)
+  local whole = count - count % 4
+
+  for index = 0, whole - 4, 4 do
+    local first = math.max(0, buffer.readu8(covered, index) - buffer.readu8(taken, index))
+    local second = math.max(0, buffer.readu8(covered, index + 1) - buffer.readu8(taken, index + 1))
+    local third = math.max(0, buffer.readu8(covered, index + 2) - buffer.readu8(taken, index + 2))
+    local fourth = math.max(0, buffer.readu8(covered, index + 3) - buffer.readu8(taken, index + 3))
+
+    buffer.writeu32(out, index, first + second * 256 + third * 65536 + fourth * 16777216)
+  end
+
+  for index = whole, count - 1 do
+    buffer.writeu8(out, index, math.max(0, buffer.readu8(covered, index) - buffer.readu8(taken, index)))
+  end
+
+  return Magick.mask(mask.width, mask.height, out)
 end
 
 function Magick.modulate(img,brightness,saturation)
