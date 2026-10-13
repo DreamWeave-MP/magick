@@ -2,111 +2,227 @@
 --!optimize 2
 -- Pure-Luau raster subset used by the Morrowind UI generator port.
 -- Semantics are intentionally ImageMagick-shaped, not a full CLI clone.
+local bytes = require '@dream/bytes'
 
 local Magick = {}
-local bytes = require("@dream/bytes")
-
 local Image = {}
 Image.__index = Image
 
-local function clamp8(v)
-    if v <= 0 then return 0 end
-    if v >= 255 then return 255 end
-    return math.floor(v + 0.5)
+type Pixels = { width: number, height: number, data: buffer }
+
+--- RGBA pixels, four bytes each, in rows from the top.
+export type Image = typeof(setmetatable({} :: Pixels, Image))
+
+--- One byte of coverage a pixel, in rows from the top.
+export type Mask = { width: number, height: number, data: buffer }
+
+--- `#rgb`, `#rrggbb` or `#rrggbbaa`, with or without the `#`, or channels by position or by
+--- name, where a color channel left out is 0 and an alpha left out is 255.
+export type Color = string | { number } | { r: number?, g: number?, b: number?, a: number? }
+
+--- What a shape is filled from: a color, or an image repeated as a tile.
+export type Source = Color | Image
+
+--- A channel as the byte it is stored as: clamped, and rounded half up.
+local function clamp8(value: number): number
+  if value <= 0 then return 0 end
+  if value >= 255 then return 255 end
+
+  return math.floor(value + 0.5)
 end
 
-local function colorTable(c)
-    if c == nil then return {0, 0, 0, 0} end
-    if type(c) == "table" then
-        return {c[1] or c.r or 0, c[2] or c.g or 0, c[3] or c.b or 0, c[4] or c.a or 255}
-    end
-    if type(c) ~= "string" then error("magick: color must be a table or hex string", 2) end
-    local s = c
-    if string.sub(s, 1, 1) == "#" then s = string.sub(s, 2) end
-    if #s == 3 then
-        s = string.sub(s,1,1)..string.sub(s,1,1)..string.sub(s,2,2)..string.sub(s,2,2)..string.sub(s,3,3)..string.sub(s,3,3)
-    end
-    if #s ~= 6 and #s ~= 8 then error("magick: expected #rgb, #rrggbb, or #rrggbbaa", 2) end
-    local r = tonumber(string.sub(s, 1, 2), 16)
-    local g = tonumber(string.sub(s, 3, 4), 16)
-    local b = tonumber(string.sub(s, 5, 6), 16)
-    local a = #s == 8 and tonumber(string.sub(s, 7, 8), 16) or 255
-    if not r or not g or not b or not a then error("magick: invalid color", 2) end
-    return {r,g,b,a}
+local function colorTable(color: Color?): { number }
+  -- `false` is not a color and is refused below; only nothing at all is the clear color.
+  if type(color) == 'nil' then return { 0, 0, 0, 0 } end
+
+  if type(color) == 'table' then
+    local fields = color :: { [number | string]: number? }
+
+    return { fields[1] or fields.r or 0, fields[2] or fields.g or 0, fields[3] or fields.b or 0, fields[4] or fields.a or 255 }
+  end
+
+  if type(color) ~= 'string' then error('magick: color must be a table or hex string', 2) end
+
+  local digits = if string.sub(color, 1, 1) == '#' then string.sub(color, 2) else color
+
+  if #digits == 3 then
+    local red, green, blue = string.sub(digits, 1, 1), string.sub(digits, 2, 2), string.sub(digits, 3, 3)
+
+    digits = red .. red .. green .. green .. blue .. blue
+  end
+
+  if #digits ~= 6 and #digits ~= 8 then error('magick: expected #rgb, #rrggbb, or #rrggbbaa', 2) end
+
+  local red = tonumber(string.sub(digits, 1, 2), 16)
+  local green = tonumber(string.sub(digits, 3, 4), 16)
+  local blue = tonumber(string.sub(digits, 5, 6), 16)
+  -- Alpha digits that are not hex leave the color opaque.
+  local alpha = #digits == 8 and tonumber(string.sub(digits, 7, 8), 16) or 255
+
+  if not red or not green or not blue then error('magick: invalid color', 2) end
+
+  return { red, green, blue, alpha }
 end
 
 Magick.color = colorTable
 
-local function offsetOf(img, x, y)
-    return (y * img.width + x) * 4
+--- The pixel a color packs to. A channel that is not a byte is not clamped: its excess carries
+--- into the channels above it, and a fraction is dropped when the pixel is stored.
+local function packed(channels: { number }): number
+  return channels[1] + channels[2] * 256 + channels[3] * 65536 + channels[4] * 16777216
 end
 
-function Magick.new(width, height, color)
-    assert(width >= 0 and height >= 0 and width == math.floor(width) and height == math.floor(height), "magick: integer image size required")
-    local data = buffer.create(width * height * 4)
-    local img = setmetatable({width = width, height = height, data = data}, Image)
-    local c = colorTable(color)
-    if c[1] ~= 0 or c[2] ~= 0 or c[3] ~= 0 or c[4] ~= 0 then
-        img:fill(c)
+--- Repeats the `size` bytes at `offset` until `length` bytes from `offset` hold them. Each copy
+--- doubles what is filled, so a fill is a handful of block copies however long it is.
+local function replicate(target: buffer, offset: number, size: number, length: number)
+  local filled = size
+
+  while filled < length do
+    local step = math.min(filled, length - filled)
+
+    buffer.copy(target, offset + filled, target, offset, step)
+    filled += step
+  end
+end
+
+function Image.fill(self: Image, color: Color?): Image
+  local pixels = self.data
+  local length = buffer.len(pixels)
+  local pixel = packed(colorTable(color))
+
+  if length < 4 then return self end
+
+  buffer.writeu32(pixels, 0, pixel)
+  replicate(pixels, 0, 4, length - length % 4)
+
+  return self
+end
+
+function Magick.new(width: number, height: number, color: Color?): Image
+  assert(
+    width >= 0 and height >= 0 and width == math.floor(width) and height == math.floor(height),
+    'magick: integer image size required'
+  )
+
+  local image = setmetatable({ width = width, height = height, data = buffer.create(width * height * 4) }, Image)
+  local channels = colorTable(color)
+
+  if channels[1] ~= 0 or channels[2] ~= 0 or channels[3] ~= 0 or channels[4] ~= 0 then image:fill(channels) end
+
+  return image
+end
+
+function Magick.fromRGBA(width: number, height: number, data: buffer): Image
+  if buffer.len(data) ~= width * height * 4 then error('magick: RGBA byte length does not match geometry', 2) end
+
+  local out = Magick.new(width, height)
+
+  buffer.copy(out.data, 0, data, 0, buffer.len(data))
+
+  return out
+end
+
+function Image.clone(self: Image): Image
+  return Magick.fromRGBA(self.width, self.height, self.data)
+end
+
+--- The channels of the pixel at a column and a row, or four zeros outside the image.
+function Image.get(self: Image, column: number, row: number): (number, number, number, number)
+  local {width, height, data} = self
+
+  if column < 0 or row < 0 or column >= width or row >= height then return 0, 0, 0, 0 end
+
+  local offset = (row * width + column) * 4
+
+  return buffer.readu8(data, offset),
+    buffer.readu8(data, offset + 1),
+    buffer.readu8(data, offset + 2),
+    buffer.readu8(data, offset + 3)
+end
+
+--- Stores a pixel, each channel clamped and rounded to a byte; a pixel outside the image is not
+--- stored.
+function Image.set(self: Image, column: number, row: number, red: number, green: number, blue: number, alpha: number): Image
+  local {width, height, data} = self
+
+  if column < 0 or row < 0 or column >= width or row >= height then return self end
+
+  local offset = (row * width + column) * 4
+
+  buffer.writeu8(data, offset, clamp8(red))
+  buffer.writeu8(data, offset + 1, clamp8(green))
+  buffer.writeu8(data, offset + 2, clamp8(blue))
+  buffer.writeu8(data, offset + 3, clamp8(alpha))
+
+  return self
+end
+
+--- The image `source` is, when it is one to repeat as a tile and not a color: a table with pixels
+--- and a width.
+local function tileOf(source: unknown): Image?
+  if type(source) ~= 'table' then return nil end
+
+  local fields = source :: { [string]: unknown }
+
+  if fields.data == nil or fields.width == nil then return nil end
+
+  return source :: Image
+end
+
+local function sampleTile(tile: Image, column: number, row: number): (number, number, number, number)
+  local wrappedColumn, wrappedRow = column % tile.width, row % tile.height
+
+  if wrappedColumn < 0 then wrappedColumn += tile.width end
+  if wrappedRow < 0 then wrappedRow += tile.height end
+
+  return tile:get(wrappedColumn, wrappedRow)
+end
+
+local function sourcePixel(source: Source?, column: number, row: number): (number, number, number, number)
+  local tile = tileOf(source)
+
+  if tile then return sampleTile(tile, column, row) end
+
+  local channels = colorTable(source :: Color?)
+
+  return channels[1], channels[2], channels[3], channels[4]
+end
+
+--- Fills the rectangle between two corners, both inside it, clipped to the image.
+function Image.rect(self: Image, x0: number, y0: number, x1: number, y1: number, source: Source?): Image
+  if x0 > x1 then x0, x1 = x1, x0 end
+  if y0 > y1 then y0, y1 = y1, y0 end
+
+  local left, top = math.max(0, math.floor(x0)), math.max(0, math.floor(y0))
+  local right, bottom = math.min(self.width - 1, math.floor(x1)), math.min(self.height - 1, math.floor(y1))
+
+  if left > right or top > bottom then return self end
+
+  local tile = tileOf(source)
+
+  if tile then
+    for row = top, bottom do
+      for column = left, right do
+        local red, green, blue, alpha = sampleTile(tile, column, row)
+
+        self:set(column, row, red, green, blue, alpha)
+      end
     end
-    return img
-end
 
-function Magick.fromRGBA(width, height, data)
-    if buffer.len(data) ~= width * height * 4 then error("magick: RGBA byte length does not match geometry", 2) end
-    local out = Magick.new(width, height)
-    buffer.copy(out.data, 0, data, 0, buffer.len(data))
-    return out
-end
-
-function Image:clone()
-    return Magick.fromRGBA(self.width, self.height, self.data)
-end
-
-function Image:fill(color)
-    local c=colorTable(color); local d=self.data; local packed=c[1]+c[2]*256+c[3]*65536+c[4]*16777216
-    for o=0,buffer.len(d)-4,4 do buffer.writeu32(d,o,packed) end
     return self
-end
+  end
 
-function Image:get(x,y)
-    if x < 0 or y < 0 or x >= self.width or y >= self.height then return 0,0,0,0 end
-    local o = offsetOf(self,x,y); local d=self.data
-    return buffer.readu8(d,o),buffer.readu8(d,o+1),buffer.readu8(d,o+2),buffer.readu8(d,o+3)
-end
+  local pixels, stride = self.data, self.width * 4
+  local first, span = top * stride + left * 4, (right - left + 1) * 4
 
-function Image:set(x,y,r,g,b,a)
-    if x < 0 or y < 0 or x >= self.width or y >= self.height then return self end
-    local o=offsetOf(self,x,y); local d=self.data
-    buffer.writeu8(d,o,clamp8(r)); buffer.writeu8(d,o+1,clamp8(g)); buffer.writeu8(d,o+2,clamp8(b)); buffer.writeu8(d,o+3,clamp8(a))
-    return self
-end
+  buffer.writeu32(pixels, first, packed(colorTable(source :: Color?)))
+  replicate(pixels, first, 4, span)
 
-local function sampleTile(tile, x, y)
-    local xx = x % tile.width; if xx < 0 then xx += tile.width end
-    local yy = y % tile.height; if yy < 0 then yy += tile.height end
-    return tile:get(xx,yy)
-end
+  for row = top + 1, bottom do
+    buffer.copy(pixels, row * stride + left * 4, pixels, first, span)
+  end
 
-local function sourcePixel(source, x, y)
-    if type(source) == "table" and source.data ~= nil and source.width ~= nil then
-        return sampleTile(source,x,y)
-    end
-    local c = colorTable(source)
-    return c[1],c[2],c[3],c[4]
-end
-
-function Image:rect(x0,y0,x1,y1,source)
-    if x0>x1 then x0,x1=x1,x0 end; if y0>y1 then y0,y1=y1,y0 end
-    x0=math.max(0,math.floor(x0)); y0=math.max(0,math.floor(y0)); x1=math.min(self.width-1,math.floor(x1)); y1=math.min(self.height-1,math.floor(y1))
-    if x0>x1 or y0>y1 then return self end
-    if type(source)~="table" or source.data==nil or source.width==nil then
-        local c=colorTable(source); local packed=c[1]+c[2]*256+c[3]*65536+c[4]*16777216; local d=self.data; local stride=self.width*4
-        for y=y0,y1 do local o=y*stride+x0*4; for _=x0,x1 do buffer.writeu32(d,o,packed); o+=4 end end
-        return self
-    end
-    for y=y0,y1 do for x=x0,x1 do local r,g,b,a=sourcePixel(source,x,y); self:set(x,y,r,g,b,a) end end
-    return self
+  return self
 end
 
 local function pointInPolygon(px,py,points)
@@ -786,14 +902,26 @@ function Image:median()
     local acc=0; for i=0,255 do acc+=hist[i]; if acc*2>=n then return i end end; return 0
 end
 
-function Magick.verticalGradient(width,height,top,bottom)
-    local a=colorTable(top); local b=colorTable(bottom); local out=Magick.new(width,height); local d=out.data
-    for y=0,height-1 do
-        local t=height<=1 and 0 or y/(height-1); local r=clamp8(a[1]+(b[1]-a[1])*t); local g=clamp8(a[2]+(b[2]-a[2])*t); local bb=clamp8(a[3]+(b[3]-a[3])*t); local aa=clamp8(a[4]+(b[4]-a[4])*t)
-        local o=y*width*4; local packed=r+g*256+bb*65536+aa*16777216
-        for _=0,width-1 do buffer.writeu32(d,o,packed); o+=4 end
-    end
-    return out
+function Magick.verticalGradient(width: number, height: number, top: Color?, bottom: Color?): Image
+  local from, to = colorTable(top), colorTable(bottom)
+  local out = Magick.new(width, height)
+  local pixels, stride = out.data, width * 4
+
+  if width == 0 then return out end
+
+  for row = 0, height - 1 do
+    local along = if height <= 1 then 0 else row / (height - 1)
+    local red = clamp8(from[1] + (to[1] - from[1]) * along)
+    local green = clamp8(from[2] + (to[2] - from[2]) * along)
+    local blue = clamp8(from[3] + (to[3] - from[3]) * along)
+    local alpha = clamp8(from[4] + (to[4] - from[4]) * along)
+    local at = row * stride
+
+    buffer.writeu32(pixels, at, red + green * 256 + blue * 65536 + alpha * 16777216)
+    replicate(pixels, at, 4, stride)
+  end
+
+  return out
 end
 
 function Magick.randomNoise(width,height,seed)
