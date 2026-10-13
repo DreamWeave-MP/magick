@@ -435,6 +435,9 @@ end
 --- high byte.
 local Opaque, Faint = 0xff000000, 0x01000000
 
+--- Whole pixels as the data plane reduces them: a run of them is tested in one native loop.
+local Pixels: dream_data_Kind_u32 = dataPlane.u32()
+
 --- Composites the pixels `first..last` of a run over what is there, one at a time: a pixel is
 --- read after the one before it is written, which an image laid over itself depends on.
 local function blend(from: buffer, sourceAt: number, to: buffer, at: number, first: number, last: number)
@@ -486,17 +489,20 @@ function Image.over(self: Image, source: Image, dx: number?, dy: number?): Image
     local sourceAt = (row * sourceWidth + left) * 4
     local at = ((row + down) * width + (left + across)) * 4
 
-    if wholeRows then
-      -- The first pixel says which of the two a row can still be, so a mixed row costs one look.
-      local lead = buffer.readu32(from, sourceAt)
-      local first, last = row * sourceWidth + left + 1, row * sourceWidth + right
+    -- The first pixel says which of the two a row can still be, so a mixed row costs one look.
+    local lead = if wholeRows then buffer.readu32(from, sourceAt) else Faint
 
-      if lead >= Opaque and all[for pixel in from[first:last, 'u32'] => pixel >= Opaque] then
+    if lead >= Opaque then
+      local opaque = Pixels:allGe(from, sourceAt, right - left, Opaque)
+
+      if opaque then
         buffer.copy(to, at, from, sourceAt, (right - left) * 4)
         continue
       end
+    elseif lead < Faint then
+      local visible = Pixels:anyGe(from, sourceAt, right - left, Faint)
 
-      if lead < Faint and not any[for pixel in from[first:last, 'u32'] => pixel >= Faint] then continue end
+      if not visible then continue end
     end
 
     blend(from, sourceAt, to, at, left, right - 1)
@@ -655,9 +661,9 @@ function Image.trim(self: Image): Image
   local top, bottom = height, height - 1
 
   for row = 0, height - 1 do
-    local first, last = row * width + 1, (row + 1) * width
+    local visible = Pixels:anyGe(data, row * width * 4, width, Faint)
 
-    if any[for pixel in data[first:last, 'u32'] => pixel >= Faint] then
+    if visible then
       top = row
       break
     end
@@ -666,9 +672,9 @@ function Image.trim(self: Image): Image
   if top == height then return Magick.new(1, 1) end
 
   for row = height - 1, top, -1 do
-    local first, last = row * width + 1, (row + 1) * width
+    local visible = Pixels:anyGe(data, row * width * 4, width, Faint)
 
-    if any[for pixel in data[first:last, 'u32'] => pixel >= Faint] then
+    if visible then
       bottom = row
       break
     end
@@ -1031,7 +1037,7 @@ function Magick.paintMask(mask: Mask, source: Source?): Image
   end
 
   -- A mask that covers nothing never reads its color, so it never refuses one either.
-  if not any[for cover in covered[1:count] => cover ~= 0] then return out end
+  if not dataPlane.any(covered, 'u8', 0, count, 'ne', 0) then return out end
 
   local channels = colorTable(source :: Color?)
   local shades = buffer.create(256 * 4)
@@ -1360,17 +1366,17 @@ export type Stats = { width: number, height: number, mean: { number }, nonzeroAl
 function Magick.stats(image: Image): Stats
   local {width, height, data} = image
   local count = width * height
-  local divisor = if count == 0 then 1 else count
-  local red = sum[for value in data[1:count, 'u8@4'] => value]
-  local green = sum[for value in data[1:count, 'u8@4+1'] => value]
-  local blue = sum[for value in data[1:count, 'u8@4+2'] => value]
-  local alpha = sum[for value in data[1:count, 'u8@4+3'] => value]
+
+  if count == 0 then return { width = width, height = height, mean = { 0, 0, 0, 0 }, nonzeroAlpha = 0 } end
+
+  local red, green = dataPlane.sum(data, 'u8@4', 0, count), dataPlane.sum(data, 'u8@4', 1, count)
+  local blue, alpha = dataPlane.sum(data, 'u8@4', 2, count), dataPlane.sum(data, 'u8@4', 3, count)
 
   return {
     width = width,
     height = height,
-    mean = { red / divisor, green / divisor, blue / divisor, alpha / divisor },
-    nonzeroAlpha = #[for value in data[1:count, 'u8@4+3'] if value ~= 0 => value],
+    mean = { red / count, green / count, blue / count, alpha / count },
+    nonzeroAlpha = dataPlane.count(data, 'u8@4', 3, count, 'ne', 0),
   }
 end
 
