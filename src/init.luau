@@ -1212,32 +1212,101 @@ function Magick.tint(image: Image, color: Color?, amount: number?): Image
   return image
 end
 
-local function write32(buf,o,v) buffer.writeu32(buf,o,v) end
+--- Copies `count` pixels with red and blue changed places, which is all that lies between RGBA
+--- and BGRA: two pixels a turn, then the odd one. The pixels are stored `step` bytes apart, four
+--- for left to right and minus four for right to left.
+local function swapRedBlue(source: buffer, from: number, target: buffer, to: number, step: number, count: number)
+  local whole = count - count % 2
 
-function Magick.dds(img)
-    local size=128+img.width*img.height*4; local out=buffer.create(size)
-    buffer.writestring(out,0,"DDS ")
-    write32(out,4,124); write32(out,8,0x100F); write32(out,12,img.height); write32(out,16,img.width); write32(out,20,img.width*4); write32(out,24,0); write32(out,28,1)
-    -- ImageMagick leaves an identifying stamp in DDS_HEADER.reserved1; harmless but useful for oracle parity.
-    write32(out,32,0x47414D49); write32(out,36,0x47414D45); write32(out,40,0x004B4349)
-    write32(out,76,32); write32(out,80,0x41); write32(out,84,0); write32(out,88,32); write32(out,92,0x00FF0000); write32(out,96,0x0000FF00); write32(out,100,0x000000FF); write32(out,104,0xFF000000); write32(out,108,0x1000)
-    local p=128
-    for y=0,img.height-1 do for x=0,img.width-1 do local r,g,b,a=img:get(x,y); buffer.writeu8(out,p,b); buffer.writeu8(out,p+1,g); buffer.writeu8(out,p+2,r); buffer.writeu8(out,p+3,a); p+=4 end end
-    return out
+  for index = 0, whole - 2, 2 do
+    local at, into = from + index * 4, to + index * step
+
+    buffer.writeu32(target, into, bit32.rrotate(bit32.byteswap(buffer.readu32(source, at)), 8))
+    buffer.writeu32(target, into + step, bit32.rrotate(bit32.byteswap(buffer.readu32(source, at + 4)), 8))
+  end
+
+  if whole < count then
+    local pixel = buffer.readu32(source, from + whole * 4)
+
+    buffer.writeu32(target, to + whole * step, bit32.rrotate(bit32.byteswap(pixel), 8))
+  end
 end
 
-function Magick.readDDS(bytes)
-    if buffer.len(bytes)<128 or buffer.readstring(bytes,0,4)~="DDS " then error("magick: not a DDS",2) end
-    local h=buffer.readu32(bytes,12); local w=buffer.readu32(bytes,16); local bits=buffer.readu32(bytes,88)
-    if bits~=32 then error("magick: only uncompressed 32-bit DDS is supported",2) end
-    local out=Magick.new(w,h); local p=128
-    for y=0,h-1 do for x=0,w-1 do local b=buffer.readu8(bytes,p); local g=buffer.readu8(bytes,p+1); local r=buffer.readu8(bytes,p+2); local a=buffer.readu8(bytes,p+3); out:set(x,y,r,g,b,a); p+=4 end end
-    return out
+--- Copies `count` pixels of three bytes, blue first, as opaque pixels stored `step` bytes apart.
+--- All but the last are read as four bytes, the fourth the next pixel's first, and turned about
+--- whole.
+local function fromBgr(source: buffer, from: number, target: buffer, to: number, step: number, count: number)
+  for index = 0, count - 2 do
+    local pixel = bit32.rrotate(bit32.byteswap(buffer.readu32(source, from + index * 3)), 8)
+
+    buffer.writeu32(target, to + index * step, bit32.bor(pixel, 0xff000000))
+  end
+
+  if count > 0 then
+    local at = from + (count - 1) * 3
+    local blueGreen, red = buffer.readu16(source, at), buffer.readu8(source, at + 2)
+    local pixel = red + bit32.band(blueGreen, 0xff00) + bit32.lshift(bit32.band(blueGreen, 255), 16) + 0xff000000
+
+    buffer.writeu32(target, to + (count - 1) * step, pixel)
+  end
 end
 
-function Magick.writeDDS(path,img)
-    jess.fs.write(path,Magick.dds(img))
-    return path
+--- Copies `count` gray bytes as opaque gray pixels stored `step` bytes apart.
+local function fromGray(source: buffer, from: number, target: buffer, to: number, step: number, count: number)
+  for index = 0, count - 1 do
+    buffer.writeu32(target, to + index * step, buffer.readu8(source, from + index) * 65793 + 0xff000000)
+  end
+end
+
+--- An image as an uncompressed 32-bit DDS file.
+function Magick.dds(image: Image): buffer
+  local {width, height, data} = image
+  local out = buffer.create(128 + width * height * 4)
+
+  buffer.writestring(out, 0, 'DDS ')
+  buffer.writeu32(out, 4, 124)
+  buffer.writeu32(out, 8, 0x100f)
+  buffer.writeu32(out, 12, height)
+  buffer.writeu32(out, 16, width)
+  buffer.writeu32(out, 20, width * 4)
+  buffer.writeu32(out, 28, 1)
+  -- ImageMagick leaves an identifying stamp in DDS_HEADER.reserved1; harmless but useful for
+  -- oracle parity.
+  buffer.writeu32(out, 32, 0x47414d49)
+  buffer.writeu32(out, 36, 0x47414d45)
+  buffer.writeu32(out, 40, 0x004b4349)
+  buffer.writeu32(out, 76, 32)
+  buffer.writeu32(out, 80, 0x41)
+  buffer.writeu32(out, 88, 32)
+  buffer.writeu32(out, 92, 0x00ff0000)
+  buffer.writeu32(out, 96, 0x0000ff00)
+  buffer.writeu32(out, 100, 0x000000ff)
+  buffer.writeu32(out, 104, 0xff000000)
+  buffer.writeu32(out, 108, 0x1000)
+  swapRedBlue(data, 0, out, 128, 4, width * height)
+
+  return out
+end
+
+--- The image an uncompressed 32-bit DDS file holds.
+function Magick.readDDS(source: buffer): Image
+  if buffer.len(source) < 128 or buffer.readstring(source, 0, 4) ~= 'DDS ' then error('magick: not a DDS', 2) end
+
+  local height, width, bits = buffer.readu32(source, 12), buffer.readu32(source, 16), buffer.readu32(source, 88)
+
+  if bits ~= 32 then error('magick: only uncompressed 32-bit DDS is supported', 2) end
+
+  local out = Magick.new(width, height)
+
+  swapRedBlue(source, 128, out.data, 0, 4, width * height)
+
+  return out
+end
+
+function Magick.writeDDS(path: string, image: Image): string
+  jess.fs.write(path, Magick.dds(image))
+
+  return path
 end
 
 export type Stats = { width: number, height: number, mean: { number }, nonzeroAlpha: number }
@@ -1265,156 +1334,343 @@ end
 -- General-purpose raster/codec extensions (v0.2)
 -- -----------------------------------------------------------------------------
 
-local function copyBuffer(src, offset, length)
-    local out = buffer.create(length)
-    buffer.copy(out, 0, src, offset or 0, length)
-    return out
+local PngSignature = '\137PNG\r\n\26\n'
+
+--- How many bytes a pixel takes for each PNG color type at eight bits a sample: gray, RGB, gray
+--- with alpha, and RGBA.
+local PngChannels = { [0] = 1, [2] = 3, [4] = 2, [6] = 4 }
+
+--- Writes a PNG chunk at `offset`: its length, its kind, its payload, and the CRC-32 of the kind
+--- and the payload. Returns the offset after it.
+local function writeChunk(out: buffer, offset: number, kind: string, payload: buffer): number
+  local length = buffer.len(payload)
+
+  bytes.writeu32be(out, offset, length)
+  buffer.writestring(out, offset + 4, kind)
+  buffer.copy(out, offset + 8, payload, 0, length)
+  bytes.writeu32be(out, offset + 8 + length, bytes.crc32(payload, bytes.crc32(kind)))
+
+  return offset + 12 + length
 end
 
-local function concatBuffers(parts)
-    local total = 0
-    for _,p in parts do total += buffer.len(p) end
-    local out = buffer.create(total)
-    local o = 0
-    for _,p in parts do local n=buffer.len(p); buffer.copy(out,o,p,0,n); o+=n end
-    return out
+--- An image as a PNG file of RGBA at eight bits a sample, deflated at a level of 0 to 10, or 6.
+function Magick.png(image: Image, level: number?): buffer
+  local {width, height, data} = image
+  local header = buffer.create(13)
+  local stride = width * 4
+  -- Every row goes out unfiltered, behind the zero that says so.
+  local lines = buffer.create((stride + 1) * height)
+
+  bytes.writeu32be(header, 0, width)
+  bytes.writeu32be(header, 4, height)
+  buffer.writeu8(header, 8, 8)
+  buffer.writeu8(header, 9, 6)
+
+  for row = 0, height - 1 do
+    buffer.copy(lines, row * (stride + 1) + 1, data, row * stride, stride)
+  end
+
+  local packed = bytes.deflate(lines, { format = 'zlib', level = level or 6 })
+  local out = buffer.create(8 + 25 + 12 + buffer.len(packed) + 12)
+
+  buffer.writestring(out, 0, PngSignature)
+  writeChunk(out, writeChunk(out, writeChunk(out, 8, 'IHDR', header), 'IDAT', packed), 'IEND', buffer.create(0))
+
+  return out
 end
 
-local function pngChunk(kind, payload)
-    local n = buffer.len(payload)
-    local out = buffer.create(12+n)
-    bytes.writeu32be(out,0,n)
-    buffer.writestring(out,4,kind)
-    if n>0 then buffer.copy(out,8,payload,0,n) end
-    local crcInput=buffer.create(4+n)
-    buffer.writestring(crcInput,0,kind)
-    if n>0 then buffer.copy(crcInput,4,payload,0,n) end
-    bytes.writeu32be(out,8+n,bytes.crc32(crcInput))
-    return out
+--- Undoes the average filter on a row of `stride` bytes at `start`: each byte gains half the sum,
+--- rounded down, of the byte a pixel before it and the byte above it.
+local function unaverage(lines: buffer, at: number, rows: buffer, start: number, stride: number, channels: number)
+  local above = start - stride
+
+  for index = 0, channels - 1 do
+    buffer.writeu8(rows, start + index, buffer.readu8(lines, at + index) + bit32.rshift(buffer.readu8(rows, above + index), 1))
+  end
+
+  for index = channels, stride - 1 do
+    local before, over = buffer.readu8(rows, start + index - channels), buffer.readu8(rows, above + index)
+
+    buffer.writeu8(rows, start + index, buffer.readu8(lines, at + index) + bit32.rshift(before + over, 1))
+  end
 end
 
-function Magick.png(img, level)
-    local ihdr=buffer.create(13)
-    bytes.writeu32be(ihdr,0,img.width); bytes.writeu32be(ihdr,4,img.height)
-    buffer.writeu8(ihdr,8,8); buffer.writeu8(ihdr,9,6); buffer.writeu8(ihdr,10,0); buffer.writeu8(ihdr,11,0); buffer.writeu8(ihdr,12,0)
-    local row=img.width*4+1
-    local raw=buffer.create(row*img.height)
-    for y=0,img.height-1 do
-        local ro=y*row; buffer.writeu8(raw,ro,0)
-        buffer.copy(raw,ro+1,img.data,y*img.width*4,img.width*4)
+--- Undoes the Paeth filter on a row of `stride` bytes at `start`: each byte gains whichever of
+--- the byte a pixel before it, the byte above it and the byte above that one is nearest to the
+--- first plus the second less the third, the earlier of them when two are as near. Which one is
+--- worked out by arithmetic: a row has no pattern for a branch to learn.
+local function unpaeth(lines: buffer, at: number, rows: buffer, start: number, stride: number, channels: number)
+  local above = start - stride
+
+  -- A row's first pixel has nothing before it, and then the nearest is always the byte above.
+  dataPlane.add(lines, 'u8', at, rows, above, rows, start, channels)
+
+  for index = channels, stride - 1 do
+    local before, over = buffer.readu8(rows, start + index - channels), buffer.readu8(rows, above + index)
+    local corner = buffer.readu8(rows, above + index - channels)
+    local toBefore, toOver = math.abs(over - corner), math.abs(before - corner)
+    local toCorner = math.abs(before + over - corner - corner)
+    local least = math.min(toBefore, toOver, toCorner)
+    local isBefore = 1 - math.min(toBefore - least, 1)
+    local isOver = (1 - isBefore) * (1 - math.min(toOver - least, 1))
+    local nearest = isBefore * before + isOver * over + (1 - isBefore - isOver) * corner
+
+    buffer.writeu8(rows, start + index, buffer.readu8(lines, at + index) + nearest)
+  end
+end
+
+--- The image a PNG file holds, the file given as its bytes or as a path to read them from. The
+--- samples must be eight bits and not interlaced; any color type but a palette is read.
+function Magick.readPNG(source: buffer | string): Image
+  local file = if type(source) == 'string' then jess.fs.readBuffer(source) else source
+  local length = buffer.len(file)
+
+  if length < 8 or buffer.readstring(file, 0, 8) ~= PngSignature then error('magick: not a PNG', 2) end
+
+  local width, height, depth, colorType, interlace
+
+  local position, packedLength = 8, 0
+  local spans: { number } = {}
+
+  while position + 12 <= length do
+    local size, kind = bytes.readu32be(file, position), buffer.readstring(file, position + 4, 4)
+    local payload = position + 8
+
+    if payload + size + 4 > length then error('magick: truncated PNG chunk', 2) end
+    if kind == 'IEND' then break end
+
+    if kind == 'IHDR' then
+      width, height = bytes.readu32be(file, payload), bytes.readu32be(file, payload + 4)
+      depth, colorType = buffer.readu8(file, payload + 8), buffer.readu8(file, payload + 9)
+      interlace = buffer.readu8(file, payload + 12)
+    elseif kind == 'IDAT' then
+      table.insert(spans, payload)
+      table.insert(spans, size)
+      packedLength += size
     end
-    local compressed=bytes.deflate(raw,{format="zlib",level=level or 6})
-    local sig=buffer.create(8); buffer.writestring(sig,0,"\137PNG\r\n\26\n")
-    return concatBuffers({sig,pngChunk("IHDR",ihdr),pngChunk("IDAT",compressed),pngChunk("IEND",buffer.create(0))})
-end
 
-local function paeth(a,b,c)
-    local p=a+b-c; local pa=math.abs(p-a); local pb=math.abs(p-b); local pc=math.abs(p-c)
-    if pa<=pb and pa<=pc then return a elseif pb<=pc then return b else return c end
-end
+    position = payload + size + 4
+  end
 
-function Magick.readPNG(src)
-    if type(src)=="string" then src=jess.fs.readBuffer(src) end
-    if buffer.len(src)<8 or buffer.readstring(src,0,8)~="\137PNG\r\n\26\n" then error("magick: not a PNG",2) end
-    local p=8; local w,h,bitDepth,colorType,interlace=nil,nil,nil,nil,nil; local idats={}
-    while p+12<=buffer.len(src) do
-        local n=bytes.readu32be(src,p); local kind=buffer.readstring(src,p+4,4); local dataOff=p+8
-        if dataOff+n+4>buffer.len(src) then error("magick: truncated PNG chunk",2) end
-        if kind=="IHDR" then
-            w=bytes.readu32be(src,dataOff); h=bytes.readu32be(src,dataOff+4); bitDepth=buffer.readu8(src,dataOff+8); colorType=buffer.readu8(src,dataOff+9); interlace=buffer.readu8(src,dataOff+12)
-        elseif kind=="IDAT" then
-            idats[#idats+1]=copyBuffer(src,dataOff,n)
-        elseif kind=="IEND" then break end
-        p=dataOff+n+4
-    end
-    if not w or not h or bitDepth~=8 or interlace~=0 then error("magick: PNG requires 8-bit non-interlaced samples",2) end
-    local channels = ({[0]=1,[2]=3,[4]=2,[6]=4})[colorType]
-    if not channels then error("magick: unsupported PNG color type "..tostring(colorType),2) end
-    local packed=concatBuffers(idats)
-    local scan=bytes.inflate(packed,{format="zlib",maxSize=h*(w*channels+1)+64})
-    local stride=w*channels; local expected=h*(stride+1)
-    if buffer.len(scan)<expected then error("magick: truncated PNG scanlines",2) end
-    local recon=buffer.create(h*stride)
-    local sp=0
-    for y=0,h-1 do
-        local f=buffer.readu8(scan,sp); sp+=1
-        local row=y*stride; local prev=(y-1)*stride
-        for x=0,stride-1 do
-            local raw=buffer.readu8(scan,sp); sp+=1
-            local a=(x>=channels) and buffer.readu8(recon,row+x-channels) or 0
-            local b=(y>0) and buffer.readu8(recon,prev+x) or 0
-            local c=(y>0 and x>=channels) and buffer.readu8(recon,prev+x-channels) or 0
-            local v
-            if f==0 then v=raw elseif f==1 then v=(raw+a)%256 elseif f==2 then v=(raw+b)%256 elseif f==3 then v=(raw+math.floor((a+b)/2))%256 elseif f==4 then v=(raw+paeth(a,b,c))%256 else error("magick: bad PNG filter",2) end
-            buffer.writeu8(recon,row+x,v)
-        end
-    end
-    local out=Magick.new(w,h); local rp=0
-    for y=0,h-1 do for x=0,w-1 do
-        local r,g,b,a
-        if colorType==6 then r=buffer.readu8(recon,rp); g=buffer.readu8(recon,rp+1); b=buffer.readu8(recon,rp+2); a=buffer.readu8(recon,rp+3)
-        elseif colorType==2 then r=buffer.readu8(recon,rp); g=buffer.readu8(recon,rp+1); b=buffer.readu8(recon,rp+2); a=255
-        elseif colorType==0 then r=buffer.readu8(recon,rp); g=r; b=r; a=255
-        else r=buffer.readu8(recon,rp); g=r; b=r; a=buffer.readu8(recon,rp+1) end
-        out:set(x,y,r,g,b,a); rp+=channels
-    end end
-    return out
-end
+  if not width or not height or depth ~= 8 or interlace ~= 0 then
+    error('magick: PNG requires 8-bit non-interlaced samples', 2)
+  end
 
-function Magick.writePNG(path,img,level) jess.fs.write(path,Magick.png(img,level)); return path end
+  local channels = PngChannels[colorType]
 
-local function extLower(path)
-    local e=string.match(path,"%.([^./\\]+)$"); return e and string.lower(e) or ""
-end
+  if not channels then error('magick: unsupported PNG color type ' .. tostring(colorType), 2) end
 
+  local packed = buffer.create(packedLength)
+  local filled = 0
 
-function Magick.readBMP(src)
-    if type(src)=="string" then src=jess.fs.readBuffer(src) end
-    if buffer.len(src)<54 or buffer.readstring(src,0,2)~="BM" then error("magick: not a BMP",2) end
-    local pixelOff=buffer.readu32(src,10); local dib=buffer.readu32(src,14)
-    if dib<40 then error("magick: unsupported BMP DIB header",2) end
-    local w=buffer.readi32(src,18); local hs=buffer.readi32(src,22); local topDown=hs<0; local h=math.abs(hs); local bpp=buffer.readu16(src,28); local compression=buffer.readu32(src,30)
-    if compression~=0 then error("magick: compressed BMP not supported",2) end
-    if bpp~=24 and bpp~=32 then error("magick: only 24/32-bit BMP supported",2) end
-    local bytesPer=bpp/8; local stride=math.floor((w*bytesPer+3)/4)*4; local out=Magick.new(w,h)
-    for y=0,h-1 do local sy=topDown and y or (h-1-y); local row=pixelOff+sy*stride
-        for x=0,w-1 do local o=row+x*bytesPer; local b=buffer.readu8(src,o); local g=buffer.readu8(src,o+1); local r=buffer.readu8(src,o+2); local a=bpp==32 and buffer.readu8(src,o+3) or 255; out:set(x,y,r,g,b,a) end
-    end
-    return out
-end
+  for index = 1, #spans, 2 do
+    buffer.copy(packed, filled, file, spans[index], spans[index + 1])
+    filled += spans[index + 1]
+  end
 
-function Magick.readTGA(src)
-    if type(src)=="string" then src=jess.fs.readBuffer(src) end
-    if buffer.len(src)<18 then error("magick: truncated TGA",2) end
-    local idLen=buffer.readu8(src,0); local cmap=buffer.readu8(src,1); local imageType=buffer.readu8(src,2); if cmap~=0 then error("magick: color-mapped TGA not supported",2) end
-    local w=buffer.readu16(src,12); local h=buffer.readu16(src,14); local bpp=buffer.readu8(src,16); local desc=buffer.readu8(src,17); local top=(bit32.band(desc,0x20)~=0); local right=(bit32.band(desc,0x10)~=0)
-    local gray=(imageType==3 or imageType==11); local rle=(imageType==10 or imageType==11)
-    if not (imageType==2 or imageType==3 or imageType==10 or imageType==11) then error("magick: unsupported TGA type",2) end
-    local bytesPer=bpp/8; if gray then if bpp~=8 then error("magick: grayscale TGA must be 8-bit",2) end else if bpp~=24 and bpp~=32 then error("magick: truecolor TGA must be 24/32-bit",2) end end
-    local p=18+idLen; local out=Magick.new(w,h); local index=0
-    local function put(px,py,r,g,b,a) local x=right and (w-1-px) or px; local y=top and py or (h-1-py); out:set(x,y,r,g,b,a) end
-    local function readPixel()
-        if gray then local v=buffer.readu8(src,p); p+=1; return v,v,v,255 else local b=buffer.readu8(src,p); local g=buffer.readu8(src,p+1); local r=buffer.readu8(src,p+2); local a=bpp==32 and buffer.readu8(src,p+3) or 255; p+=bytesPer; return r,g,b,a end
-    end
-    if not rle then
-        for i=0,w*h-1 do local r,g,b,a=readPixel(); put(i%w,math.floor(i/w),r,g,b,a) end
+  local stride = width * channels
+  local lines = bytes.inflate(packed, { format = 'zlib', maxSize = height * (stride + 1) + 64 })
+
+  if buffer.len(lines) < height * (stride + 1) then error('magick: truncated PNG scanlines', 2) end
+
+  -- The rows as they were before filtering, under a row of zeros for the first to count as
+  -- above it, and before one spare byte so that a pixel of three can be read as four.
+  local rows = buffer.create((height + 1) * stride + 1)
+  local at = 0
+
+  for row = 1, height do
+    local filter = buffer.readu8(lines, at)
+    local start = row * stride
+
+    at += 1
+
+    -- A row without bytes has none to filter, whatever its filter says.
+    if stride == 0 then continue end
+
+    if filter == 0 then
+      buffer.copy(rows, start, lines, at, stride)
+    elseif filter == 1 then
+      -- Each byte gains the one a pixel before it, itself just made: the sum runs in order.
+      buffer.copy(rows, start, lines, at, channels)
+      dataPlane.add(lines, 'u8', at + channels, rows, start, rows, start + channels, stride - channels)
+    elseif filter == 2 then
+      dataPlane.add(lines, 'u8', at, rows, start - stride, rows, start, stride)
+    elseif filter == 3 then
+      unaverage(lines, at, rows, start, stride, channels)
+    elseif filter == 4 then
+      unpaeth(lines, at, rows, start, stride, channels)
     else
-        while index<w*h do local head=buffer.readu8(src,p); p+=1; local count=bit32.band(head,0x7f)+1
-            if bit32.band(head,0x80)~=0 then local r,g,b,a=readPixel(); for _=1,count do put(index%w,math.floor(index/w),r,g,b,a); index+=1 end
-            else for _=1,count do local r,g,b,a=readPixel(); put(index%w,math.floor(index/w),r,g,b,a); index+=1 end end
-        end
+      error('magick: bad PNG filter', 2)
     end
-    return out
+
+    at += stride
+  end
+
+  local out = Magick.new(width, height)
+  local pixels, count = out.data, width * height
+
+  if colorType == 6 then
+    buffer.copy(pixels, 0, rows, stride, count * 4)
+  elseif colorType == 2 then
+    for index = 0, count - 1 do
+      buffer.writeu32(pixels, index * 4, bit32.bor(buffer.readu32(rows, stride + index * 3), 0xff000000))
+    end
+  elseif colorType == 0 then
+    fromGray(rows, stride, pixels, 0, 4, count)
+  else
+    for index = 0, count - 1 do
+      local grayAlpha = buffer.readu16(rows, stride + index * 2)
+
+      buffer.writeu32(pixels, index * 4, bit32.band(grayAlpha, 255) * 65793 + bit32.rshift(grayAlpha, 8) * 16777216)
+    end
+  end
+
+  return out
 end
 
-function Magick.read(path)
-    local e=extLower(path)
-    if e=="png" then return Magick.readPNG(path) elseif e=="dds" then return Magick.readDDS(jess.fs.readBuffer(path)) elseif e=="bmp" then return Magick.readBMP(path) elseif e=="tga" then return Magick.readTGA(path) else error("magick: unsupported input format ."..e,2) end
+function Magick.writePNG(path: string, image: Image, level: number?): string
+  jess.fs.write(path, Magick.png(image, level))
+
+  return path
 end
 
-function Magick.write(path,img)
-    local e=extLower(path)
-    if e=="png" then return Magick.writePNG(path,img) elseif e=="dds" then return Magick.writeDDS(path,img) else error("magick: unsupported output format ."..e,2) end
+--- The image a BMP file holds, the file given as its bytes or as a path to read them from. The
+--- pixels must be 24 or 32 bits and not compressed.
+function Magick.readBMP(source: buffer | string): Image
+  local file = if type(source) == 'string' then jess.fs.readBuffer(source) else source
+
+  if buffer.len(file) < 54 or buffer.readstring(file, 0, 2) ~= 'BM' then error('magick: not a BMP', 2) end
+
+  local pixelsAt, headerSize = buffer.readu32(file, 10), buffer.readu32(file, 14)
+
+  if headerSize < 40 then error('magick: unsupported BMP DIB header', 2) end
+
+  local width, signedHeight = buffer.readi32(file, 18), buffer.readi32(file, 22)
+  local bits, compression = buffer.readu16(file, 28), buffer.readu32(file, 30)
+
+  if compression ~= 0 then error('magick: compressed BMP not supported', 2) end
+  if bits ~= 24 and bits ~= 32 then error('magick: only 24/32-bit BMP supported', 2) end
+
+  -- A height below zero says the rows run from the top; otherwise they run from the bottom.
+  local topDown, height = signedHeight < 0, math.abs(signedHeight)
+  local stride = math.floor((width * bits / 8 + 3) / 4) * 4
+  local out = Magick.new(width, height)
+
+  for row = 0, height - 1 do
+    local from = pixelsAt + (if topDown then row else height - 1 - row) * stride
+
+    if bits == 32 then
+      swapRedBlue(file, from, out.data, row * width * 4, 4, width)
+    else
+      fromBgr(file, from, out.data, row * width * 4, 4, width)
+    end
+  end
+
+  return out
+end
+
+--- The image a TGA file holds, the file given as its bytes or as a path to read them from: true
+--- color of 24 or 32 bits or gray of 8, plain or in run-length packets, from any corner.
+function Magick.readTGA(source: buffer | string): Image
+  local file = if type(source) == 'string' then jess.fs.readBuffer(source) else source
+
+  if buffer.len(file) < 18 then error('magick: truncated TGA', 2) end
+
+  local idLength, colorMap, imageType = buffer.readu8(file, 0), buffer.readu8(file, 1), buffer.readu8(file, 2)
+
+  if colorMap ~= 0 then error('magick: color-mapped TGA not supported', 2) end
+
+  local width, height = buffer.readu16(file, 12), buffer.readu16(file, 14)
+  local bits, descriptor = buffer.readu8(file, 16), buffer.readu8(file, 17)
+  local fromTop, fromRight = bit32.band(descriptor, 0x20) ~= 0, bit32.band(descriptor, 0x10) ~= 0
+  local gray, inPackets = imageType == 3 or imageType == 11, imageType == 10 or imageType == 11
+
+  if not (imageType == 2 or imageType == 3 or imageType == 10 or imageType == 11) then
+    error('magick: unsupported TGA type', 2)
+  end
+
+  if gray and bits ~= 8 then error('magick: grayscale TGA must be 8-bit', 2) end
+  if not gray and bits ~= 24 and bits ~= 32 then error('magick: truecolor TGA must be 24/32-bit', 2) end
+
+  local size, count = bits / 8, width * height
+  local out = Magick.new(width, height)
+  local plain, position = file, 18 + idLength
+
+  if inPackets then
+    -- The packets are laid out flat first: a run's pixel repeated, a literal's pixels copied.
+    -- A packet may run past the image; what does is read, so that a file too short for it is
+    -- refused, and dropped.
+    local index = 0
+
+    plain = buffer.create(count * size)
+
+    while index < count do
+      local head = buffer.readu8(file, position)
+      local run = bit32.band(head, 0x7f) + 1
+      local kept = math.min(run, count - index)
+
+      position += 1
+
+      if bit32.band(head, 0x80) ~= 0 then
+        buffer.copy(plain, index * size, file, position, size)
+        replicate(plain, index * size, size, kept * size)
+        position += size
+      else
+        buffer.readu8(file, position + run * size - 1)
+        buffer.copy(plain, index * size, file, position, kept * size)
+        position += run * size
+      end
+
+      index += run
+    end
+
+    position = 0
+  end
+
+  for row = 0, height - 1 do
+    local from = position + row * width * size
+    local to = (if fromTop then row else height - 1 - row) * width
+    local first, step = if fromRight then (to + width - 1) * 4 else to * 4, if fromRight then -4 else 4
+
+    if gray then
+      fromGray(plain, from, out.data, first, step, width)
+    elseif size == 3 then
+      fromBgr(plain, from, out.data, first, step, width)
+    else
+      swapRedBlue(plain, from, out.data, first, step, width)
+    end
+  end
+
+  return out
+end
+
+--- A path's extension, in lower case and without its dot, or nothing.
+local function extension(path: string): string
+  local found = string.match(path, '%.([^./\\]+)$')
+
+  return if found then string.lower(found) else ''
+end
+
+--- The image a file holds, by its extension: PNG, DDS, BMP or TGA.
+function Magick.read(path: string): Image
+  local kind = extension(path)
+
+  if kind == 'png' then return Magick.readPNG(path) end
+  if kind == 'dds' then return Magick.readDDS(jess.fs.readBuffer(path)) end
+  if kind == 'bmp' then return Magick.readBMP(path) end
+  if kind == 'tga' then return Magick.readTGA(path) end
+
+  error('magick: unsupported input format .' .. kind, 2)
+end
+
+--- Writes an image to a file, by its extension: PNG or DDS. Returns the path.
+function Magick.write(path: string, image: Image): string
+  local kind = extension(path)
+
+  if kind == 'png' then return Magick.writePNG(path, image) end
+  if kind == 'dds' then return Magick.writeDDS(path, image) end
+
+  error('magick: unsupported output format .' .. kind, 2)
 end
 
 --- Composites a rectangle of a color or of a tile over what is there.
