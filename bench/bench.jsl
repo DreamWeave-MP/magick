@@ -3,7 +3,7 @@
 -- @magick, timed from Luau through its public API: drawing, compositing, geometry, masks, tone,
 -- generators and codecs, on images the size of a UI texture or a page's picture, and a few of
 -- them again on a glyph, an icon and a border. Run by
--- `jess run --package . bench/bench.luau [filter] [record]`, on a release build. Prints one line
+-- `jess run --package . bench/bench.jsl [filter] [record]`, on a release build. Prints one line
 -- per workload: its name, a tab, and the seconds one call takes. Every workload's result is held
 -- to the fingerprint the package gave as imported, so a path that stopped doing the work, or does
 -- other work, fails here instead of posting a time. With `record` the fingerprints are printed as

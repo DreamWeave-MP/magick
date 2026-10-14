@@ -1,6 +1,6 @@
 # Benchmarks
 
-`bench/bench.luau` times @magick through its public API on images the size of a UI texture or a
+`bench/bench.jsl` times @magick through its public API on images the size of a UI texture or a
 page's picture: 512 by 512 for most rows and 256 by 256 for the heavier ones, a 64 by 64 tile,
 and codec inputs built byte by byte so that a decoder meets the filters and layouts other
 encoders write. Ten rows are small on purpose: glyphs of 12 by 16, an icon of 16 by 16 and
@@ -12,7 +12,7 @@ pixels, or of the file), so a path that stopped doing the work, or does other wo
 instead of posting a time.
 
 ```sh
-jess run --package jpk/magick jpk/magick/bench/bench.luau [filter]
+jess run --package jpk/magick jpk/magick/bench/bench.jsl [filter]
 ```
 
 It refuses a build without the verified toolchain.
@@ -26,7 +26,7 @@ head) inside one hold of the machine's bench lock, each run as
 
 ```sh
 systemd-run --user --scope -q -p MemoryMax=3G -p MemorySwapMax=0 \
-  target/l3i2/jess run --package <the base's export, or jpk/magick> --package-path jpk <its bench/bench.luau>
+  target/l3i2/jess run --package <the base's export, or jpk/magick> --package-path jpk <its bench/bench.jsl>
 ```
 
 Each cell is the median of the three runs' medians. Other agents' work shared the machine, so a
