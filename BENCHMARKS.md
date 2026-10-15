@@ -229,3 +229,132 @@ each is one table of 256 entries or a kernel said in a line. Eleven reductions o
 slices were not kept: they measured 0.53 ms of load each (5.9 ms together; the module took
 38.4 ms to require with them), and the explicit data-plane call each lowers to is as fast or
 faster once the module is loaded. Record patterns cost nothing to load.
+
+## Which modules are native, and why
+
+Jess compiles to machine code only what is marked (`--!native` on a module, `@native` on one
+function), and every load pays for what is marked. A module carries `--!native` when a row below
+spends its time there and the module is small (12 KB or less); a larger module carries `@native`
+on the functions the row spends its time in, and nothing else.
+
+Measured 2026-10-15 with `jess 0.1.0`, the verified release build of jess `07c38cb` on l3i
+2.0.3, on the i7-10870H, the one-minute load 1.48 and 1.40 at the start of the two
+sessions. In each session the bench ran alternately on this package and on a copy of it with
+every module marked, three fresh runs of `bench/bench.jsl` each, every run's row the median of
+its batches; a column is the median of the three, and a ratio is against the all-marked runs of
+the same session. Which functions a row spends its time in comes from `jess run --profile` of
+that row alone, unmarked. The load cost is a fresh `jess run --package <this package>
+--package-path jpk` of a script that only requires `@magick`, the two sides alternating, the
+median of five each after one warm-up.
+
+| Requiring `@magick` | All marked | This state |
+| --- | ---: | ---: |
+| Unmarked | 0.076 s | 0.052 s |
+| Final | 0.075 s | 0.070 s |
+
+| Row | All marked (ms) | Unmarked / all marked | Final (ms) | Final / all marked |
+| --- | ---: | ---: | ---: | ---: |
+| new filled | 0.2342 | 0.650× | 0.06918 | 0.295× |
+| fill | 0.06348 | **1.080×** | 0.05748 | 0.905× |
+| rect color | 0.06422 | **1.132×** | 0.05759 | 0.897× |
+| rect tiled | 0.08291 | **1.346×** | 0.07744 | 0.934× |
+| tile | 0.2656 | 0.694× | 0.1006 | 0.379× |
+| polygon | 0.6483 | **5.007×** | 0.6367 | 0.982× |
+| polygon tiled | 0.8991 | **4.649×** | 0.8886 | 0.988× |
+| polygonOver | 1.534 | **10.266×** | 1.515 | 0.988× |
+| circle | 0.2899 | **5.450×** | 0.2838 | 0.979× |
+| rectOver color | 1.238 | **9.582×** | 1.224 | 0.989× |
+| rectOver tiled | 0.2406 | **6.974×** | 0.2347 | 0.976× |
+| roundRect | 0.1019 | **4.174×** | 0.1001 | 0.982× |
+| line and strokeRect | 0.1128 | **2.563×** | 0.1117 | 0.991× |
+| get and set every pixel | 4.198 | **5.824×** | 3.914 | 0.932× |
+| over opaque | 0.3440 | **1.487×** | 0.3406 | 0.990× |
+| over sprite | 1.167 | **8.387×** | 1.185 | 1.015× |
+| over soft | 4.505 | **10.215×** | 4.601 | 1.021× |
+| over offset | 3.389 | **10.102×** | 3.410 | 1.006× |
+| overMask opaque color | 1.152 | **7.547×** | 1.160 | 1.006× |
+| overMask soft color | 3.868 | **8.534×** | 3.886 | 1.005× |
+| copyAlpha dstin | 0.4174 | **8.512×** | 0.4187 | 1.003× |
+| copyAlpha copy | 0.1005 | 0.995× | 0.1001 | 0.996× |
+| darken | 0.5739 | **20.332×** | 0.5762 | 1.004× |
+| mathCompose | 1.384 | **16.423×** | 1.382 | 0.999× |
+| extent | 4.719 | **9.584×** | 4.678 | 0.991× |
+| montage | 0.1296 | **2.352×** | 0.1316 | 1.016× |
+| clone | 0.1985 | 0.584× | 0.07625 | 0.384× |
+| crop | 0.05386 | 0.880× | 0.03436 | 0.638× |
+| trim | 0.2268 | **1.200×** | 0.2470 | **1.089×** |
+| rotate90 | 1.090 | 0.993× | 1.120 | 1.027× |
+| rotate | 2.671 | **12.021×** | 2.695 | 1.009× |
+| resize nearest | 0.2754 | **1.250×** | 0.2854 | 1.036× |
+| resize down | 2.147 | **16.269×** | 2.150 | 1.001× |
+| resize up | 6.202 | **16.273×** | 6.238 | 1.006× |
+| roll | 0.2233 | **1.082×** | 0.1269 | 0.568× |
+| alphaMask | 0.3779 | **14.651×** | 0.3789 | 1.003× |
+| maskToImage | 1.026 | **8.328×** | 1.041 | 1.015× |
+| paintMask color | 0.2613 | **8.417×** | 0.2595 | 0.993× |
+| paintMask tiled | 0.7350 | **9.046×** | 0.7450 | 1.014× |
+| dilateMask 1 | 0.5854 | **17.606×** | 0.6251 | **1.068×** |
+| dilateMask 3 | 1.715 | **17.990×** | 1.797 | 1.047× |
+| blurMask | 4.233 | **11.530×** | 4.271 | 1.009× |
+| subtractMask | 0.1192 | **20.177×** | 0.1226 | 1.029× |
+| modulate | 0.7136 | **19.372×** | 0.6994 | 0.980× |
+| emboss | 0.9816 | **20.162×** | 0.9833 | 1.002× |
+| tint | 0.9713 | **15.752×** | 0.9755 | 1.004× |
+| grayscale | 1.377 | **21.490×** | 1.378 | 1.001× |
+| threshold | 1.420 | **14.731×** | 1.408 | 0.992× |
+| colorize | 1.383 | **21.326×** | 1.382 | 1.000× |
+| transparent | 1.100 | **13.692×** | 1.088 | 0.989× |
+| opaque | 1.145 | **11.760×** | 1.147 | 1.002× |
+| setAlpha | 0.1015 | 1.038× | 0.1029 | 1.014× |
+| polynomial | 1.380 | **21.946×** | 1.378 | 0.999× |
+| contrastStretch | 0.8665 | **14.880×** | 0.8775 | 1.013× |
+| sigmoidalContrast | 0.3466 | **21.031×** | 0.3677 | **1.061×** |
+| median | 0.5304 | **10.384×** | 0.5169 | 0.975× |
+| stats | 1.619 | **1.066×** | 1.620 | 1.001× |
+| noise | 1.954 | **6.651×** | 1.952 | 0.999× |
+| randomNoise | 0.6003 | **7.283×** | 0.6008 | 1.001× |
+| addGaussianNoise | 4.695 | **4.729×** | 4.743 | 1.010× |
+| verticalGradient | 0.2204 | **2.208×** | 0.2177 | 0.988× |
+| gaussianBlur 1.5 | 8.084 | **20.672×** | 8.210 | 1.016× |
+| gaussianBlur 12 | 45.49 | **20.980×** | 46.34 | 1.019× |
+| shadowed | 7.949 | **18.175×** | 8.432 | **1.061×** |
+| overMask glyphs | 0.02000 | **7.410×** | 0.01987 | 0.994× |
+| overMask soft glyphs | 0.03392 | **7.654×** | 0.03308 | 0.975× |
+| maskToImage glyph | 0.00175 | **6.626×** | 0.00198 | **1.128×** |
+| paintMask glyph | 0.00529 | **11.732×** | 0.00547 | 1.035× |
+| threshold icon | 0.00165 | **12.621×** | 0.00168 | 1.021× |
+| colorize icon | 0.00286 | **16.107×** | 0.00283 | 0.992× |
+| polynomial icon | 0.00295 | **15.996×** | 0.00294 | 0.995× |
+| strokeRect border | 0.00266 | **3.630×** | 0.00289 | **1.086×** |
+| rect columns | 0.00840 | **4.847×** | 0.00855 | 1.017× |
+| verticalGradient icon | 0.00188 | **4.775×** | 0.00219 | **1.162×** |
+| png | 6.350 | **1.065×** | 6.387 | 1.006× |
+| png stored | 1.385 | **1.054×** | 1.396 | 1.008× |
+| readPNG unfiltered | 0.8880 | **1.089×** | 0.9197 | 1.036× |
+| readPNG filtered rgba | 1.864 | **7.904×** | 1.919 | 1.030× |
+| readPNG filtered rgb | 1.684 | **8.120×** | 1.696 | 1.007× |
+| readPNG filtered gray | 0.9187 | **6.559×** | 0.9528 | 1.037× |
+| dds | 0.6210 | **20.093×** | 0.6281 | 1.011× |
+| readDDS | 0.6204 | **19.768×** | 0.6295 | 1.015× |
+| readBMP | 0.8925 | **15.513×** | 0.9222 | 1.033× |
+| readTGA | 0.6338 | **19.020×** | 0.6341 | 1.000× |
+| readTGA packets | 1.760 | **7.976×** | 1.759 | 1.000× |
+
+What carries the directive (every function here is one a row spends its time in, unmarked):
+
+- `init`, by function: `colorTable`, `replicate`, `spread`, `Image.fill`, `Image.get`, `Image.set`,
+  `Image.rect`, `Image.polygon`, `Image.circle`, `blend`, `Image.over`, `Image.overMask`,
+  `Image.copyAlpha`, `Image.crop`, `Image.trim`, `Image.rotate90`, `Image.resize`, `Image.rotate`,
+  `Magick.noise`, `shade`, `Magick.maskToImage`, `Magick.paintMask`, `raise`, `Magick.blurMask`,
+  `Magick.subtractMask`, `Magick.modulate`, `Magick.emboss`, `Magick.tint`, `swapRedBlue`,
+  `fromBgr`, `fromGray`, `Magick.png`, `unaverage`, `unpaeth`, `Magick.readPNG`, `Magick.readTGA`,
+  `Image.rectOver`, `Image.alphaMask`, `Image.roll`, `mapColors`, `levels`, `Image.grayscale`,
+  `Image.threshold`, `Image.colorize`, `Image.transparent`, `Image.opaque`, `Image.darken`,
+  `Image.line`, `accumulate`, `settle`, `Magick.mathCompose`, `Image.polynomial`,
+  `Magick.verticalGradient`, `Magick.randomNoise`, `Magick.addGaussianNoise`, `Magick.shadowed`.
+
+Nearly every image operation is one some row spends its time in; what loads as bytecode is the
+module's setup, its argument checks, and the operations no row reaches. The seven rows still
+above 5% are 1.06x to 1.16x, and the worst of them are calls of 2 µs (a glyph's mask to an image,
+a gradient icon): small in what they cost, where marking the whole 100 KB module would give back
+the 6 ms a load this saves.
