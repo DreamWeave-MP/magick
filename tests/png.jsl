@@ -4,6 +4,7 @@
 -- and in, BMP and TGA in, and the files `read` and `write` choose a codec for. The inputs are
 -- built here byte by byte, so a decoder is held to bytes no encoder of this package wrote.
 local bytes = require '@dream/bytes'
+local fs = require '@dream/fs'
 local goldens = require './goldens'
 local magick = require '@magick'
 local support = require './support'
@@ -24,11 +25,12 @@ suite.afterEach(settle)
 --- A file of the suite's own under the harness's scratch root.
 local function scratch(name: string): string
   local root = assert(rawget(_G, 'scratchRoot') :: string?, 'the case needs a scratchRoot')
-  local folder = jess.fs.join(root, 'magick-codecs')
+  local folder = fs.join(root, 'magick-codecs')
 
-  jess.fs.createDir(folder)
+  local done, problem = fs.mkdir(folder, { recursive = true })
+  if not done then error(problem, 0) end
 
-  return jess.fs.join(folder, name)
+  return fs.join(folder, name)
 end
 
 local function chunk(kind: string, payload: string): string
@@ -290,22 +292,24 @@ suite.describe('files', function()
 
     expect(magick.write(asPng, source)).toBe(asPng)
     expect(magick.write(asDds, source)).toBe(asDds)
-    pin('write png', digest(jess.fs.readBuffer(asPng)))
-    pin('write dds', digest(jess.fs.readBuffer(asDds)))
+    pin('write png', digest(fs.readFile(asPng)))
+    pin('write dds', digest(fs.readFile(asDds)))
     expect(pixels(magick.read(asPng))).toBe(pixels(source))
     expect(pixels(magick.read(asDds))).toBe(pixels(source))
     expect(pixels(magick.readPNG(asPng))).toBe(pixels(source))
     expect(magick.writePNG(scratch 'level.png', source, 1)).toBe(scratch 'level.png')
-    pin('writePNG level', digest(jess.fs.readBuffer(scratch 'level.png')))
+    pin('writePNG level', digest(fs.readFile(scratch 'level.png')))
     expect(magick.writeDDS(scratch 'direct.dds', source)).toBe(scratch 'direct.dds')
-    expect(digest(jess.fs.readBuffer(scratch 'direct.dds'))).toBe(digest(magick.dds(source)))
+    expect(digest(fs.readFile(scratch 'direct.dds'))).toBe(digest(magick.dds(source)))
   end)
 
   suite.it('reads BMP and TGA files', function()
     local asBmp, asTga = scratch 'read.bmp', scratch 'read.TGA'
 
-    jess.fs.write(asBmp, bmp(7, 5, 24, false, 711))
-    jess.fs.write(asTga, tga(7, 5, 2, 32, 8, noise(7 * 5 * 4, 712)))
+    local done, problem = fs.writeFile(asBmp, bmp(7, 5, 24, false, 711), { atomic = true, createParents = true })
+    if not done then error(problem, 0) end
+    local done, problem = fs.writeFile(asTga, tga(7, 5, 2, 32, 8, noise(7 * 5 * 4, 712)), { atomic = true, createParents = true })
+    if not done then error(problem, 0) end
     pin('read bmp', pixels(magick.read(asBmp)))
     pin('read tga', pixels(magick.read(asTga)))
     expect(pixels(magick.readBMP(asBmp))).toBe(pixels(magick.read(asBmp)))

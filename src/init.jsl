@@ -4,6 +4,7 @@
 -- Semantics are intentionally ImageMagick-shaped, not a full CLI clone.
 local bytes = require '@dream/bytes'
 local dataPlane = require '@dream/data'
+local fs = require '@dream/fs'
 
 local Magick = {}
 local Image = {}
@@ -1475,7 +1476,8 @@ function Magick.readDDS(source: buffer): Image
 end
 
 function Magick.writeDDS(path: string, image: Image): string
-  jess.fs.write(path, Magick.dds(image))
+  local succeeded, problem = fs.writeFile(path, Magick.dds(image), { atomic = true, createParents = true })
+  if not succeeded then error(problem, 0) end
 
   return path
 end
@@ -1496,14 +1498,14 @@ function Magick.stats(image: Image): Stats
     width = width,
     height = height,
     mean = { red / count, green / count, blue / count, alpha / count },
-    nonzeroAlpha = dataPlane.count(data, 'u8@4', 3, count, 'ne', 0),
+    nonzeroAlpha = dataPlane.countWhere(data, 'u8@4', 3, count, 'ne', 0),
   }
 end
 
 --- The bytes of a file given as them or as a path to read them from. A file that cannot be read
 --- comes back as nothing, which the first look at its length refuses.
 local function opened(source: buffer | string): buffer
-  return (if type(source) == 'string' then jess.fs.readBuffer(source) else source) :: buffer
+  return (if type(source) == 'string' then fs.readFile(source) else source) :: buffer
 end
 
 local PngSignature = '\137PNG\r\n\26\n'
@@ -1705,7 +1707,8 @@ function Magick.readPNG(source: buffer | string): Image
 end
 
 function Magick.writePNG(path: string, image: Image, level: number?): string
-  jess.fs.write(path, Magick.png(image, level))
+  local succeeded, problem = fs.writeFile(path, Magick.png(image, level), { atomic = true, createParents = true })
+  if not succeeded then error(problem, 0) end
 
   return path
 end
