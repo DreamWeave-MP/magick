@@ -4,7 +4,7 @@ manifest_version = 1
 id = "org.dreamweave.magick"
 version = "0.1.2"
 jess_api = "1"
-include = ["src", "LICENSES", "README.md"]
+include = ["src", "LICENSES", "README.md", "tests"]
 tests = ["tests/basic.jsl", "tests/png.jsl", "tests/style.jsl"]
 
 [modules]
