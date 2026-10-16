@@ -103,7 +103,7 @@ suite.describe('colors', function()
   end)
 
   suite.it('refuses what is not a color', function()
-    expect(function() magick.color(5) end).toThrow 'magick: color must be a table or hex string'
+    expect(function() magick.color(5 :: any) end).toThrow 'magick: color must be a table or hex string'
     expect(function() magick.color '#12345' end).toThrow 'magick: expected #rgb, #rrggbb, or #rrggbbaa'
     expect(function() magick.color '' end).toThrow 'magick: expected #rgb, #rrggbb, or #rrggbbaa'
     expect(function() magick.color '#gg0000' end).toThrow 'magick: invalid color'
@@ -353,7 +353,7 @@ suite.describe('compositing', function()
     end
 
     expect(function() noisy(9, 7, 41):copyAlpha(noisy(9, 7, 42), 'screen') end).toThrow 'magick: unknown alpha composite mode screen'
-    expect(function() noisy(9, 7, 41):copyAlpha(noisy(9, 7, 42)) end).toThrow 'magick: unknown alpha composite mode nil'
+    expect(function() noisy(9, 7, 41):copyAlpha(noisy(9, 7, 42), nil :: any) end).toThrow 'magick: unknown alpha composite mode nil'
     expect(function() noisy(9, 7, 41):copyAlpha(noisy(9, 6, 42), 'copy') end).toThrow 'magick: mask geometry mismatch'
     pin('copyAlpha empty', pixels(magick.new(0, 0):copyAlpha(magick.new(0, 0), 'screen')))
   end)

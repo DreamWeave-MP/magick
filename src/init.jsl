@@ -351,13 +351,15 @@ function Image.polygon(self: Image, points: { { number } }, source: Source?): Im
   local {width, height, data} = self
   local left, top, right, bottom = width - 1, height - 1, 0, 0
 
+  -- The last value of each pair is parenthesized: unwrapped, the type checker reads it as
+  -- `number?` once the loop has run.
   for _, point in points do
-    left, top = math.min(left, point[1]), math.min(top, point[2])
-    right, bottom = math.max(right, point[1]), math.max(bottom, point[2])
+    left, top = math.min(left, point[1]), (math.min(top, point[2]))
+    right, bottom = math.max(right, point[1]), (math.max(bottom, point[2]))
   end
 
-  left, top = math.max(0, math.floor(left)), math.max(0, math.floor(top))
-  right, bottom = math.min(width - 1, math.ceil(right)), math.min(height - 1, math.ceil(bottom))
+  left, top = math.max(0, math.floor(left)), (math.max(0, math.floor(top)))
+  right, bottom = math.min(width - 1, math.ceil(right)), (math.min(height - 1, math.ceil(bottom)))
 
   if left > right then return self end
 
@@ -365,7 +367,7 @@ function Image.polygon(self: Image, points: { { number } }, source: Source?): Im
   local tilePixels = if tile and repeatable(tile, data) then tile.data else nil
   local tileWidth, tileHeight = if tile then tile.width else 0, if tile then tile.height else 0
   local count = #points
-  local crossings: { number } = table.create(count)
+  local crossings = table.create(count) :: { number }
   local color: number? = nil
 
   for row = top, bottom do
@@ -671,7 +673,9 @@ function Image.copyAlpha(self: Image, mask: Image, mode: string): Image
 
   -- A mask with a `get` of its own is asked for each pixel through it, and one with none, a
   -- mask of coverage for one, is refused by the first call.
-  if mask.get ~= plainGet then
+  local maskGet = mask.get
+
+  if maskGet ~= plainGet then
     for row = 0, self.height - 1 do
       for column = 0, self.width - 1 do
         local red, green, blue, alpha = self:get(column, row)
@@ -1514,6 +1518,9 @@ local PngSignature = '\137PNG\r\n\26\n'
 --- with alpha, and RGBA.
 local PngChannels = { [0] = 1, [2] = 3, [4] = 2, [6] = 4 }
 
+-- What a PNG's IHDR says.
+type PngHeader = { width: number, height: number, depth: number, colorType: number, interlace: number }
+
 --- Writes a PNG chunk at `offset`: its length, its kind, its payload, and the CRC-32 of the kind
 --- and the payload. Returns the offset after it.
 local function writeChunk(out: buffer, offset: number, kind: string, payload: buffer): number
@@ -1605,7 +1612,7 @@ function Magick.readPNG(source: buffer | string): Image
 
   if length < 8 or buffer.readstring(file, 0, 8) ~= PngSignature then error('magick: not a PNG', 2) end
 
-  local width, height, depth, colorType, interlace
+  local header: PngHeader?
 
   local position, packedLength = 8, 0
   local spans: { number } = {}
@@ -1618,9 +1625,13 @@ function Magick.readPNG(source: buffer | string): Image
     if kind == 'IEND' then break end
 
     if kind == 'IHDR' then
-      width, height = bytes.readu32be(file, payload), bytes.readu32be(file, payload + 4)
-      depth, colorType = buffer.readu8(file, payload + 8), buffer.readu8(file, payload + 9)
-      interlace = buffer.readu8(file, payload + 12)
+      header = {
+        width = bytes.readu32be(file, payload),
+        height = bytes.readu32be(file, payload + 4),
+        depth = buffer.readu8(file, payload + 8),
+        colorType = buffer.readu8(file, payload + 9),
+        interlace = buffer.readu8(file, payload + 12),
+      }
     elseif kind == 'IDAT' then
       table.insert(spans, payload)
       table.insert(spans, size)
@@ -1630,9 +1641,11 @@ function Magick.readPNG(source: buffer | string): Image
     position = payload + size + 4
   end
 
-  if not width or not height or not colorType or depth ~= 8 or interlace ~= 0 then
+  if not header or header.depth ~= 8 or header.interlace ~= 0 then
     error('magick: PNG requires 8-bit non-interlaced samples', 2)
   end
+
+  local {width, height, colorType} = header
 
   local channels = PngChannels[colorType]
 

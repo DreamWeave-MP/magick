@@ -20,6 +20,14 @@ local Signature = '\137PNG\r\n\26\n'
 --- How many bytes a pixel of each PNG color type takes at eight bits a sample.
 local Channels = { [0] = 1, [2] = 3, [4] = 2, [6] = 4 }
 
+
+--- The bytes of the file at `path`.
+local function readBytes(path: string): buffer
+  local contents, problem = fs.readFile(path)
+  if not contents then error(problem, 0) end
+
+  return contents
+end
 suite.afterEach(settle)
 
 --- A file of the suite's own under the harness's scratch root.
@@ -292,15 +300,15 @@ suite.describe('files', function()
 
     expect(magick.write(asPng, source)).toBe(asPng)
     expect(magick.write(asDds, source)).toBe(asDds)
-    pin('write png', digest(fs.readFile(asPng)))
-    pin('write dds', digest(fs.readFile(asDds)))
+    pin('write png', digest(readBytes(asPng)))
+    pin('write dds', digest(readBytes(asDds)))
     expect(pixels(magick.read(asPng))).toBe(pixels(source))
     expect(pixels(magick.read(asDds))).toBe(pixels(source))
     expect(pixels(magick.readPNG(asPng))).toBe(pixels(source))
     expect(magick.writePNG(scratch 'level.png', source, 1)).toBe(scratch 'level.png')
-    pin('writePNG level', digest(fs.readFile(scratch 'level.png')))
+    pin('writePNG level', digest(readBytes(scratch 'level.png')))
     expect(magick.writeDDS(scratch 'direct.dds', source)).toBe(scratch 'direct.dds')
-    expect(digest(fs.readFile(scratch 'direct.dds'))).toBe(digest(magick.dds(source)))
+    expect(digest(readBytes(scratch 'direct.dds'))).toBe(digest(magick.dds(source)))
   end)
 
   suite.it('reads BMP and TGA files', function()
