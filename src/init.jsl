@@ -2247,6 +2247,146 @@ function Image.darken(self: Image, source: Image, dx: number?, dy: number?): Ima
   return self
 end
 
+--- Composites `source`, laid at a whole offset, by screening, ImageMagick's `Screen`: each color
+--- channel becomes one less the product of what the two lack of full, so black leaves what is
+--- under it as it was and nothing gets darker. The source's alpha weighs it as `over` would.
+@native
+function Image.screen(self: Image, source: Image, dx: number?, dy: number?): Image
+  local across, down = dx or 0, dy or 0
+
+  if across % 1 ~= 0 or down % 1 ~= 0 then error('magick: screen needs a whole offset', 2) end
+
+  local {width, height, data: to} = self
+  local {width: sourceWidth, height: sourceHeight, data: from} = source
+  local left, right = math.max(0, -across), math.min(sourceWidth, width - across) - 1
+
+  for row = math.max(0, -down), math.min(sourceHeight, height - down) - 1 do
+    local sourceAt = (row * sourceWidth + left) * 4
+    local at = ((row + down) * width + left + across) * 4
+
+    for _ = left, right do
+      local pixel = buffer.readu32(from, sourceAt)
+      local alpha = bit32.rshift(pixel, 24)
+
+      if alpha ~= 0 then
+        local under = buffer.readu32(to, at)
+        local opacity, underOpacity = alpha / 255, bit32.rshift(under, 24) / 255
+        local covered = opacity + underOpacity - opacity * underOpacity
+        local out = round8(covered * 255) * 16777216
+
+        -- Premultiplied, a channel is the source's plus what is under it less their product.
+        for shift = 0, 16, 8 do
+          local mine = bit32.band(bit32.rshift(pixel, shift), 255) / 255 * opacity
+          local theirs = bit32.band(bit32.rshift(under, shift), 255) / 255 * underOpacity
+
+          out += clamp8((mine + theirs - mine * theirs) / covered * 255) * bit32.lshift(1, shift)
+        end
+
+        buffer.writeu32(to, at, out)
+      end
+
+      sourceAt += 4
+      at += 4
+    end
+  end
+
+  return self
+end
+
+--- Where each pixel of a line `target` long falls on a line `source` long when the two are laid
+--- end to end over each other: for each, the first source pixel it overlaps, how many it does,
+--- and how much of each, as shares of the target pixel, in one flat list from `weights[at]`.
+local function overlaps(source: number, target: number): ({ number }, { number }, { number }, { number })
+  local firsts, counts = table.create(target) :: { number }, table.create(target) :: { number }
+  local starts, weights = table.create(target) :: { number }, {} :: { number }
+  local span = source / target
+
+  for index = 0, target - 1 do
+    local from, to = index * span, (index + 1) * span
+    local first, last = math.floor(from), math.min(source - 1, math.ceil(to) - 1)
+
+    table.insert(firsts, first)
+    table.insert(counts, last - first + 1)
+    table.insert(starts, #weights + 1)
+
+    for pixel = first, last do
+      table.insert(weights, (math.min(to, pixel + 1) - math.max(from, pixel)) / span)
+    end
+  end
+
+  return firsts, counts, starts, weights
+end
+
+--- The image resampled to a size by area, ImageMagick's `-scale`: each pixel is the average of
+--- the pixels it covers, weighed by how much of each it covers and by their alpha, so a smaller
+--- image keeps every detail's share of its color and an edge doesn't darken into a clear
+--- neighbour. Enlarged, a pixel is repeated.
+@native
+function Image.scale(self: Image, width: number, height: number): Image
+  local out = Magick.new(width, height)
+  local {width: sourceWidth, height: sourceHeight, data: from} = self
+
+  if width == 0 or height == 0 or sourceWidth == 0 or sourceHeight == 0 then return out end
+
+  -- Rows first: each source row is shrunk across into premultiplied channels, then the rows are
+  -- averaged down.
+  local across = buffer.create(width * sourceHeight * 32)
+  local firsts, counts, starts, weights = overlaps(sourceWidth, width)
+
+  for row = 0, sourceHeight - 1 do
+    for column = 0, width - 1 do
+      local red, green, blue, alpha = 0, 0, 0, 0
+      local first, start = firsts[column + 1], starts[column + 1]
+
+      for step = 0, counts[column + 1] - 1 do
+        local pixel = buffer.readu32(from, (row * sourceWidth + first + step) * 4)
+        local share = weights[start + step]
+        local opacity = bit32.rshift(pixel, 24) * share
+
+        red += bit32.band(pixel, 255) * opacity
+        green += bit32.band(bit32.rshift(pixel, 8), 255) * opacity
+        blue += bit32.band(bit32.rshift(pixel, 16), 255) * opacity
+        alpha += opacity
+      end
+
+      local at = (row * width + column) * 32
+
+      buffer.writef64(across, at, red)
+      buffer.writef64(across, at + 8, green)
+      buffer.writef64(across, at + 16, blue)
+      buffer.writef64(across, at + 24, alpha)
+    end
+  end
+
+  local pixels = out.data
+
+  firsts, counts, starts, weights = overlaps(sourceHeight, height)
+
+  for row = 0, height - 1 do
+    local first, start = firsts[row + 1], starts[row + 1]
+
+    for column = 0, width - 1 do
+      local red, green, blue, alpha = 0, 0, 0, 0
+
+      for step = 0, counts[row + 1] - 1 do
+        local at = ((first + step) * width + column) * 32
+        local share = weights[start + step]
+
+        red += buffer.readf64(across, at) * share
+        green += buffer.readf64(across, at + 8) * share
+        blue += buffer.readf64(across, at + 16) * share
+        alpha += buffer.readf64(across, at + 24) * share
+      end
+
+      if alpha > 0 then
+        buffer.writeu32(pixels, (row * width + column) * 4, stored(red / alpha, green / alpha, blue / alpha, alpha))
+      end
+    end
+  end
+
+  return out
+end
+
 --- Draws a line as a square of the line's width at every step along it.
 @native
 function Image.line(self: Image, x0: number, y0: number, x1: number, y1: number, source: Source?, width: number?): Image

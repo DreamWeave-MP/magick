@@ -1,0 +1,107 @@
+--!strict
+-- `Image.screen` and `Image.scale`: screening as ImageMagick's Screen composes it, and resampling
+-- by area as `-scale` does, each held to values worked out by hand.
+local magick = require '@magick'
+local test = require '@jess/test'
+
+local expect = test.expect
+local suite = test.new()
+
+suite.describe('screen', function()
+  suite.it('leaves what is under black alone and makes white white', function()
+    local image = magick.new(2, 1, '#405060')
+
+    image:screen(magick.new(1, 1, '#000000'), 0, 0)
+    image:screen(magick.new(1, 1, '#ffffff'), 1, 0)
+
+    expect({ image:get(0, 0) }).toEqual { 0x40, 0x50, 0x60, 255 }
+    expect({ image:get(1, 0) }).toEqual { 255, 255, 255, 255 }
+  end)
+
+  suite.it('takes one less the product of what each lacks', function()
+    local image = magick.new(1, 1, '#808080')
+
+    image:screen(magick.new(1, 1, '#808080'))
+
+    -- 1 - (127/255)^2, of 255: 191.75.
+    expect({ image:get(0, 0) }).toEqual { 192, 192, 192, 255 }
+  end)
+
+  suite.it('weighs the source by its alpha', function()
+    local image = magick.new(2, 1, '#000000')
+
+    image:screen(magick.fromRGBA(2, 1, buffer.fromstring '\255\255\255\0\255\255\255\128'))
+
+    expect({ image:get(0, 0) }).toEqual { 0, 0, 0, 255 }
+    expect({ image:get(1, 0) }).toEqual { 128, 128, 128, 255 }
+  end)
+
+  suite.it('lays the source at an offset, clipped to the image', function()
+    local image = magick.new(2, 2, '#000000')
+
+    image:screen(magick.new(2, 2, '#ffffff'), 1, -1)
+
+    expect({ image:get(1, 0) }).toEqual { 255, 255, 255, 255 }
+    expect({ image:get(0, 0) }).toEqual { 0, 0, 0, 255 }
+    expect({ image:get(1, 1) }).toEqual { 0, 0, 0, 255 }
+  end)
+
+  suite.it('refuses an offset between pixels', function()
+    expect(function()
+      magick.new(2, 2):screen(magick.new(1, 1), 0.5, 0)
+    end).toThrow 'screen needs a whole offset'
+  end)
+end)
+
+suite.describe('scale', function()
+  suite.it('averages the pixels each one covers', function()
+    local board = magick.new(2, 2, '#000000')
+
+    board:set(1, 0, 255, 255, 255, 255)
+    board:set(0, 1, 255, 255, 255, 255)
+
+    local out = board:scale(1, 1)
+
+    expect({ out.width, out.height }).toEqual { 1, 1 }
+    expect({ out:get(0, 0) }).toEqual { 128, 128, 128, 255 }
+  end)
+
+  suite.it('weighs a pixel shared between two by its share of each', function()
+    local line = magick.new(3, 1, '#000000')
+
+    line:set(1, 0, 255, 255, 255, 255)
+
+    local out = line:scale(2, 1)
+
+    -- Each output pixel is a pixel and a half of the line: half of the white one is a third.
+    expect({ out:get(0, 0) }).toEqual { 85, 85, 85, 255 }
+    expect({ out:get(1, 0) }).toEqual { 85, 85, 85, 255 }
+  end)
+
+  suite.it("doesn't let a clear pixel's color in", function()
+    local out = magick.fromRGBA(2, 1, buffer.fromstring '\255\0\0\255\0\255\0\0'):scale(1, 1)
+
+    expect({ out:get(0, 0) }).toEqual { 255, 0, 0, 128 }
+  end)
+
+  suite.it('repeats pixels when it enlarges', function()
+    local line = magick.new(2, 1, '#000000')
+
+    line:set(1, 0, 255, 255, 255, 255)
+
+    local out = line:scale(4, 1)
+
+    expect({ out:get(0, 0) }).toEqual { 0, 0, 0, 255 }
+    expect({ out:get(1, 0) }).toEqual { 0, 0, 0, 255 }
+    expect({ out:get(2, 0) }).toEqual { 255, 255, 255, 255 }
+    expect({ out:get(3, 0) }).toEqual { 255, 255, 255, 255 }
+  end)
+
+  suite.it('gives an empty image for an empty size', function()
+    local out = magick.new(2, 2, '#ffffff'):scale(0, 3)
+
+    expect({ out.width, out.height }).toEqual { 0, 3 }
+  end)
+end)
+
+return suite
