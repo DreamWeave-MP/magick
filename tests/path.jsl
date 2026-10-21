@@ -1,0 +1,192 @@
+--!strict
+-- `@magick/path`: coverage worked out exactly where the geometry says what it must be (whole and
+-- half pixels, areas, holes, unions), the shapes and strokes the module builds, its pen, and
+-- filling through a mask into an image.
+local magick = require '@magick'
+local path = require '@magick/path'
+local test = require '@jess/test'
+
+local expect = test.expect
+local suite = test.new()
+
+--- The coverage bytes of a mask, a row a list.
+local function rows(mask: magick.Mask): { { number } }
+  local out: { { number } } = {}
+
+  for row = 0, mask.height - 1 do
+    local values: { number } = {}
+
+    for column = 0, mask.width - 1 do
+      table.insert(values, buffer.readu8(mask.data, row * mask.width + column))
+    end
+
+    table.insert(out, values)
+  end
+
+  return out
+end
+
+--- The coverage a mask holds in all, in whole pixels.
+local function area(mask: magick.Mask): number
+  local total = 0
+
+  for offset = 0, mask.width * mask.height - 1 do
+    total += buffer.readu8(mask.data, offset)
+  end
+
+  return total / 255
+end
+
+--- The coverage at a point of the image a path was drawn for, through its mask's offset.
+local function at(mask: magick.Mask, left: number, top: number, column: number, row: number): number
+  return buffer.readu8(mask.data, (row - top) * mask.width + column - left)
+end
+
+suite.describe('coverage', function()
+  suite.it('covers whole pixels whole, past a spare column for the right edge', function()
+    local mask, left, top = path.new():rect(1, 2, 3, 4):mask()
+
+    expect({ left, top, mask.width, mask.height }).toEqual { 1, 2, 3, 2 }
+    expect(rows(mask)).toEqual { { 255, 255, 0 }, { 255, 255, 0 } }
+  end)
+
+  suite.it('covers a pixel an edge halves by half', function()
+    local mask = path.new():rect(0.5, 0, 2.5, 1):mask()
+
+    expect(rows(mask)).toEqual { { 128, 255, 128, 0 } }
+  end)
+
+  suite.it('covers a slanted edge by the area under it', function()
+    -- The diagonal of a 2 by 2 square: the pixels it crosses are half covered.
+    local mask = path.new():polygon({ { 0, 0 }, { 2, 0 }, { 2, 2 } }):mask()
+
+    expect(rows(mask)).toEqual { { 128, 255, 0 }, { 0, 128, 0 } }
+  end)
+
+  suite.it('covers a circle by its area', function()
+    local mask = path.new(0.05):circle(50, 50, 40):mask()
+
+    expect(math.abs(area(mask) - math.pi * 1600) < 2).toBe(true)
+  end)
+
+  suite.it('joins shapes that overlap without adding them past full', function()
+    local mask = path.new():rect(0, 0, 3, 1):rect(2, 0, 5, 1):mask()
+
+    expect(rows(mask)).toEqual { { 255, 255, 255, 255, 255, 0 } }
+  end)
+
+  suite.it('cuts a hole with a contour drawn the other way', function()
+    local opposite = path.new():rect(0, 0, 3, 3):moveTo(1, 1):lineTo(1, 2):lineTo(2, 2):lineTo(2, 1):close():mask()
+    local same = path.new():rect(0, 0, 3, 3):moveTo(1, 1):lineTo(2, 1):lineTo(2, 2):lineTo(1, 2):close():mask()
+
+    expect(rows(opposite)[2]).toEqual { 255, 0, 255, 0 }
+    expect(rows(same)[2]).toEqual { 255, 255, 255, 0 }
+  end)
+
+  suite.it('gives nothing for a path with no contours', function()
+    local mask, left, top = path.new():mask()
+
+    expect({ mask.width, mask.height, left, top }).toEqual { 0, 0, 0, 0 }
+  end)
+end)
+
+suite.describe('shapes', function()
+  suite.it('leaves a ring and a frame hollow', function()
+    local ring, ringLeft, ringTop = path.new():ring(20, 20, 10, 6):mask()
+    local frame, frameLeft, frameTop = path.new():frame(0, 0, 10, 10, 2):mask()
+
+    expect(at(ring, ringLeft, ringTop, 20, 20)).toBe(0)
+    expect(at(ring, ringLeft, ringTop, 20, 12)).toBe(255)
+    expect(at(frame, frameLeft, frameTop, 5, 5)).toBe(0)
+    expect(at(frame, frameLeft, frameTop, 1, 5)).toBe(255)
+    expect(math.abs(area(frame) - (100 - 36)) < 0.01).toBe(true)
+  end)
+
+  suite.it('rounds a rectangle off its corners and nowhere else', function()
+    local mask, left, top = path.new(0.05):roundRect(0, 0, 40, 20, 8):mask()
+
+    expect(at(mask, left, top, 0, 0)).toBe(0)
+    expect(at(mask, left, top, 20, 0)).toBe(255)
+    expect(at(mask, left, top, 0, 10)).toBe(255)
+    expect(math.abs(area(mask) - (800 - (4 - math.pi) * 64)) < 0.5).toBe(true)
+  end)
+
+  suite.it('caps a line flush, square, or round', function()
+    local butt = path.new():line(10, 10, 30, 10, 4):mask()
+    local square = path.new():line(10, 10, 30, 10, 4, 'square'):mask()
+    local round = path.new(0.05):line(10, 10, 30, 10, 4, 'round'):mask()
+
+    expect(math.abs(area(butt) - 80) < 0.01).toBe(true)
+    expect(math.abs(area(square) - 96) < 0.01).toBe(true)
+    expect(math.abs(area(round) - (80 + math.pi * 4)) < 0.1).toBe(true)
+  end)
+
+  suite.it('joins a polyline round and caps only its two ends', function()
+    local mask, left, top = path.new():polyline({ { 0, 10 }, { 20, 10 }, { 20, 30 } }, 4, 'square'):mask()
+
+    -- The square cap reaches 2 past the first point; the corner is a round join about the bend.
+    expect(left).toBe(-2)
+    expect(at(mask, left, top, 18, 8)).toBe(255)
+    expect(at(mask, left, top, 20, 9)).toBe(255)
+    expect(at(mask, left, top, 21, 31)).toBe(255)
+  end)
+
+  suite.it('flattens curves to within the tolerance', function()
+    local quad = path.new(0.25):moveTo(0, 0):quadTo(50, 100, 100, 0):close()
+    local cubic = path.new(0.25):moveTo(0, 0):cubicTo(0, 100, 100, 100, 100, 0):close()
+
+    -- The quadratic's peak is at half its control's height.
+    local _, quadTop, _, quadBottom = quad:bounds()
+    local _, _, _, cubicBottom = cubic:bounds()
+
+    expect(quadTop).toBe(0)
+    expect(math.abs(quadBottom - 50) <= 0.25).toBe(true)
+    expect(math.abs(cubicBottom - 75) <= 0.25).toBe(true)
+    expect(#quad.contours[1] > 8).toBe(true)
+  end)
+
+  suite.it('moves and scales a copy, leaving the path as it was', function()
+    local shape = path.new():rect(0, 0, 2, 2)
+    local moved = shape:transformed(2, 10, 20)
+
+    expect({ moved:bounds() }).toEqual { 10, 20, 14, 24 }
+    expect({ shape:bounds() }).toEqual { 0, 0, 2, 2 }
+  end)
+end)
+
+suite.describe('pen', function()
+  suite.it('draws what the methods draw', function()
+    local drawn = path.new():moveTo(0, 0):lineTo(4, 0):quadTo(6, 2, 4, 4):lineTo(0, 4):close():mask()
+    local penned = path.new()
+    local pen = penned:pen()
+
+    pen.moveTo(0, 0)
+    pen.lineTo(4, 0)
+    pen.quadTo(6, 2, 4, 4)
+    pen.lineTo(0, 4)
+    pen.close()
+
+    expect(rows(penned:mask())).toEqual(rows(drawn))
+  end)
+
+  suite.it('refuses a line before a move', function()
+    expect(function()
+      path.new():lineTo(1, 1)
+    end).toThrow 'path.lineTo needs a moveTo first'
+  end)
+end)
+
+suite.describe('fill', function()
+  suite.it('composites a color through the coverage at its place in the image', function()
+    local image = magick.new(4, 1, '#000000')
+
+    path.new():rect(1.5, 0, 3, 1):fill(image, '#ffffff')
+
+    expect({ image:get(0, 0) }).toEqual { 0, 0, 0, 255 }
+    expect({ image:get(1, 0) }).toEqual { 128, 128, 128, 255 }
+    expect({ image:get(2, 0) }).toEqual { 255, 255, 255, 255 }
+    expect({ image:get(3, 0) }).toEqual { 0, 0, 0, 255 }
+  end)
+end)
+
+return suite

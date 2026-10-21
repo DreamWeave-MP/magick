@@ -5,12 +5,13 @@ id = "org.dreamweave.magick"
 version = "0.1.2"
 jess_api = "1"
 include = ["src", "LICENSES", "README.md", "tests"]
-tests = ["tests/basic.jsl", "tests/png.jsl", "tests/style.jsl"]
+tests = ["tests/basic.jsl", "tests/png.jsl", "tests/path.jsl", "tests/style.jsl"]
 
 [modules]
 "@magick" = "src/init.jsl"
+"@magick/path" = "src/path.jsl"
 
 [[layer]]
 id = "org.dreamweave.magick"
 requires = []
-exports = ["@magick"]
+exports = ["@magick", "@magick/path"]

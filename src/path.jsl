@@ -1,0 +1,561 @@
+--!strict
+--[[
+@magick/path: shapes as outlines, filled with anti-aliased coverage.
+
+A path is a list of closed contours in image coordinates (pixels, y down, a pixel's square
+running from its corner to the next). Lines go in as they are; quadratic and cubic curves are
+flattened as they are added, to within the path's tolerance. Filling a path gives a mask of
+coverage over the path's bounds, where each byte is how much of its pixel the shape covers,
+worked out exactly for the flattened outline rather than sampled.
+
+Coverage is the winding the contours add up to, clamped to whole: contours that wind the same
+way add up and overlap without a seam, and a contour that winds the other way cuts a hole in
+them. Every shape this module builds (rectangles, ellipses, strokes) winds the way a TrueType
+glyph's outer contour does once it is turned the right way up, so shapes and glyphs drawn into
+one path join; `ring` and `frame` wind their inner contour the other way, and are holes.
+
+The coverage is accumulated as signed areas a row at a time, the technique Raph Levien's
+font-rs (MIT OR Apache-2.0) describes; this is a separate implementation of it.
+]]
+local magick = require '@magick'
+
+local Path = {}
+Path.__index = Path
+
+type Outline = {
+  --- Each contour's points as x, y pairs in one flat list.
+  contours: { { number } },
+  --- The contour lines and curves are being added to, until the next move or close.
+  open: { number }?,
+  --- The farthest a flattened curve strays from the curve, in pixels.
+  tolerance: number,
+}
+
+--- Closed contours, and the open one being drawn.
+export type Path = typeof(setmetatable({} :: Outline, Path))
+
+--- How a line's ends are drawn: flush with them, as half circles past them, or as half squares
+--- past them.
+export type Cap = 'butt' | 'round' | 'square'
+
+local Module = {}
+
+--- An empty path whose curves are flattened to within `tolerance` pixels, or a quarter pixel.
+function Module.new(tolerance: number?): Path
+  local outline: Outline = { contours = {}, open = nil, tolerance = tolerance or 0.25 }
+
+  return setmetatable(outline, Path)
+end
+
+--- The area a contour encloses, positive for the winding every shape here is built with.
+local function signedArea(points: { number }): number
+  local count = #points
+  local total = 0
+  local lastX, lastY = points[count - 1], points[count]
+
+  for index = 1, count - 1, 2 do
+    local pointX, pointY = points[index], points[index + 1]
+
+    total += lastX * pointY - pointX * lastY
+    lastX, lastY = pointX, pointY
+  end
+
+  return total / 2
+end
+
+--- A contour's points in the other order.
+local function reversed(points: { number }): { number }
+  local count = #points
+  local out = table.create(count) :: { number }
+
+  for index = count - 1, 1, -2 do
+    table.insert(out, points[index])
+    table.insert(out, points[index + 1])
+  end
+
+  return out
+end
+
+--- Adds a closed contour wound as a shape (`hole` false) or as a hole in one, whichever way its
+--- points go.
+local function wound(self: Path, points: { number }, hole: boolean): Path
+  if #points < 6 then return self end
+
+  local area = signedArea(points)
+
+  if area == 0 then return self end
+
+  table.insert(self.contours, if (area < 0) ~= hole then reversed(points) else points)
+
+  return self
+end
+
+--- Starts a contour at a point, closing the one before it.
+function Path.moveTo(self: Path, toX: number, toY: number): Path
+  self:close()
+  self.open = { toX, toY }
+
+  return self
+end
+
+--- The open contour, or an error naming the drawing call that needs one.
+local function opened(self: Path, call: string): { number }
+  local points = self.open
+  if not points then error(`magick: path.{call} needs a moveTo first`, 3) end
+
+  return points
+end
+
+--- Adds a straight line from the current point.
+function Path.lineTo(self: Path, toX: number, toY: number): Path
+  local points = opened(self, 'lineTo')
+
+  table.insert(points, toX)
+  table.insert(points, toY)
+
+  return self
+end
+
+--- Adds a quadratic curve from the current point through a control point.
+function Path.quadTo(self: Path, controlX: number, controlY: number, toX: number, toY: number): Path
+  local points = opened(self, 'quadTo')
+  local fromX, fromY = points[#points - 1], points[#points]
+  -- A quadratic's chord strays by its second difference over eight, shrinking with the square of
+  -- the number of pieces.
+  local bendX, bendY = fromX - 2 * controlX + toX, fromY - 2 * controlY + toY
+  local pieces = math.max(1, math.ceil(math.sqrt(math.sqrt(bendX * bendX + bendY * bendY) / (8 * self.tolerance))))
+
+  for piece = 1, pieces do
+    local along = piece / pieces
+    local rest = 1 - along
+
+    table.insert(points, rest * rest * fromX + 2 * rest * along * controlX + along * along * toX)
+    table.insert(points, rest * rest * fromY + 2 * rest * along * controlY + along * along * toY)
+  end
+
+  return self
+end
+
+--- Adds a cubic curve from the current point through two control points.
+function Path.cubicTo(
+  self: Path,
+  firstX: number,
+  firstY: number,
+  secondX: number,
+  secondY: number,
+  toX: number,
+  toY: number
+): Path
+  local points = opened(self, 'cubicTo')
+  local fromX, fromY = points[#points - 1], points[#points]
+  -- A cubic's chord strays by at most three quarters of its larger second difference, shrinking
+  -- with the square of the number of pieces.
+  local leadX, leadY = fromX - 2 * firstX + secondX, fromY - 2 * firstY + secondY
+  local tailX, tailY = firstX - 2 * secondX + toX, firstY - 2 * secondY + toY
+  local bend = math.max(math.sqrt(leadX * leadX + leadY * leadY), math.sqrt(tailX * tailX + tailY * tailY))
+  local pieces = math.max(1, math.ceil(math.sqrt(0.75 * bend / self.tolerance)))
+
+  for piece = 1, pieces do
+    local along = piece / pieces
+    local rest = 1 - along
+    local start, early, late, finish = rest * rest * rest, 3 * rest * rest * along, 3 * rest * along * along, along * along * along
+
+    table.insert(points, start * fromX + early * firstX + late * secondX + finish * toX)
+    table.insert(points, start * fromY + early * firstY + late * secondY + finish * toY)
+  end
+
+  return self
+end
+
+--- Closes the open contour, if there is one, back to where it started. A contour drawn here
+--- keeps its own winding.
+function Path.close(self: Path): Path
+  local points = self.open
+
+  self.open = nil
+  if points and #points >= 6 then table.insert(self.contours, points) end
+
+  return self
+end
+
+--- What draws into a path through plain functions, for a caller that hands outlines to whatever
+--- it is given (a font reader, a vector format) and knows nothing of paths.
+export type Pen = {
+  moveTo: (x: number, y: number) -> (),
+  lineTo: (x: number, y: number) -> (),
+  quadTo: (controlX: number, controlY: number, x: number, y: number) -> (),
+  cubicTo: (firstX: number, firstY: number, secondX: number, secondY: number, x: number, y: number) -> (),
+  close: () -> (),
+}
+
+--- A pen that draws into the path.
+function Path.pen(self: Path): Pen
+  return {
+    moveTo = function(toX: number, toY: number)
+      self:moveTo(toX, toY)
+    end,
+    lineTo = function(toX: number, toY: number)
+      self:lineTo(toX, toY)
+    end,
+    quadTo = function(controlX: number, controlY: number, toX: number, toY: number)
+      self:quadTo(controlX, controlY, toX, toY)
+    end,
+    cubicTo = function(firstX: number, firstY: number, secondX: number, secondY: number, toX: number, toY: number)
+      self:cubicTo(firstX, firstY, secondX, secondY, toX, toY)
+    end,
+    close = function()
+      self:close()
+    end,
+  }
+end
+
+--- Adds a polygon through points given as `{ x, y }` pairs, as a shape whichever way they go.
+function Path.polygon(self: Path, points: { { number } }): Path
+  local flat = table.create(#points * 2) :: { number }
+
+  for _, point in points do
+    table.insert(flat, point[1])
+    table.insert(flat, point[2])
+  end
+
+  return wound(self, flat, false)
+end
+
+--- Adds a rectangle between two corners.
+function Path.rect(self: Path, x0: number, y0: number, x1: number, y1: number): Path
+  return wound(self, { x0, y0, x1, y0, x1, y1, x0, y1 }, false)
+end
+
+--- The points of an elliptical arc about a center, from one angle to another in radians,
+--- flattened to within a tolerance, appended to `points`.
+local function arc(
+  points: { number },
+  centerX: number,
+  centerY: number,
+  radiusX: number,
+  radiusY: number,
+  from: number,
+  to: number,
+  tolerance: number
+)
+  local radius = math.max(radiusX, radiusY)
+  -- A chord of angle `step` strays from its arc by radius * (1 - cos(step / 2)).
+  local step = if radius > tolerance then 2 * math.acos(1 - tolerance / radius) else math.pi / 2
+  local pieces = math.max(2, math.ceil(math.abs(to - from) / step))
+  local turn = math.abs(to - from) / pieces
+  -- Chords cut inside the arc, so the points between them are pushed out until the polygon
+  -- encloses the area the arc does: a whole circle's chords enclose r^2 * n * sin(turn) / 2. The
+  -- ends of an arc that isn't whole stay on it, where the straight edges it meets begin.
+  local outward = math.sqrt(turn / math.sin(turn))
+  local whole = math.abs(to - from) >= 2 * math.pi
+
+  for piece = 0, pieces do
+    local angle = from + (to - from) * piece / pieces
+    local reach = if whole or (piece > 0 and piece < pieces) then outward else 1
+
+    table.insert(points, centerX + radiusX * reach * math.cos(angle))
+    table.insert(points, centerY + radiusY * reach * math.sin(angle))
+  end
+end
+
+--- The points of an ellipse about a center.
+local function ellipse(self: Path, centerX: number, centerY: number, radiusX: number, radiusY: number): { number }
+  local points: { number } = {}
+
+  arc(points, centerX, centerY, radiusX, radiusY, 0, 2 * math.pi, self.tolerance)
+  -- The last point is the first again.
+  table.remove(points)
+  table.remove(points)
+
+  return points
+end
+
+--- Adds an ellipse about a center, or a circle when `radiusY` is left out.
+function Path.circle(self: Path, centerX: number, centerY: number, radiusX: number, radiusY: number?): Path
+  if radiusX <= 0 or (radiusY or radiusX) <= 0 then return self end
+
+  return wound(self, ellipse(self, centerX, centerY, radiusX, radiusY or radiusX), false)
+end
+
+--- Adds a circle's outline: the band between an outer and an inner radius.
+function Path.ring(self: Path, centerX: number, centerY: number, outer: number, inner: number): Path
+  self:circle(centerX, centerY, outer)
+  if inner <= 0 then return self end
+
+  return wound(self, ellipse(self, centerX, centerY, inner, inner), true)
+end
+
+--- Adds a rectangle with its corners rounded to a radius, which is held to half the shorter
+--- side.
+function Path.roundRect(self: Path, x0: number, y0: number, x1: number, y1: number, radius: number): Path
+  local left, right = math.min(x0, x1), math.max(x0, x1)
+  local top, bottom = math.min(y0, y1), math.max(y0, y1)
+  local corner = math.clamp(radius, 0, math.min(right - left, bottom - top) / 2)
+
+  if corner <= 0 then return self:rect(left, top, right, bottom) end
+
+  local points: { number } = {}
+  local quarter = math.pi / 2
+
+  arc(points, right - corner, top + corner, corner, corner, -quarter, 0, self.tolerance)
+  arc(points, right - corner, bottom - corner, corner, corner, 0, quarter, self.tolerance)
+  arc(points, left + corner, bottom - corner, corner, corner, quarter, 2 * quarter, self.tolerance)
+  arc(points, left + corner, top + corner, corner, corner, 2 * quarter, 3 * quarter, self.tolerance)
+
+  return wound(self, points, false)
+end
+
+--- Adds a rectangle's outline, `width` wide inside the corners it is given.
+function Path.frame(self: Path, x0: number, y0: number, x1: number, y1: number, width: number): Path
+  local left, right = math.min(x0, x1), math.max(x0, x1)
+  local top, bottom = math.min(y0, y1), math.max(y0, y1)
+
+  self:rect(left, top, right, bottom)
+  if right - left <= 2 * width or bottom - top <= 2 * width then return self end
+
+  return wound(self, { left + width, top + width, right - width, top + width, right - width, bottom - width, left + width, bottom - width }, true)
+end
+
+--- Adds a straight line `width` wide between two points, each end drawn as its own cap says.
+local function stroke(
+  self: Path,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  width: number,
+  startCap: Cap,
+  endCap: Cap
+): Path
+  local across, down = x1 - x0, y1 - y0
+  local length = math.sqrt(across * across + down * down)
+  local half = width / 2
+
+  if length == 0 then
+    if startCap == 'round' or endCap == 'round' then return self:circle(x0, y0, half) end
+    if startCap == 'square' or endCap == 'square' then return self:rect(x0 - half, y0 - half, x0 + half, y0 + half) end
+
+    return self
+  end
+
+  -- The unit along the line, and the half width across it.
+  local alongX, alongY = across / length, down / length
+  local sideX, sideY = -alongY * half, alongX * half
+  local before, after = if startCap == 'square' then half else 0, if endCap == 'square' then half else 0
+  local startX, startY = x0 - alongX * before, y0 - alongY * before
+  local endX, endY = x1 + alongX * after, y1 + alongY * after
+
+  wound(self, { startX + sideX, startY + sideY, endX + sideX, endY + sideY, endX - sideX, endY - sideY, startX - sideX, startY - sideY }, false)
+  if startCap == 'round' then self:circle(x0, y0, half) end
+  if endCap == 'round' then self:circle(x1, y1, half) end
+
+  return self
+end
+
+--- Adds a straight line `width` wide between two points, its ends drawn as `cap` says, or flush.
+function Path.line(self: Path, x0: number, y0: number, x1: number, y1: number, width: number, cap: Cap?): Path
+  return stroke(self, x0, y0, x1, y1, width, cap or 'butt', cap or 'butt')
+end
+
+--- Adds lines `width` wide through points given as `{ x, y }` pairs, joined round, their two ends
+--- drawn as `cap` says, or flush.
+function Path.polyline(self: Path, points: { { number } }, width: number, cap: Cap?): Path
+  local count = #points
+  local ends: Cap = cap or 'butt'
+
+  if count == 1 then return stroke(self, points[1][1], points[1][2], points[1][1], points[1][2], width, ends, ends) end
+
+  for index = 1, count - 1 do
+    local from, to = points[index], points[index + 1]
+    local startCap: Cap, endCap: Cap = if index == 1 then ends else 'butt', if index == count - 1 then ends else 'butt'
+
+    stroke(self, from[1], from[2], to[1], to[2], width, startCap, endCap)
+  end
+
+  for index = 2, count - 1 do
+    self:circle(points[index][1], points[index][2], width / 2)
+  end
+
+  return self
+end
+
+--- The smallest box holding every point of the path: left, top, right, bottom. A path with no
+--- points has an empty box at the origin.
+function Path.bounds(self: Path): (number, number, number, number)
+  local left, top, right, bottom = math.huge, math.huge, -math.huge, -math.huge
+
+  for _, points in self.contours do
+    for index = 1, #points - 1, 2 do
+      local pointX, pointY = points[index], points[index + 1]
+
+      left, right = math.min(left, pointX), (math.max(right, pointX))
+      top, bottom = math.min(top, pointY), (math.max(bottom, pointY))
+    end
+  end
+
+  if left > right then return 0, 0, 0, 0 end
+
+  return left, top, right, bottom
+end
+
+--- A copy of the path moved by an offset and scaled about the origin first: each point becomes
+--- `point * scale + offset`.
+function Path.transformed(self: Path, scale: number, dx: number, dy: number): Path
+  local out = Module.new(self.tolerance)
+
+  for _, points in self.contours do
+    local moved = table.create(#points) :: { number }
+
+    for index = 1, #points - 1, 2 do
+      table.insert(moved, points[index] * scale + dx)
+      table.insert(moved, points[index + 1] * scale + dy)
+    end
+
+    table.insert(out.contours, moved)
+  end
+
+  return out
+end
+
+--- Adds each closed contour of another path to this one, as it winds.
+function Path.append(self: Path, other: Path): Path
+  for _, points in other.contours do
+    table.insert(self.contours, table.clone(points))
+  end
+
+  return self
+end
+
+--- Adds the signed area a line from one point to another sweeps over each cell it crosses, and
+--- what it leaves to the cell after the last, to a row-major grid of cells `stride` wide, so that
+--- a running sum along each row is the winding the line contributes to each pixel's coverage.
+@native
+local function sweep(cells: buffer, stride: number, rows: number, fromX: number, fromY: number, toX: number, toY: number)
+  if fromY == toY then return end
+
+  local direction = 1
+
+  if fromY > toY then
+    direction = -1
+    fromX, fromY, toX, toY = toX, toY, fromX, fromY
+  end
+
+  local slope = (toX - fromX) / (toY - fromY)
+  local currentX = fromX
+
+  for row = math.max(0, math.floor(fromY)), math.min(rows, math.ceil(toY)) - 1 do
+    local rowStart = row * stride
+    local height = math.min(row + 1, toY) - math.max(row, fromY)
+    local nextX = currentX + slope * height
+    local share = height * direction
+    local left, right = math.min(currentX, nextX), math.max(currentX, nextX)
+    local leftCell, rightCell = math.floor(left), math.ceil(right)
+
+    if rightCell <= leftCell + 1 then
+      -- The line stays in one cell: it covers the part of it right of its middle.
+      local middle = 0.5 * (currentX + nextX) - leftCell
+      local at = (rowStart + leftCell) * 8
+
+      buffer.writef64(cells, at, buffer.readf64(cells, at) + share * (1 - middle))
+      buffer.writef64(cells, at + 8, buffer.readf64(cells, at + 8) + share * middle)
+    else
+      -- The line crosses cells: the first and last take the triangles it cuts from them, those
+      -- between take an even share, and what is left over carries to the cell after.
+      local inverse = 1 / (right - left)
+      local leftPart = left - leftCell
+      local firstArea = 0.5 * inverse * (1 - leftPart) * (1 - leftPart)
+      local rightPart = right - rightCell + 1
+      local lastArea = 0.5 * inverse * rightPart * rightPart
+      local at = (rowStart + leftCell) * 8
+
+      buffer.writef64(cells, at, buffer.readf64(cells, at) + share * firstArea)
+
+      if rightCell == leftCell + 2 then
+        buffer.writef64(cells, at + 8, buffer.readf64(cells, at + 8) + share * (1 - firstArea - lastArea))
+      else
+        local secondArea = inverse * (1.5 - leftPart)
+
+        buffer.writef64(cells, at + 8, buffer.readf64(cells, at + 8) + share * (secondArea - firstArea))
+
+        for cell = rowStart + leftCell + 2, rowStart + rightCell - 2 do
+          buffer.writef64(cells, cell * 8, buffer.readf64(cells, cell * 8) + share * inverse)
+        end
+
+        local beforeLast = secondArea + (rightCell - leftCell - 3) * inverse
+        local penultimate = (rowStart + rightCell - 1) * 8
+
+        buffer.writef64(cells, penultimate, buffer.readf64(cells, penultimate) + share * (1 - beforeLast - lastArea))
+      end
+
+      local last = (rowStart + rightCell) * 8
+
+      buffer.writef64(cells, last, buffer.readf64(cells, last) + share * lastArea)
+    end
+
+    currentX = nextX
+  end
+end
+
+--- Sums each row of cells into coverage bytes, a byte a pixel, `width` of the `stride` cells a
+--- row has.
+@native
+local function settle(cells: buffer, stride: number, width: number, height: number, covered: buffer)
+  for row = 0, height - 1 do
+    local total = 0
+    local at, to = row * stride * 8, row * width
+
+    for column = 0, width - 1 do
+      total += buffer.readf64(cells, at)
+
+      local coverage = math.min(1, math.abs(total))
+
+      buffer.writeu8(covered, to + column, math.floor(coverage * 255 + 0.5))
+      at += 8
+    end
+  end
+end
+
+--- The path's coverage over the pixels its bounds touch, and where that mask's top left corner
+--- is in the image the path was drawn for.
+function Path.mask(self: Path): (magick.Mask, number, number)
+  self:close()
+
+  local minX, minY, maxX, maxY = self:bounds()
+  local left, top = math.floor(minX), math.floor(minY)
+  local width, height = math.ceil(maxX) - left + 1, math.ceil(maxY) - top
+
+  if #self.contours == 0 or height <= 0 then return magick.mask(0, 0, buffer.create(0)), 0, 0 end
+
+  -- One spare cell a row: a line along the right edge leaves its remainder past it.
+  local stride = width + 1
+  local cells = buffer.create(stride * height * 8)
+
+  for _, points in self.contours do
+    local count = #points
+    local lastX, lastY = points[count - 1] - left, points[count] - top
+
+    for index = 1, count - 1, 2 do
+      local pointX, pointY = points[index] - left, points[index + 1] - top
+
+      sweep(cells, stride, height, lastX, lastY, pointX, pointY)
+      lastX, lastY = pointX, pointY
+    end
+  end
+
+  local covered = buffer.create(width * height)
+
+  settle(cells, stride, width, height, covered)
+
+  return magick.mask(width, height, covered), left, top
+end
+
+--- Composites a color over an image through the path's coverage, and returns the image.
+function Path.fill(self: Path, image: magick.Image, color: magick.Color?): magick.Image
+  local mask, left, top = self:mask()
+
+  return image:overMask(mask, color, left, top)
+end
+
+Module.Path = Path
+
+return Module
