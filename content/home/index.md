@@ -1,6 +1,6 @@
 +++
 title = "Magick"
-description = "A pure-Luau raster toolkit for Jess: PNG, BMP and TGA, atlases, gradients, masks and filters."
+description = "A pure-Luau raster toolkit for Jess: PNG, BMP and TGA, anti-aliased paths, atlases, gradients, masks and filters."
 date = 2026-10-19
 
 [taxonomies]
@@ -10,7 +10,7 @@ tags = ["Jess", "Luau"]
 sections = ["overview", "releases", "credits"]
 +++
 
-A pure-Luau raster toolkit for Jess: PNG, BMP and TGA, atlases, gradients, masks and filters.
+A pure-Luau raster toolkit for Jess: PNG, BMP and TGA, anti-aliased paths, atlases, gradients, masks and filters.
 
 <!-- more -->
 

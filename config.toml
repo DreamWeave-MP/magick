@@ -6,7 +6,7 @@
 # in archives. Include the repository path for project sites: https://OWNER.github.io/REPO
 base_url = "https://dreamweave-mp.github.io/magick"
 title = "Magick"
-description = "A pure-Luau raster toolkit for Jess: PNG, BMP and TGA, atlases, gradients, masks and filters."
+description = "A pure-Luau raster toolkit for Jess: PNG, BMP and TGA, anti-aliased paths, atlases, gradients, masks and filters."
 
 compile_sass = true
 build_search_index = true
