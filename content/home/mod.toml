@@ -1,6 +1,6 @@
-# Magick as a DreamWeave project: a Jess package. The repository root is its Package Source;
-# jess.toml names the package and its version, and each release tag `magick-<version>` is one
-# version of the package, packed by CI with `jess pack`.
+# Magick as a DreamWeave project: a Jess package. `jess` names the Package Source it publishes,
+# the repository root's own jess.toml, and each release tag `magick-<version>` is one version of
+# the package, packed by the Mod Template from that tag; every push packs a development build.
 id = "4aefcc8f-913f-48f5-8980-2326173a7288"
 slug = "magick"
 type = "library"
@@ -12,6 +12,7 @@ url = "https://github.com/DreamWeave-MP"
 
 [package]
 format = "jpk"
+jess = "org.dreamweave.magick"
 
 [[releases]]
 version = "0.1.2"
