@@ -10,6 +10,7 @@
 -- lines of the table below instead of being checked.
 local bytes = require '@dream/bytes'
 local magick = require '@magick'
+local path = require '@magick/path'
 
 -- A build without the verified toolchain runs Luau slower than a release does, so a number from
 -- one says nothing about what ships.
@@ -62,6 +63,12 @@ local Expected: { [string]: string } = {
   ['resize nearest'] = '300x300:bcca1828',
   ['resize down'] = '300x300:0eaf3dc3',
   ['resize up'] = '512x512:f00c7903',
+  ['scale down'] = '160x160:ef8e9d8f',
+  ['scale up'] = '512x512:003d5b4d',
+  ['screen'] = '512x512:7f748e8f',
+  ['path circle'] = '256x256:26ce06c3',
+  ['path polyline'] = '256x256:27f77e3b',
+  ['path ring mask'] = '502x502:0670b011',
   ['roll'] = '512x512:6f521340',
   ['alphaMask'] = '512x512:5eb31990',
   ['maskToImage'] = '512x512:1dcddd50',
@@ -359,6 +366,17 @@ workload('rotate', function() return half:rotate(-5) end)
 workload('resize nearest', function() return photo:resize(300, 300, true) end)
 workload('resize down', function() return photo:resize(300, 300) end)
 workload('resize up', function() return half:resize(Large, Large) end)
+workload('scale down', function() return photo:scale(160, 160) end)
+workload('scale up', function() return half:scale(Large, Large) end)
+workload('screen', function() return fresh(photo):screen(cutout) end)
+
+-- Paths: coverage worked out for a filled circle the size of the image, a stroke through a
+-- zigzag, and a ring's mask alone.
+local Zigzag = [for step in range(0, 8) => { 16 + step * 28, if step % 2 == 0 then 40 else 216 }]
+
+workload('path circle', function() return path.new():circle(128, 128, 120):fill(freshHalf(half), '#da96e0') end)
+workload('path polyline', function() return path.new():polyline(Zigzag, 9, 'round'):fill(freshHalf(half), '#ffe6ff') end)
+workload('path ring mask', function() return (path.new():ring(256, 256, 250, 200):mask()) end)
 workload('roll', function() return photo:roll(100, -37) end)
 
 -- Masks.

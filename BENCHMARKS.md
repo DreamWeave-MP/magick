@@ -358,3 +358,27 @@ module's setup, its argument checks, and the operations no row reaches. The seve
 above 5% are 1.06x to 1.16x, and the worst of them are calls of 2 µs (a glyph's mask to an image,
 a gradient icon): small in what they cost, where marking the whole 100 KB module would give back
 the 6 ms a load this saves.
+
+## 0.1.3: paths, screen and scale
+
+`@magick/path` fills shapes with coverage worked out from their outlines; two functions do the
+work, `sweep` (an edge's signed areas into a row of cells) and `settle` (the rows summed into
+coverage bytes). `Image.screen` and `Image.scale` are new image operations. All four carry
+`@native`, and these rows are why.
+
+Measured 2026-10-21 with `jess 0.1.0`, the verified release build installed from jess `49093c4`,
+on the i7-10870H, the one-minute load 0.85 at the start. The bench ran on this package and on a
+copy of it with those four functions unmarked, the two alternating, six runs each of the rows
+named `scale`, `screen` and `path`, each run's row the median of its batches; a column is the
+median of the six. `grayscale` comes in with the `scale` filter and changed nothing, which is
+the noise floor.
+
+| Row | Marked (ms) | Unmarked (ms) | Unmarked / marked |
+| --- | ---: | ---: | ---: |
+| path circle | 0.4948 | 2.044 | **4.13×** |
+| path polyline | 0.5103 | 1.878 | **3.68×** |
+| path ring mask | 1.418 | 7.984 | **5.63×** |
+| screen | 5.892 | 36.93 | **6.27×** |
+| scale down | 5.585 | 32.19 | **5.76×** |
+| scale up | 10.60 | 54.01 | **5.10×** |
+| grayscale | 1.350 | 1.355 | 1.00× |
