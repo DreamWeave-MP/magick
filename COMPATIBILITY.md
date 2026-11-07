@@ -7,7 +7,7 @@ suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and 
 
 Measured against: `jess` 0.3.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
-- `jess package test .`: 254 passed, 0 failed (182 of them before `tests/compat.jsl` was added).
+- `jess package test .`: 274 passed, 0 failed (182 of them before `tests/compat.jsl` was added).
 - `jess package check .`: no errors, strict types over every `.jsl`.
 - `jess run --package . bench/bench.jsl`: all 91 workloads ran and held their fingerprints.
 
@@ -96,8 +96,10 @@ Makes a new image:
   `magick.mathCompose`, `magick.montage`, `magick.shadowed`, `magick.addGaussianNoise`, and every
   `magick.read*` codec.
 - `clone`, `crop`, `extent`, `trim`, `rotate90`, `rotate`, `resize`, `resizeFit`, `roll`, `scale`.
-- `Path:transformed(scale, dx, dy)`: a **new** `Path` with each point moved to `point * scale +
-  offset`. The source is unchanged, and its bounds stay where they were.
+- `Path:transformed(scale, dx, dy)`: a **new** `Path` whose closed contours are copied with each
+  point moved to `point * scale + offset`. An open contour is **not** copied: a contour not yet
+  closed is left out of the result entirely, and the result's bounds do not include it. The
+  source is unchanged. Close a contour before transforming it.
 
 Makes a new mask: `alphaMask`, `magick.dilateMask`, `magick.blurMask`, `magick.subtractMask`.
 
