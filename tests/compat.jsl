@@ -19,6 +19,17 @@ local function flat(width: number, height: number, value: number): magick.Mask
   return magick.mask(width, height, covered)
 end
 
+--- The message a call raises, without the position Luau puts in front of it: the message is the
+--- contract, and where it was raised is not.
+local function failure(run: () -> ()): string
+  -- pcall only around the calls that fail on purpose: each is a refusal the contract names.
+  local ok, raised = pcall(run)
+
+  assert(not ok, 'the call did not fail')
+
+  return string.match(tostring(raised), '^.-:%d+: (.*)$') or tostring(raised)
+end
+
 suite.describe('ownership', function()
   suite.it('copies the bytes fromRGBA is given', function()
     local bytes = buffer.create(4)
@@ -109,6 +120,15 @@ suite.describe('pixels', function()
   end)
 end)
 
+suite.describe('colors that are nothing and colors that are empty', function()
+  suite.it('reads nothing as transparent black and an empty table as opaque black', function()
+    expect(magick.color(nil)).toEqual { 0, 0, 0, 0 }
+    expect(magick.color({})).toEqual { 0, 0, 0, 255 }
+    expect({ magick.new(1, 1):get(0, 0) }).toEqual { 0, 0, 0, 0 }
+    expect({ magick.new(1, 1, {}):get(0, 0) }).toEqual { 0, 0, 0, 255 }
+  end)
+end)
+
 suite.describe('compositing', function()
   suite.it('leaves a destination pixel alone under a clear source pixel', function()
     local under = magick.new(1, 1, '#ff0000')
@@ -171,47 +191,110 @@ suite.describe('compositing', function()
   suite.it('refuses a copyAlpha of another size and an unknown mode', function()
     local image = magick.new(1, 1)
 
-    expect(function() image:copyAlpha(magick.new(2, 2), 'dstin') end).toThrow 'mask geometry mismatch'
-    expect(function() image:copyAlpha(magick.new(1, 1), 'bogus') end).toThrow 'unknown alpha composite mode bogus'
+    expect(failure(function() image:copyAlpha(magick.new(2, 2), 'dstin') end)).toBe 'magick: mask geometry mismatch'
+    expect(failure(function() image:copyAlpha(magick.new(1, 1), 'bogus') end)).toBe 'magick: unknown alpha composite mode bogus'
   end)
 
   suite.it('refuses a screen at a fractional offset', function()
-    expect(function() magick.new(2, 2):screen(magick.new(1, 1), 0.5, 0) end).toThrow 'screen needs a whole offset'
+    expect(failure(function() magick.new(2, 2):screen(magick.new(1, 1), 0.5, 0) end)).toBe 'magick: screen needs a whole offset'
   end)
 end)
 
 suite.describe('errors', function()
   suite.it('refuses a size that is not a whole, non-negative number', function()
-    expect(function() magick.new(-1, 2) end).toThrow 'integer image size required'
-    expect(function() magick.new(1.5, 2) end).toThrow 'integer image size required'
+    expect(failure(function() magick.new(-1, 2) end)).toBe 'magick: integer image size required'
+    expect(failure(function() magick.new(1.5, 2) end)).toBe 'magick: integer image size required'
   end)
 
   suite.it('refuses a color it cannot read', function()
-    expect(function() magick.new(1, 1, '#12') end).toThrow 'expected #rgb, #rrggbb, or #rrggbbaa'
+    expect(failure(function() magick.new(1, 1, '#12') end)).toBe 'magick: expected #rgb, #rrggbb, or #rrggbbaa'
   end)
 
   suite.it('refuses bytes that do not match the geometry', function()
-    expect(function() magick.fromRGBA(2, 2, buffer.create(3)) end).toThrow 'RGBA byte length does not match geometry'
-    expect(function() magick.mask(2, 2, buffer.create(3)) end).toThrow 'mask byte length mismatch'
+    expect(failure(function() magick.fromRGBA(2, 2, buffer.create(3)) end)).toBe
+      'magick: RGBA byte length does not match geometry'
+    expect(failure(function() magick.mask(2, 2, buffer.create(3)) end)).toBe 'magick: mask byte length mismatch'
   end)
 
   suite.it('names the format it cannot read or write by extension', function()
-    expect(function() magick.read 'texture.jpeg' end).toThrow 'unsupported input format .jpeg'
-    expect(function() magick.write('texture.jpeg', magick.new(1, 1)) end).toThrow 'unsupported output format .jpeg'
+    expect(failure(function() magick.read 'texture.jpeg' end)).toBe 'magick: unsupported input format .jpeg'
+    expect(failure(function() magick.write('texture.jpeg', magick.new(1, 1)) end)).toBe
+      'magick: unsupported output format .jpeg'
   end)
 
   suite.it('refuses a file it cannot decode, in the words the codec uses', function()
-    expect(function() magick.readBMP(buffer.create(60)) end).toThrow 'not a BMP'
-    expect(function() magick.readTGA(buffer.create(4)) end).toThrow 'truncated TGA'
-    expect(function() magick.readDDS(buffer.create(200)) end).toThrow 'not a DDS'
+    expect(failure(function() magick.readBMP(buffer.create(60)) end)).toBe 'magick: not a BMP'
+    expect(failure(function() magick.readTGA(buffer.create(4)) end)).toBe 'magick: truncated TGA'
+    expect(failure(function() magick.readDDS(buffer.create(200)) end)).toBe 'magick: not a DDS'
   end)
 
   suite.it('refuses an empty montage', function()
-    expect(function() magick.montage {} end).toThrow 'montage requires images'
+    expect(failure(function() magick.montage {} end)).toBe 'magick: montage requires images'
   end)
 
   suite.it('needs a moveTo before a path draws a line', function()
-    expect(function() path.new():lineTo(1, 1) end).toThrow 'path.lineTo needs a moveTo first'
+    expect(failure(function() path.new():lineTo(1, 1) end)).toBe 'magick: path.lineTo needs a moveTo first'
+  end)
+end)
+
+suite.describe('paths', function()
+  suite.it('finalizes an open contour when it is rasterized', function()
+    local outline = path.new():moveTo(0, 0):lineTo(4, 0):lineTo(4, 4):lineTo(0, 4)
+
+    -- An open contour is not in the bounds until something closes it.
+    expect({ outline:bounds() }).toEqual { 0, 0, 0, 0 }
+
+    local mask = outline:mask()
+
+    expect({ mask.width, mask.height }).toEqual { 5, 4 }
+    expect({ outline:bounds() }).toEqual { 0, 0, 4, 4 }
+  end)
+
+  suite.it('finalizes an open contour when it is filled', function()
+    local outline = path.new():moveTo(0, 0):lineTo(4, 0):lineTo(4, 4):lineTo(0, 4)
+
+    outline:fill(magick.new(6, 6), '#ffffff')
+
+    expect({ outline:bounds() }).toEqual { 0, 0, 4, 4 }
+  end)
+
+  suite.it('drops a contour of fewer than three points when it closes', function()
+    local outline = path.new():moveTo(0, 0):lineTo(4, 0)
+    local mask = outline:mask()
+
+    expect({ mask.width, mask.height }).toEqual { 0, 0 }
+    expect({ outline:bounds() }).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('bounds only closed contours, before and after closing', function()
+    local outline = path.new():moveTo(1, 2):lineTo(5, 2):lineTo(5, 7)
+
+    expect({ outline:bounds() }).toEqual { 0, 0, 0, 0 }
+
+    outline:close()
+
+    expect({ outline:bounds() }).toEqual { 1, 2, 5, 7 }
+  end)
+
+  suite.it('gives a new path from transformed and leaves the source as it was', function()
+    local shape = path.new():rect(0, 0, 2, 2)
+    local moved = shape:transformed(2, 10, 20)
+
+    expect(moved == shape).toBe(false)
+    expect({ moved:bounds() }).toEqual { 10, 20, 14, 24 }
+    expect({ shape:bounds() }).toEqual { 0, 0, 2, 2 }
+  end)
+
+  suite.it('draws through a pen that forwards to the path', function()
+    local outline = path.new()
+    local pen = outline:pen()
+
+    pen.moveTo(1, 2)
+    pen.lineTo(5, 2)
+    pen.lineTo(5, 7)
+    pen.close()
+
+    expect({ outline:bounds() }).toEqual { 1, 2, 5, 7 }
   end)
 end)
 
@@ -233,6 +316,13 @@ suite.describe('round trips through bytes', function()
     local back = magick.readDDS(magick.dds(image))
 
     expect(buffer.tostring(back.data)).toBe(buffer.tostring(image.data))
+  end)
+
+  suite.it('encodes to a buffer, not to a file', function()
+    local image = magick.new(2, 2, '#01020304')
+
+    expect(type(magick.png(image))).toBe 'buffer'
+    expect(type(magick.dds(image))).toBe 'buffer'
   end)
 end)
 
@@ -322,6 +412,11 @@ suite.describe('the undocumented surface', function()
     expect(type(magick.color)).toBe 'function'
     expect(type(magick.Image)).toBe 'table'
     expect(type(magick.new)).toBe 'function'
+  end)
+
+  suite.it('exports the Path metatable that every path it makes carries', function()
+    expect(type(path.Path)).toBe 'table'
+    expect(getmetatable(path.new()) == path.Path).toBe(true)
   end)
 end)
 
