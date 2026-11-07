@@ -285,6 +285,19 @@ suite.describe('paths', function()
     expect({ shape:bounds() }).toEqual { 0, 0, 2, 2 }
   end)
 
+  suite.it('leaves an open contour out of a transformed path, as it always has', function()
+    local outline = path.new():moveTo(1, 2):lineTo(5, 2):lineTo(5, 7)
+    local moved = outline:transformed(2, 10, 20)
+
+    -- Only closed contours are copied: the open one is not in the moved path at all.
+    expect({ moved:bounds() }).toEqual { 0, 0, 0, 0 }
+    expect({ outline:bounds() }).toEqual { 0, 0, 0, 0 }
+
+    outline:close()
+
+    expect({ outline:transformed(2, 10, 20):bounds() }).toEqual { 12, 24, 20, 34 }
+  end)
+
   suite.it('draws through a pen that forwards to the path', function()
     local outline = path.new()
     local pen = outline:pen()
