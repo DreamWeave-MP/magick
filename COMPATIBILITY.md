@@ -47,10 +47,31 @@ buffer of any other length.
 
 `magick.color` turns a color into its four channels, `{ red, green, blue, alpha }`.
 
+Two inputs that look alike mean different things, and the difference is contract:
+
+- `nil` (no color at all) is **transparent black**, `{ 0, 0, 0, 0 }`. `magick.new(w, h)` is clear.
+- `{}` (an empty table) is **opaque black**, `{ 0, 0, 0, 255 }`. `magick.new(w, h, {})` is black.
+
+`false` is not a color and is refused with `magick: color must be a table or hex string`.
+
 **Source.** A color, or an `Image` repeated as a tile from its top left corner.
 
 **Path.** `@magick/path` builds an outline in pixel coordinates (y down) and fills it with
 anti-aliased coverage. `path:mask()` returns a `Mask` and the `left`, `top` of its bounds.
+
+Path semantics that the rasterizer depends on, and that a rewrite of the path representation must
+keep:
+
+- **Rasterizing finalizes.** `path:mask()` closes the open contour, as `close` does, and
+  `path:fill()` calls `mask()`, so it finalizes too. A contour of fewer than three points is
+  dropped when it closes, and a path with nothing left gives a 0 by 0 mask at 0, 0.
+- **Bounds read closed contours only.** `path:bounds()` covers the contours already closed, and
+  is `0, 0, 0, 0` when there are none. An open contour is not counted until it closes.
+- **`path:pen()`** returns a table of five functions, `moveTo`, `lineTo`, `quadTo`, `cubicTo` and
+  `close`, that forward to the path and return nothing. A font reader or vector format draws
+  through it.
+- **`path.new(tolerance?)`** makes an empty path, flattening curves to within `tolerance` pixels,
+  a quarter pixel by default. Every path carries the metatable the module exports as `path.Path`.
 
 ## Ownership and return values
 
@@ -65,7 +86,8 @@ Changes its argument and returns `self`:
   `sigmoidalContrast`.
 - `magick`: `modulate`, `emboss`, `tint`, each on the image it is given.
 - `Path`: every builder (`moveTo`, `lineTo`, `quadTo`, `cubicTo`, `close`, `polygon`, `rect`,
-  `circle`, `ring`, `roundRect`, `frame`, `line`, `polyline`, `transformed`, `append`).
+  `circle`, `ring`, `roundRect`, `frame`, `line`, `polyline`, `append`). `append` adds the closed
+  contours of another path to this one.
 
 Makes a new image:
 
@@ -74,12 +96,18 @@ Makes a new image:
   `magick.mathCompose`, `magick.montage`, `magick.shadowed`, `magick.addGaussianNoise`, and every
   `magick.read*` codec.
 - `clone`, `crop`, `extent`, `trim`, `rotate90`, `rotate`, `resize`, `resizeFit`, `roll`, `scale`.
+- `Path:transformed(scale, dx, dy)`: a **new** `Path` with each point moved to `point * scale +
+  offset`. The source is unchanged, and its bounds stay where they were.
 
 Makes a new mask: `alphaMask`, `magick.dilateMask`, `magick.blurMask`, `magick.subtractMask`.
 
 `magick.mask(width, height, bytes)` **wraps** `bytes` and does not copy: a later write to the
 buffer changes the mask. `magick.fromRGBA(width, height, bytes)` **copies** the bytes, so the
 image does not change when the buffer does. `clone` copies.
+
+`magick.png(image)` and `magick.dds(image)` return the encoded file as a `buffer`.
+`magick.write`, `magick.writePNG` and `magick.writeDDS` write a file and return its path as a
+string.
 
 ## Errors
 
@@ -181,7 +209,9 @@ Each of these would break a consumer, so none happens inside 0.1.x:
 - making `overMask` refuse a mismatched mask, or `copyAlpha` accept one;
 - changing the `paintMask` alpha scaling, or the fill winding of a shape;
 - removing or renaming `magick.color` or any name in the consumer list above;
-- changing an error message a suite pins.
+- changing an error message a suite pins;
+- making `Path:transformed` change its source, or `mask` and `fill` leave an open contour open;
+- making `Path:bounds` count an open contour, or `color(nil)` and `color({})` mean the same thing.
 
 A change that needs any of these goes into a new minor version as an opt-in, with the old
 behavior kept under its old name.
