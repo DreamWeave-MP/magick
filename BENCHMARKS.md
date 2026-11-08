@@ -17,6 +17,8 @@ jess run --package jpk/magick jpk/magick/bench/bench.jsl [filter]
 
 It refuses a build without the verified toolchain.
 
+The renderer design these benchmarks will measure against is [RFC-0001](docs/RFC-0001-renderer.md). Its budgets and tile sizes are decisions, not measurements; numbers in this file stay measured on verified builds.
+
 ## l3i 2.0: before and after
 
 2026-10-13, Intel Core i7-10870H @ 2.20GHz, a verified release build of Jess on l3i 2.0.2 (Luau
