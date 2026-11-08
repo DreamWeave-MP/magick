@@ -375,6 +375,400 @@ suite.describe('values at extreme sizes', function()
   end)
 end)
 
+suite.describe('values at extreme sizes, by hand', function()
+  -- Each operation is held at a 1 by 1 image, a 1 by 17 column and a 17 by 1 row. The expected
+  -- values come from what the operation says it does, worked out in each comment; none is read
+  -- from the code under test. The background is #102030, that is (16, 32, 48).
+  local background = '#102030'
+  local red = '#ff0000'
+  local white = '#ffffff'
+  local green = '#00ff00'
+  local black = '#000000'
+
+  --- Whether every pixel of an image is `expected`.
+  local function everyPixel(image: Image, expected: { number })
+    for row = 0, image.height - 1 do
+      for column = 0, image.width - 1 do
+        expect(at(image, column, row)).toEqual(expected)
+      end
+    end
+  end
+
+  --- An image whose pixel at index i, in row order, holds 15 * i in each color channel.
+  local function ramp(width: number, height: number): Image
+    local image = magick.new(width, height)
+
+    for index = 0, width * height - 1 do
+      local value = index * 15
+
+      image:set(index % width, index // width, value, value, value, 255)
+    end
+
+    return image
+  end
+
+  suite.it('rect paints its inclusive corners and nothing else', function()
+    -- Both corners are inside, so the 1 by 1 is red; a column from row 4 to row 8 is red, and
+    -- the others stay background; a row from column 4 to column 8 likewise.
+    expect(at(magick.new(1, 1, background):rect(0, 0, 0, 0, red), 0, 0)).toEqual { 255, 0, 0, 255 }
+
+    local column = magick.new(1, 17, background):rect(0, 4, 0, 8, red)
+    local line = magick.new(17, 1, background):rect(4, 0, 8, 0, red)
+
+    for index = 0, 16 do
+      local expected = if index >= 4 and index <= 8 then { 255, 0, 0, 255 } else { 16, 32, 48, 255 }
+
+      expect(at(column, 0, index)).toEqual(expected)
+      expect(at(line, index, 0)).toEqual(expected)
+    end
+  end)
+
+  suite.it('rectOver lays a half-opaque red over the background by its alpha', function()
+    -- Alpha 128 over (16, 32, 48): red 255 * 128/255 + 16 * 127/255 is 135.97, so 136; green
+    -- 32 * 127/255 is 15.9, so 16; blue 48 * 127/255 is 23.9, so 24. The result is opaque.
+    local blended = { 136, 16, 24, 255 }
+
+    expect(at(magick.new(1, 1, background):rectOver(0, 0, 0, 0, '#ff000080'), 0, 0)).toEqual(blended)
+
+    local column = magick.new(1, 17, background):rectOver(0, 4, 0, 8, '#ff000080')
+
+    for index = 0, 16 do
+      expect(at(column, 0, index)).toEqual(if index >= 4 and index <= 8 then blended else { 16, 32, 48, 255 })
+    end
+  end)
+
+  suite.it('polygon fills a shape that covers the image in every pixel', function()
+    local square = { { -1, -1 }, { 20, -1 }, { 20, 20 }, { -1, 20 } }
+
+    everyPixel(magick.new(1, 1, background):polygon(square, green), { 0, 255, 0, 255 })
+    everyPixel(magick.new(1, 17, background):polygon(square, green), { 0, 255, 0, 255 })
+    everyPixel(magick.new(17, 1, background):polygon(square, green), { 0, 255, 0, 255 })
+  end)
+
+  suite.it('circle fills every pixel of an image its radius covers', function()
+    -- Centred on the image with radius 20: the farthest pixel centre of a 1 by 17 is 8 away.
+    everyPixel(magick.new(1, 1, background):circle(0.5, 0.5, 20, nil, green), { 0, 255, 0, 255 })
+    everyPixel(magick.new(1, 17, background):circle(0.5, 8.5, 20, nil, green), { 0, 255, 0, 255 })
+    everyPixel(magick.new(17, 1, background):circle(8.5, 0.5, 20, nil, green), { 0, 255, 0, 255 })
+  end)
+
+  suite.it('line strokes a wide line across an image it crosses', function()
+    -- Four wide, centred on the pixel centres: it covers every pixel of the image it runs over.
+    everyPixel(magick.new(1, 1, background):line(-5, 0.5, 5, 0.5, white, 4), { 255, 255, 255, 255 })
+    everyPixel(magick.new(1, 17, background):line(0.5, -5, 0.5, 21, white, 4), { 255, 255, 255, 255 })
+    everyPixel(magick.new(17, 1, background):line(-5, 0.5, 21, 0.5, white, 4), { 255, 255, 255, 255 })
+  end)
+
+  suite.it('strokeRect draws a one-pixel frame, which is the whole of a line or column', function()
+    -- A frame around a zero-width or zero-height rectangle is the pixels it runs over.
+    everyPixel(magick.new(1, 1, background):strokeRect(0, 0, 0, 0, white, 1), { 255, 255, 255, 255 })
+    everyPixel(magick.new(1, 17, background):strokeRect(0, 0, 0, 16, white, 1), { 255, 255, 255, 255 })
+    everyPixel(magick.new(17, 1, background):strokeRect(0, 0, 16, 0, white, 1), { 255, 255, 255, 255 })
+  end)
+
+  suite.it('roundRect fills the interior of a rounded rectangle that covers the image', function()
+    -- Corners of radius 2 lie outside the image, so every pixel is inside.
+    everyPixel(magick.new(1, 1, background):roundRect(-5, -5, 5, 5, 2, white), { 255, 255, 255, 255 })
+    everyPixel(magick.new(1, 17, background):roundRect(-5, -5, 5, 21, 2, white), { 255, 255, 255, 255 })
+    everyPixel(magick.new(17, 1, background):roundRect(-5, -5, 21, 5, 2, white), { 255, 255, 255, 255 })
+  end)
+
+  suite.it('crop takes the pixel it is asked for, not the first', function()
+    -- Row 5 of the ramp holds 75 in each channel; column 5 of the row ramp likewise.
+    expect(at(magick.new(1, 1, background):crop(1, 1, 0, 0), 0, 0)).toEqual { 16, 32, 48, 255 }
+    expect(at(ramp(1, 17):crop(1, 1, 0, 5), 0, 0)).toEqual { 75, 75, 75, 255 }
+    expect(at(ramp(17, 1):crop(1, 1, 5, 0), 0, 0)).toEqual { 75, 75, 75, 255 }
+  end)
+
+  suite.it('extent pads with the background and places the image at its offset', function()
+    -- A 3 by 3 with the 1 by 1 at (1, 1): the centre is the pixel, the rest black.
+    local square = magick.new(1, 1, background):extent(3, 3, 1, 1, black)
+
+    for row = 0, 2 do
+      for column = 0, 2 do
+        local expected = if column == 1 and row == 1 then { 16, 32, 48, 255 } else { 0, 0, 0, 255 }
+
+        expect(at(square, column, row)).toEqual(expected)
+      end
+    end
+
+    -- A 1 by 17 at (1, 1) of a 3 by 19: column 1 from row 1 to row 17 is the image, the rest black.
+    local column = magick.new(1, 17, background):extent(3, 19, 1, 1, black)
+
+    for row = 0, 18 do
+      for columnIndex = 0, 2 do
+        local inside = columnIndex == 1 and row >= 1 and row <= 17
+
+        expect(at(column, columnIndex, row)).toEqual(if inside then { 16, 32, 48, 255 } else { 0, 0, 0, 255 })
+      end
+    end
+  end)
+
+  suite.it('roll moves each pixel down by its offset and wraps it round', function()
+    -- Row k of the ramp holds 15k. Rolled down by one, row 0 takes row 16 (240), and row k takes
+    -- row k - 1. A roll across a 1 pixel wide image changes nothing.
+    local rolled = ramp(1, 17):roll(0, 1)
+    local unchanged = ramp(1, 17):roll(3, 0)
+
+    for index = 0, 16 do
+      local value = if index == 0 then 240 else (index - 1) * 15
+
+      expect(at(rolled, 0, index)).toEqual { value, value, value, 255 }
+      expect(at(unchanged, 0, index)).toEqual { index * 15, index * 15, index * 15, 255 }
+    end
+  end)
+
+  suite.it('colorize moves each channel the share of the way to the color', function()
+    -- At 40 per cent, white moves toward (51, 102, 153): 255 - 204 * 0.4 is 173.4, so 173;
+    -- 255 - 153 * 0.4 is 193.8, so 194; 255 - 102 * 0.4 is 214.2, so 214. Alpha is kept.
+    everyPixel(magick.new(1, 1, white):colorize('#336699', 40), { 173, 194, 214, 255 })
+    everyPixel(magick.new(1, 17, white):colorize('#336699', 40), { 173, 194, 214, 255 })
+    everyPixel(magick.new(17, 1, white):colorize('#336699', 40), { 173, 194, 214, 255 })
+  end)
+
+  suite.it('alphaMask gives each pixel its alpha as coverage', function()
+    local column = magick.new(1, 17, background)
+    local line = magick.new(17, 1, background)
+
+    for index = 0, 16 do
+      column:set(0, index, 16, 32, 48, index * 15)
+      line:set(index, 0, 16, 32, 48, index * 15)
+    end
+
+    local mask = column:alphaMask()
+    local lineMask = line:alphaMask()
+
+    expect({ mask.width, mask.height, lineMask.width, lineMask.height }).toEqual { 1, 17, 17, 1 }
+
+    for index = 0, 16 do
+      expect(buffer.readu8(mask.data, index)).toBe(index * 15)
+      expect(buffer.readu8(lineMask.data, index)).toBe(index * 15)
+    end
+  end)
+
+  suite.it('shadowed casts a black shadow at its offset, behind the image', function()
+    -- Opacity 40 and no blur, offset by one: the image sits at the top left and its shadow one
+    -- pixel down and right, black at alpha 255 * 0.4 = 102. A 1 by 1 gives a 3 by 3.
+    local square = magick.shadowed(magick.new(1, 1, white), 40, 0, 1, 1)
+
+    expect({ square.width, square.height }).toEqual { 3, 3 }
+    expect(at(square, 0, 0)).toEqual { 255, 255, 255, 255 }
+    expect(at(square, 1, 1)).toEqual { 0, 0, 0, 102 }
+    expect(at(square, 2, 2)).toEqual { 0, 0, 0, 0 }
+
+    -- A 1 by 17 column gives a 3 by 19: the image in column 0, its shadow in column 1 from row 1.
+    local column = magick.shadowed(magick.new(1, 17, white), 40, 0, 1, 1)
+
+    expect({ column.width, column.height }).toEqual { 3, 19 }
+    expect(at(column, 0, 16)).toEqual { 255, 255, 255, 255 }
+    expect(at(column, 0, 17)).toEqual { 0, 0, 0, 0 }
+    expect(at(column, 1, 0)).toEqual { 0, 0, 0, 0 }
+    expect(at(column, 1, 1)).toEqual { 0, 0, 0, 102 }
+    expect(at(column, 1, 17)).toEqual { 0, 0, 0, 102 }
+    expect(at(column, 1, 18)).toEqual { 0, 0, 0, 0 }
+
+    -- A 17 by 1 row gives a 19 by 3, the same way turned.
+    local line = magick.shadowed(magick.new(17, 1, white), 40, 0, 1, 1)
+
+    expect({ line.width, line.height }).toEqual { 19, 3 }
+    expect(at(line, 16, 0)).toEqual { 255, 255, 255, 255 }
+    expect(at(line, 1, 1)).toEqual { 0, 0, 0, 102 }
+    expect(at(line, 17, 1)).toEqual { 0, 0, 0, 102 }
+    expect(at(line, 18, 1)).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('tile repeats a one-pixel tile over the whole image', function()
+    everyPixel(magick.tile(1, 17, magick.new(1, 1, red)), { 255, 0, 0, 255 })
+    everyPixel(magick.tile(17, 1, magick.new(1, 1, red)), { 255, 0, 0, 255 })
+  end)
+
+  suite.it('montage of one image is that image', function()
+    local column = ramp(1, 17)
+    local line = ramp(17, 1)
+    local single = magick.montage({ column })
+    local singleLine = magick.montage({ line })
+
+    expect({ single.width, single.height }).toEqual { 1, 17 }
+    expect({ singleLine.width, singleLine.height }).toEqual { 17, 1 }
+    expect(buffer.tostring(single.data) == buffer.tostring(column.data)).toBe(true)
+    expect(buffer.tostring(singleLine.data) == buffer.tostring(line.data)).toBe(true)
+  end)
+
+  suite.it('verticalGradient steps a column by 255 * row / 16, and a row is its top color', function()
+    -- Row r of 17 is 255 * r / 16 rounded half up: 0, 16, 32, 48, 64, 80, 96, 112, 128, 143,
+    -- 159, 175, 191, 207, 223, 239, 255. A single row is its top color, black.
+    local steps = { 0, 16, 32, 48, 64, 80, 96, 112, 128, 143, 159, 175, 191, 207, 223, 239, 255 }
+    local column = magick.verticalGradient(1, 17, black, white)
+
+    for row = 0, 16 do
+      expect(at(column, 0, row)).toEqual { steps[row + 1], steps[row + 1], steps[row + 1], 255 }
+    end
+
+    everyPixel(magick.verticalGradient(17, 1, black, white), { 0, 0, 0, 255 })
+    everyPixel(magick.verticalGradient(1, 1, black, white), { 0, 0, 0, 255 })
+  end)
+
+  suite.it('a path covering an image fills every pixel, and an empty path changes nothing', function()
+    everyPixel(path.new():rect(-1, -1, 2, 2):fill(magick.new(1, 1, background), white), { 255, 255, 255, 255 })
+    everyPixel(path.new():rect(-1, -1, 2, 18):fill(magick.new(1, 17, background), white), { 255, 255, 255, 255 })
+    everyPixel(path.new():rect(-1, -1, 18, 2):fill(magick.new(17, 1, background), white), { 255, 255, 255, 255 })
+    everyPixel(path.new():fill(magick.new(1, 17, background), white), { 16, 32, 48, 255 })
+  end)
+end)
+
+suite.describe('values at extreme sizes, by hand: the rest', function()
+  -- The same three shapes as above, and the same background, (16, 32, 48).
+  local background = '#102030'
+  local white = '#ffffff'
+  local black = '#000000'
+
+  --- Whether every pixel of an image is `expected`.
+  local function everyPixel(image: Image, expected: { number })
+    for row = 0, image.height - 1 do
+      for column = 0, image.width - 1 do
+        expect(at(image, column, row)).toEqual(expected)
+      end
+    end
+  end
+
+  --- An image whose pixel at index i, in row order, holds 15 * i in each color channel.
+  local function ramp(width: number, height: number): Image
+    local image = magick.new(width, height)
+
+    for index = 0, width * height - 1 do
+      local value = index * 15
+
+      image:set(index % width, index // width, value, value, value, 255)
+    end
+
+    return image
+  end
+
+  suite.it('polygonOver lays a half-opaque green over the background by its alpha', function()
+    -- Green at alpha 128 over (16, 32, 48): red 16 * 127/255 is 7.97, so 8; green 255 * 128/255
+    -- plus 32 * 127/255 is 143.9, so 144; blue 48 * 127/255 is 23.9, so 24. Opaque.
+    local square = { { -1, -1 }, { 20, -1 }, { 20, 20 }, { -1, 20 } }
+
+    everyPixel(magick.new(1, 1, background):polygonOver(square, '#00ff0080'), { 8, 144, 24, 255 })
+    everyPixel(magick.new(1, 17, background):polygonOver(square, '#00ff0080'), { 8, 144, 24, 255 })
+    everyPixel(magick.new(17, 1, background):polygonOver(square, '#00ff0080'), { 8, 144, 24, 255 })
+  end)
+
+  suite.it('transparent clears the alpha of a color and nothing else', function()
+    -- The background is that color, so every pixel is clear; a white pixel in it is not.
+    local column = magick.new(1, 17, background)
+    local line = magick.new(17, 1, background)
+
+    column:set(0, 3, 255, 255, 255, 255)
+    line:set(3, 0, 255, 255, 255, 255)
+    column:transparent(background)
+    line:transparent(background)
+
+    for index = 0, 16 do
+      local expectedAlpha = if index == 3 then 255 else 0
+      local _, _, _, columnAlpha = column:get(0, index)
+      local _, _, _, lineAlpha = line:get(index, 0)
+
+      expect(columnAlpha).toBe(expectedAlpha)
+      expect(lineAlpha).toBe(expectedAlpha)
+    end
+  end)
+
+  suite.it('opaque gives every pixel of one color the other, alpha kept', function()
+    everyPixel(magick.new(1, 1, background):opaque(background, '#ff0000'), { 255, 0, 0, 255 })
+    everyPixel(magick.new(1, 17, background):opaque(background, '#ff0000'), { 255, 0, 0, 255 })
+    everyPixel(magick.new(17, 1, background):opaque(background, '#ff0000'), { 255, 0, 0, 255 })
+  end)
+
+  suite.it('polynomial maps each channel through a line', function()
+    -- Slope 0.5 and an intercept of 0.5, a share of full: v becomes v / 2 + 127.5. Red 16 gives
+    -- 135.5, so 136; green 32 gives 143.5, so 144; blue 48 gives 151.5, so 152.
+    everyPixel(magick.new(1, 1, background):polynomial(0.5, 0.5), { 136, 144, 152, 255 })
+    everyPixel(magick.new(1, 17, background):polynomial(0.5, 0.5), { 136, 144, 152, 255 })
+    everyPixel(magick.new(17, 1, background):polynomial(0.5, 0.5), { 136, 144, 152, 255 })
+  end)
+
+  suite.it('contrastStretch maps the lowest and highest levels to black and white', function()
+    -- The ramp runs 0 to 240, so 0 stays black and 240 becomes white, and row r becomes
+    -- 255 * r / 16 rounded half up, as verticalGradient gives it.
+    local steps = { 0, 16, 32, 48, 64, 80, 96, 112, 128, 143, 159, 175, 191, 207, 223, 239, 255 }
+    local line = ramp(17, 1):contrastStretch(0, 0)
+
+    for index = 0, 16 do
+      expect(at(line, index, 0)).toEqual { steps[index + 1], steps[index + 1], steps[index + 1], 255 }
+    end
+  end)
+
+  suite.it('sigmoidalContrast pushes levels below the midpoint darker and above it lighter', function()
+    -- A sigmoid about the midpoint maps 0 to 0 and 255 to 255 and is steeper in the middle, so a
+    -- dark color goes darker and a light one lighter. Contrast 2, midpoint one half.
+    local dark = magick.new(1, 1, background):sigmoidalContrast(2, 0.5)
+    local light = magick.new(1, 1, '#c8dcf0'):sigmoidalContrast(2, 0.5)
+    local darkCase = at(dark, 0, 0)
+    local lightCase = at(light, 0, 0)
+
+    expect(darkCase[1] < 16 and darkCase[2] < 32 and darkCase[3] < 48).toBe(true)
+    expect(lightCase[1] > 200 and lightCase[2] > 220 and lightCase[3] > 240).toBe(true)
+
+    local column = magick.new(1, 17, background):sigmoidalContrast(2, 0.5)
+    local line = magick.new(17, 1, background):sigmoidalContrast(2, 0.5)
+
+    everyPixel(magick.new(1, 1, background):sigmoidalContrast(2, 0.5), darkCase)
+    expect(at(column, 0, 16)).toEqual(darkCase)
+    expect(at(line, 16, 0)).toEqual(darkCase)
+  end)
+
+  suite.it('darken keeps the darker channel of the image and of an opaque source', function()
+    -- Background (16, 32, 48) against opaque red (255, 0, 0): the channels' minimum, (16, 0, 0).
+    everyPixel(magick.new(1, 1, background):darken(magick.new(1, 1, '#ff0000')), { 16, 0, 0, 255 })
+    everyPixel(magick.new(1, 17, background):darken(magick.new(1, 17, '#ff0000')), { 16, 0, 0, 255 })
+    everyPixel(magick.new(17, 1, background):darken(magick.new(17, 1, '#ff0000')), { 16, 0, 0, 255 })
+  end)
+
+  suite.it('resizeFit shrinks to fit a box, keeping the shape, and keeps a uniform color', function()
+    -- A 1 by 17 into 8 by 8: the scale is 8 / 17, so the image is 1 wide (at least one pixel)
+    -- and 8 high. A 1 by 1 into 8 by 8 is 8 by 8. Resizing a uniform image leaves it uniform.
+    local column = magick.new(1, 17, background):resizeFit(8, 8)
+    local line = magick.new(17, 1, background):resizeFit(8, 8)
+    local square = magick.new(1, 1, background):resizeFit(8, 8)
+
+    expect({ column.width, column.height }).toEqual { 1, 8 }
+    expect({ line.width, line.height }).toEqual { 8, 1 }
+    expect({ square.width, square.height }).toEqual { 8, 8 }
+    everyPixel(column, { 16, 32, 48, 255 })
+    everyPixel(line, { 16, 32, 48, 255 })
+    everyPixel(square, { 16, 32, 48, 255 })
+  end)
+
+  suite.it('modulate at half brightness and full saturation halves each channel', function()
+    -- With saturation unchanged, the color is its own; brightness 50 percent halves it:
+    -- (16, 32, 48) becomes (8, 16, 24).
+    everyPixel(magick.modulate(magick.new(1, 1, background), 50, 100), { 8, 16, 24, 255 })
+    everyPixel(magick.modulate(magick.new(1, 17, background), 50, 100), { 8, 16, 24, 255 })
+    everyPixel(magick.modulate(magick.new(17, 1, background), 50, 100), { 8, 16, 24, 255 })
+  end)
+
+  suite.it('tint moves white fully to the color and black to black', function()
+    -- At 100 per cent a white pixel is lit fully, so it takes the color, #ff8040; a black one is
+    -- not lit at all, so it stays black.
+    everyPixel(magick.tint(magick.new(1, 1, white), '#ff8040', 100), { 255, 128, 64, 255 })
+    everyPixel(magick.tint(magick.new(1, 17, white), '#ff8040', 100), { 255, 128, 64, 255 })
+    everyPixel(magick.tint(magick.new(17, 1, white), '#ff8040', 100), { 255, 128, 64, 255 })
+    everyPixel(magick.tint(magick.new(1, 17, black), '#ff8040', 100), { 0, 0, 0, 255 })
+  end)
+
+  suite.it('emboss leaves an image one pixel wide or high as it is', function()
+    -- Equivalent at these sizes: each pixel gains the difference between its diagonal
+    -- neighbours, and a one-pixel-wide or -high image has none inside its edges, so every
+    -- neighbour reads as clear and the difference is nothing. Nothing can tell an identity from
+    -- a no-op here, so this pins the identity as the contract.
+    everyPixel(magick.emboss(magick.new(1, 1, background), 1), { 16, 32, 48, 255 })
+    everyPixel(magick.emboss(magick.new(1, 17, background), 1), { 16, 32, 48, 255 })
+    everyPixel(magick.emboss(magick.new(17, 1, background), 1), { 16, 32, 48, 255 })
+    expect(buffer.tostring(magick.emboss(ramp(1, 17), 1).data) == buffer.tostring(ramp(1, 17).data)).toBe(true)
+  end)
+end)
+
 suite.describe('gallery', function()
   --- Whether text parses as JSON. pcall only around json.decode, which throws on text it cannot
   --- read: the throw is the answer.
