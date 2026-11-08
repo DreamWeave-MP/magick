@@ -111,6 +111,12 @@ for _, candidate in scenes do
 
     local row = gallery.compare(candidate.name, scenesModule.recorded, image, png, baselines[candidate.name])
 
+    -- The file as written is read back and held to the bytes that were compared: a runner that
+    -- wrote other bytes would pass on the record it checked, not on the file it left.
+    local stored = fs.readFile(`{folder}/{candidate.name}.png`) :: buffer
+
+    if support.digest(stored) ~= row.png.observed then row.matches = false end
+
     table.insert(rows, row)
 
     if row.matches then

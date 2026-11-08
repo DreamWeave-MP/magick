@@ -864,6 +864,20 @@ suite.describe('gallery', function()
     end
   end)
 
+  suite.it('names the first byte past a baseline that is a prefix of the observed image', function()
+    -- A one-pixel baseline is the first pixel of a two-pixel image: its 4 bytes are a prefix of the
+    -- 8 observed. The first byte the two differ at is byte 4, where the baseline has none.
+    local observed = magick.new(2, 1, '#102030')
+    local baseline = magick.new(1, 1, '#102030')
+    local row = gallery.compare('prefix', scenes.recorded, observed, magick.png(observed), magick.png(baseline))
+
+    expect(row.firstByte ~= nil).toBe(true)
+    expect(row.firstByte and row.firstByte.offset).toBe(4)
+    expect(row.firstByte and row.firstByte.expected == nil).toBe(true)
+    -- Byte 4 is the red of the second pixel, background #102030: 16.
+    expect(row.firstByte and row.firstByte.observed).toBe(16)
+  end)
+
   suite.it('refuses an output folder inside the baseline folder, and only that', function()
     expect(gallery.within('tests/gallery', 'tests/gallery')).toBe(true)
     expect(gallery.within('tests/gallery/', 'tests/gallery')).toBe(true)
@@ -874,6 +888,20 @@ suite.describe('gallery', function()
     expect(gallery.within('tests', 'tests/gallery')).toBe(false)
     expect(gallery.within('target/gallery', 'tests/gallery')).toBe(false)
     expect(gallery.within('tests/gallery/../other', 'tests/gallery')).toBe(false)
+  end)
+
+  suite.it('keeps the measured area of each curve and circle fixture within 0.2 pixels', function()
+    -- Measured: the quadratic arch 0.157 px, the cubic 0.086 px, the clipped circle 0.007 px. This
+    -- bound is a literal, not AreaTolerance, so it still holds if that tolerance is loosened.
+    local image = scene 'curves'
+    local left, right = magick.new(16, 16), magick.new(16, 16)
+
+    left:over(image, 0, 0)
+    right:over(image, -16, 0)
+
+    expect(math.abs(alphaArea(left) - 64) < 0.2).toBe(true)
+    expect(math.abs(alphaArea(right) - 64) < 0.2).toBe(true)
+    expect(math.abs(alphaArea(scene 'clipped circle') - math.pi * 25 / 2) < 0.2).toBe(true)
   end)
 
   suite.it('refuses a report cut short, or one that lost a closing brace', function()
