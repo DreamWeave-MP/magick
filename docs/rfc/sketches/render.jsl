@@ -1,11 +1,12 @@
 --!strict
 --[[
-@magick/render: 0.3.0+ SKETCH (RFC-0001 sections 10 and 11). NOT part of 0.2.0. Every function is
-a STUB.
+@magick/render: 0.3.0+ SKETCH (RFC-0001 sections 10 and 11). NOT part of 0.2.0. Every function that
+renders is a STUB. Render.workingBytes is REFERENCE arithmetic for the memory budget of section 11;
+tests/rfc.jsl runs it.
 
 Rendering compiles a scene to operations, then runs them tile by tile in a fixed order. Tile
 edges are on a grid from the origin; the default tile edge is 128 px and the maximum is 256 px.
-Output is straight RGBA8 through the legacy Image boundary.
+Output is straight RGBA8 written tile by tile into one Image.
 ]]
 
 local scene = require './scene'
@@ -16,18 +17,41 @@ local Render = {}
 export type Document = scene.Document
 export type Image = { width: number, height: number, data: buffer }
 
---- The options a render takes, each with the default RFC-0001 gives it.
+--- The options a render takes, each with the default RFC-0001 section 11 gives it.
 export type Options = {
   tileSize: number?,      -- 128 by default, at most 256 (B1)
   workers: number | 'auto'?, -- an integer 1..8, or 'auto' for the host count capped at 8 (B3)
-  memoryBudgetBytes: number?, -- refused before any tile runs when the plan's bound exceeds it (B3)
+  memoryBudgetBytes: number?, -- 512 MiB by default; refused before any tile runs when the bound exceeds it
+  encode: boolean?,       -- true when the output will be encoded: the encode buffer is then counted (B3)
+  haloPixels: number?,    -- 0 for 0.2.0-style renders; at most 64 (MaxHaloPx) when filters need one
 }
 
 Render.DefaultTileSize = 128
 Render.MaxTileSize = 256
+Render.DefaultBudgetBytes = 512 * 1024 * 1024
+Render.MaxGroupDepth = 32
 
---- Stub: renders a document to a straight RGBA8 image, tile by tile in row-major tile order.
---- Result is independent of tile size and worker count (RFC-0001 section 11, D3), a property the
+--- REFERENCE. The bytes a render needs, by RFC-0001 section 11 (B3):
+---   perWorker = (1 + MaxGroupDepth) * tile + coverage + halo
+---   coverage  = (tile + 1) * tile * 8    (f64 cells, one spare column a row, `tile` rows)
+---   halo      = (tile + 2 * haloPixels)^2 * 16   (f32 RGBA, one halo tile a worker holds)
+---   total     = workers * perWorker + output + (encode ? output * 1.01 : 0)
+--- where tile = tileEdge^2 * 16, and output = width * height * 4 (one straight RGBA8 Image).
+function Render.workingBytes(tileEdge: number, workers: number, haloPixels: number, outputWidth: number, outputHeight: number, encode: boolean): number
+  local tileBytes = tileEdge * tileEdge * 16
+  local coverageBytes = (tileEdge + 1) * tileEdge * 8
+  local haloSide = tileEdge + 2 * haloPixels
+  local haloBytes = haloSide * haloSide * 16
+  local perWorker = (1 + Render.MaxGroupDepth) * tileBytes + coverageBytes + haloBytes
+  local outputBytes = outputWidth * outputHeight * 4
+  local encodeBytes = if encode then math.floor(outputBytes * 1.01) else 0
+
+  return workers * perWorker + outputBytes + encodeBytes
+end
+
+--- Stub: renders a document to a straight RGBA8 image, tile by tile in row-major tile order. Refuses
+--- with `magick: render needs <n> bytes, budget is <m>` when Render.workingBytes exceeds the budget.
+--- The result is independent of tile size and worker count (RFC-0001 section 11, D3), a property the
 --- 0.3.0 parity tests check rather than assume.
 function Render.image(document: Document, options: Options?): Image
   error('magick: sketch stub, not implemented before 0.3.0', 2)

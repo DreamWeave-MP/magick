@@ -4,12 +4,10 @@
 
 Everything with a body here is a REFERENCE for the arithmetic the RFC fixes: byte rounding,
 premultiplication through an f32 store, straight conversion with the transparent-RGB policy, the
-Porter-Duff factors, the W3C separable blend functions, and one-pixel compositing with opacity.
-The tests in tests/rfc.jsl run it. Everything that touches an image or a tile is a STUB.
-
-Working tiles are premultiplied, RGBA, f32 per channel (16 bytes a pixel), rows from the top.
-Space is 'srgb' (encoded values, the default) or 'linear' (sRGB transfer removed before
-compositing, encoded again on output).
+Porter-Duff factors, the W3C separable blend functions, one-pixel compositing with an operator, a
+blend mode and an opacity, and the clip multiplication of section 10. Names outside the 0.2.0 sets are
+refused with a magick: error. The tests in tests/rfc.jsl run all of it.
+Everything that touches an image or a tile is a STUB.
 ]]
 
 local Color = {}
@@ -23,12 +21,46 @@ export type Operator =
   'clear' | 'src' | 'dst' | 'src-over' | 'dst-over' | 'src-in' | 'dst-in'
   | 'src-out' | 'dst-out' | 'src-atop' | 'dst-atop' | 'xor'
 
---- The separable blend modes 0.2.0 ships. Every other name is rejected with
---- `magick: unknown blend mode <name>`; nonseparable modes are not in 0.2.0.
+--- The separable blend modes 0.2.0 ships. Every other name is refused (RFC-0001 W9).
 export type BlendMode = 'normal' | 'multiply' | 'screen' | 'overlay' | 'darken' | 'lighten' | 'soft-light'
 
 --- One pixel, premultiplied, channels and alpha in 0..1. Its straight color is channel / alpha.
 export type Pixel = { red: number, green: number, blue: number, alpha: number }
+
+local BlendModes: { [string]: boolean } = {
+  normal = true,
+  multiply = true,
+  screen = true,
+  overlay = true,
+  darken = true,
+  lighten = true,
+  ['soft-light'] = true,
+}
+
+local Operators: { [string]: boolean } = {
+  clear = true,
+  ['src'] = true,
+  ['dst'] = true,
+  ['src-over'] = true,
+  ['dst-over'] = true,
+  ['src-in'] = true,
+  ['dst-in'] = true,
+  ['src-out'] = true,
+  ['dst-out'] = true,
+  ['src-atop'] = true,
+  ['dst-atop'] = true,
+  xor = true,
+}
+
+--- Refuses a blend name outside the 0.2.0 set, loudly (RFC-0001 W9, E3).
+local function requireBlendMode(mode: string)
+  if not BlendModes[mode] then error(`magick: unknown blend mode {mode}`, 3) end
+end
+
+--- Refuses an operator name outside the twelve W3C operators, loudly (RFC-0001 W8, E3).
+local function requireOperator(operator: string)
+  if not Operators[operator] then error(`magick: unknown operator {operator}`, 3) end
+end
 
 --- A straight byte: clamped to 0..255, rounded half up. RFC-0001 W4.
 function Color.byte(value: number): number
@@ -68,8 +100,10 @@ end
 
 --- W3C Porter-Duff factors (Compositing and Blending Level 1, section 5.1): the source and
 --- backdrop multipliers for premultiplied colors. Result color is cs * fa + cb * fb, result
---- alpha is as * fa + ab * fb.
+--- alpha is as * fa + ab * fb. An operator outside the twelve is refused.
 function Color.factors(operator: Operator, sourceAlpha: number, backdropAlpha: number): (number, number)
+  requireOperator(operator)
+
   if operator == 'clear' then return 0, 0 end
   if operator == 'src' then return 1, 0 end
   if operator == 'dst' then return 0, 1 end
@@ -101,18 +135,26 @@ local function hardLightChannel(backdrop: number, source: number): number
   return screenChannel(backdrop, 2 * source - 1)
 end
 
---- SoftLight(cb, cs), with D(x) = ((16x - 12)x + 4)x for x <= 1/4 and sqrt(x) above it.
+--- D(x) of W3C SoftLight: a quartic for x <= 1/4, and sqrt(x) above it.
+local function softLightLift(backdrop: number): number
+  if backdrop <= 0.25 then return ((16 * backdrop - 12) * backdrop + 4) * backdrop end
+
+  return math.sqrt(backdrop)
+end
+
+--- SoftLight(cb, cs). Its two branches split at cs = 1/2, and the second uses D above.
 local function softLightChannel(backdrop: number, source: number): number
   if source <= 0.5 then return backdrop - (1 - 2 * source) * backdrop * (1 - backdrop) end
 
-  local lifted = if backdrop <= 0.25 then ((16 * backdrop - 12) * backdrop + 4) * backdrop else math.sqrt(backdrop)
-
-  return backdrop + (2 * source - 1) * (lifted - backdrop)
+  return backdrop + (2 * source - 1) * (softLightLift(backdrop) - backdrop)
 end
 
 --- The separable blend function B(cb, cs) of W3C section 10: `backdrop` is cb, `source` is cs,
---- both straight, in 0..1. Overlay is HardLight with the arguments swapped.
+--- both straight, in 0..1. Overlay is HardLight with the arguments swapped. A mode outside the
+--- seven is refused.
 function Color.separable(mode: BlendMode, backdrop: number, source: number): number
+  requireBlendMode(mode)
+
   if mode == 'normal' then return source end
   if mode == 'multiply' then return multiplyChannel(backdrop, source) end
   if mode == 'screen' then return screenChannel(backdrop, source) end
@@ -132,12 +174,14 @@ local function straightChannel(premultiplied: number, alpha: number): number
 end
 
 --- One pixel of compositing with an operator, a blend mode and an opacity, on premultiplied pixels
---- (RFC-0001 section 10). The source's alpha and color are scaled by the opacity first, once.
---- With the normal blend mode, any operator applies: result = cs' * fa + cb * fb and
---- alpha = as' * fa + ab * fb, with fa and fb from Color.factors. Any other blend mode composites
---- with src-over only: per channel, result = cs' * (1 - ab) + cb * (1 - as') + as' * ab * B(cb/ab, cs/as),
+--- (RFC-0001 section 10). Both names are checked first. The source's alpha and color are scaled by the
+--- opacity once. With the normal blend mode, any operator applies: result = cs' * fa + cb * fb and
+--- alpha = as' * fa + ab * fb, with fa and fb from Color.factors. Any other blend mode composites with
+--- src-over only: per channel, result = cs' * (1 - ab) + cb * (1 - as') + as' * ab * B(cb/ab, cs/as),
 --- and alpha = as' + ab - as' * ab. Results are premultiplied and not clamped; the inputs are in range.
 function Color.blendPixel(mode: BlendMode, operator: Operator, source: Pixel, backdrop: Pixel, opacity: number): Pixel
+  requireBlendMode(mode)
+  requireOperator(operator)
   if mode ~= 'normal' and operator ~= 'src-over' then error('magick: blend modes composite with src-over only', 2) end
 
   local sourceAlpha = source.alpha * opacity
@@ -162,6 +206,27 @@ function Color.blendPixel(mode: BlendMode, operator: Operator, source: Pixel, ba
   }
 end
 
+--- A clip is a byte of coverage a pixel, as a unit in 0..1 (byte / 255). Clipping multiplies every
+--- premultiplied channel and the alpha by it (RFC-0001 F5, G2 step 2).
+function Color.clipPixel(pixel: Pixel, coverage: number): Pixel
+  local clamped = math.clamp(coverage, 0, 1)
+
+  return {
+    red = pixel.red * clamped,
+    green = pixel.green * clamped,
+    blue = pixel.blue * clamped,
+    alpha = pixel.alpha * clamped,
+  }
+end
+
+--- Nested clips multiply, and the nesting depth is capped at 16 (MaxClipDepth). A depth past the cap
+--- is refused with the cap's name.
+function Color.nestClip(depth: number): number
+  if depth + 1 > 16 then error('magick: MaxClipDepth 16 exceeded', 2) end
+
+  return depth + 1
+end
+
 --- Stub: the working tile a straight RGBA8 image becomes (premultiplied, space as given).
 --- The image's pixels with alpha 0 lose their RGB; the legacy image keeps it.
 function Color.fromImage(image: { width: number, height: number, data: buffer }, space: Space): Working
@@ -173,13 +238,24 @@ function Color.toImage(working: Working): { width: number, height: number, data:
   error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
 end
 
+--- Stub: converts a tile between 'srgb' and 'linear' (RFC-0001 W3). Tiles of different space are
+--- never composited without it.
+function Color.convert(working: Working, space: Space): Working
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
 --- Stub: composites an isolated group tile onto a destination tile (RFC-0001 section 10). Order:
 --- the group's children were drawn into `group` in painter order, starting from transparent; the
---- group's opacity is applied once to each pixel, then its blend and operator (blendPixel above).
+--- group's clip multiplies coverage, the opacity is applied once, then blendPixel composes the result.
 function Color.compositeGroup(
   destination: Working,
   group: Working,
-  options: { blend: BlendMode?, operator: Operator?, opacity: number? }?
+  options: {
+    blend: BlendMode?,
+    operator: Operator?,
+    opacity: number?,
+    clip: { width: number, height: number, data: buffer }?,
+  }?
 ): Working
   error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
 end

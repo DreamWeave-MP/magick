@@ -20,7 +20,7 @@ export type Paint = paint.Paint
 Scene.MaxDepth = 32
 Scene.MaxNodes = 65536
 
-export type Group = { kind: 'group', children: { Node }, opacity: number, blend: color.BlendMode?, transform: Matrix, isolated: boolean }
+export type Group = { kind: 'group', children: { Node }, opacity: number, blend: color.BlendMode?, transform: Matrix }
 export type Shape = { kind: 'shape', geometry: unknown, fill: Paint?, stroke: Paint?, transform: Matrix }
 
 --- A node is a group or a shape. Image layers are a later node kind, not 0.3.0.

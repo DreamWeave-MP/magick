@@ -14,7 +14,7 @@ local Brush = {}
 
 export type Paint = paint.Paint
 
---- One stamp along a stroke. `spacing` is a fraction of the tip's width.
+--- One stamp along a stroke. `spacing` is a fraction of the tip's radius.
 export type Dab = { x: number, y: number, radius: number, angle: number, pressure: number }
 
 --- A brush: a tip, a spacing, and the paint it lays down. Immutable once made.
