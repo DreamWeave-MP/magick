@@ -7,9 +7,9 @@ suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and 
 
 Measured against: `jess` 0.3.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
-- `jess package test .`: 434 passed, 0 failed. That is 217 tests counted twice: each suite runs once from
+- `jess package test .`: 438 passed, 0 failed. That is 219 tests counted twice: each suite runs once from
   the source folder and once from the packed `.jpk`, so every count is doubled. Per provider, 49 are
-  `tests/basic.jsl`, 46 `tests/compat.jsl`, 76 `tests/gate.jsl`, 4 `tests/property.jsl`, 15
+  `tests/basic.jsl`, 46 `tests/compat.jsl`, 78 `tests/gate.jsl`, 4 `tests/property.jsl`, 15
   `tests/png.jsl`, 16 `tests/path.jsl`, 10 `tests/resample.jsl` and 1 `tests/style.jsl`.
 - `jess package check .`: no errors, strict types over every `.jsl`.
 - `jess run --package . bench/bench.jsl`: all 98 workloads ran and held their fingerprints (91 of them before the gate rows).
