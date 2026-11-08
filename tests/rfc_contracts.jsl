@@ -1,0 +1,779 @@
+--!strict
+-- Executable contracts of docs/RFC-0001-renderer.md. The sketches' reference arithmetic is run against
+-- hand-derived numbers (each expected value is derived in a comment, not read from output), against an
+-- independent dense sampling of the curves, and against fixed-seed property samples. The legacy facts the
+-- contracts rely on are in tests/rfc.jsl.
+local magick = require '@magick'
+local test = require '@jess/test'
+local transform = require '../docs/rfc/sketches/transform'
+local color = require '../docs/rfc/sketches/color'
+local paint = require '../docs/rfc/sketches/paint'
+local render = require '../docs/rfc/sketches/render'
+local caps = require '../docs/rfc/sketches/caps'
+local stroke = require '../docs/rfc/sketches/stroke'
+local seed = require '../docs/rfc/sketches/noise'
+
+local expect = test.expect
+local suite = test.new()
+
+--- Whether two numbers agree within eps.
+local function near(actual: number, expected: number, eps: number?): boolean
+  return math.abs(actual - expected) <= (eps or 1e-9)
+end
+
+--- Whether `text` contains `part` as plain text.
+local function contains(text: string, part: string): boolean
+  return string.find(text, part, 1, true) ~= nil
+end
+
+--- The message a refused call raises, or '' when it did not raise.
+local function refusal(callback: () -> ()): string
+  -- pcall around the call under test: the refusal is what is checked, and its message is returned.
+  local ok, message = pcall(callback)
+
+  if ok then return '' end
+
+  -- error(..., 2) prefixes the caller's file and line; the contract is the text from "magick:" on.
+  local text = tostring(message)
+  local start = string.find(text, 'magick:', 1, true)
+
+  if start == nil then return text end
+
+  return string.sub(text, start)
+end
+
+--- A deterministic generator in [0, 1): the Lehmer step of the reference, so the samples are fixed.
+local function sampler(initial: number): () -> number
+  local state = initial
+
+  return function(): number
+    state = seed.step(state)
+
+    return state / seed.Modulus
+  end
+end
+
+--- The cubic Bezier point of eight control numbers at parameter t.
+local function cubicPoint(curve: { number }, along: number): (number, number)
+  local rest = 1 - along
+  local weightStart, weightFirst = rest * rest * rest, 3 * rest * rest * along
+  local weightSecond, weightEnd = 3 * rest * along * along, along * along * along
+
+  return weightStart * curve[1] + weightFirst * curve[3] + weightSecond * curve[5] + weightEnd * curve[7],
+    weightStart * curve[2] + weightFirst * curve[4] + weightSecond * curve[6] + weightEnd * curve[8]
+end
+
+--- The box of a cubic by dense sampling (an independent check of cubicBox): 20001 parameters.
+local function denseBox(curve: { number }): (number, number, number, number)
+  local left, top, right, bottom = math.huge, math.huge, -math.huge, -math.huge
+
+  for index = 0, 20000 do
+    local pointX, pointY = cubicPoint(curve, index / 20000)
+
+    left = math.min(left, pointX)
+    right = math.max(right, pointX)
+    top = math.min(top, pointY)
+    bottom = math.max(bottom, pointY)
+  end
+
+  return left, top, right, bottom
+end
+
+--- The shoelace area of a polygon given by start and {x, y} points, closed back to the start.
+local function polygonArea(startX: number, startY: number, points: { { number } }): number
+  local ring = { { startX, startY } }
+
+  for _, point in points do
+    table.insert(ring, point)
+  end
+
+  local total = 0
+
+  for index = 1, #ring do
+    local here, there = ring[index], ring[index % #ring + 1]
+
+    total += here[1] * there[2] - there[1] * here[2]
+  end
+
+  return math.abs(total) / 2
+end
+
+-- Budgets (RFC-0001 B3, section 11): the boundary of the render check --------------------------------
+
+suite.describe('render budget boundaries (B3)', function()
+  suite.it('accepts a render exactly at the default 512 MiB and refuses one byte more', function()
+    -- Tile 248, halo 1, 8 workers: per worker 33*248^2*16 + 249*248*8 + 250^2*16 = 33968128, times 8 = 271745024.
+    -- Output 8091 by 8192 at 4 bytes: 265125888. Total 536870912 = 512 MiB exactly.
+    local exact = render.plan(248, 8, 1, 8091, 8192, false, 536870912)
+
+    expect(exact).toBe(536870912)
+    expect(contains(refusal(function()
+      render.plan(248, 8, 1, 8092, 8192, false, 536870912)
+    end), 'magick: render needs 536903680 bytes, budget is 536870912')).toBe(true)
+  end)
+
+  suite.it('refuses the same render one byte under its own bound', function()
+    expect(contains(refusal(function()
+      render.plan(248, 8, 1, 8091, 8192, false, 536870911)
+    end), 'magick: render needs 536870912 bytes, budget is 536870911')).toBe(true)
+  end)
+
+  suite.it('keeps the 8192 square at tile 128 under 512 MiB, and refuses it at tile 256', function()
+    expect(render.plan(128, 8, 64, 8192, 8192, false, 536870912)).toBe(347086848)
+    expect(contains(refusal(function()
+      render.plan(256, 8, 64, 8192, 8192, false, 536870912)
+    end), 'magick: render needs 568344576 bytes')).toBe(true)
+  end)
+
+  suite.it('counts the encode bound: 8192 square at tile 128 with encode is 886642114 bytes', function()
+    -- 2.01 * 268435456 = 539555266 (floored), plus 347086848.
+    expect(render.plan(128, 8, 64, 8192, 8192, true, 1073741824)).toBe(886642114)
+    expect(contains(refusal(function()
+      render.plan(128, 8, 64, 8192, 8192, true, 536870912)
+    end), 'magick: render needs 886642114 bytes')).toBe(true)
+  end)
+
+  suite.it('refuses each option outside its cap with the E5 message', function()
+    expect(contains(refusal(function()
+      render.plan(257, 8, 0, 8, 8, false, 1e12)
+    end), 'magick: MaxTileEdge 256 exceeded')).toBe(true)
+
+    expect(contains(refusal(function()
+      render.plan(128, 9, 0, 8, 8, false, 1e12)
+    end), 'magick: MaxWorkers 8 exceeded')).toBe(true)
+
+    expect(contains(refusal(function()
+      render.plan(128, 1, 65, 8, 8, false, 1e12)
+    end), 'magick: MaxHaloPx 64 exceeded')).toBe(true)
+
+    expect(contains(refusal(function()
+      render.plan(128, 1, 0, 8193, 8, false, 1e12)
+    end), 'magick: MaxImageEdge 8192 exceeded')).toBe(true)
+  end)
+
+  suite.it('refuses a tile edge or a worker count that is not a whole number at least one', function()
+    expect(contains(refusal(function()
+      render.plan(0, 1, 0, 8, 8, false, 1e12)
+    end), 'tileSize must be a whole number')).toBe(true)
+
+    expect(contains(refusal(function()
+      render.plan(128, 0, 0, 8, 8, false, 1e12)
+    end), 'workers must be a whole number')).toBe(true)
+  end)
+end)
+
+-- Stroke units and joins (RFC-0001 section 5) --------------------------------------------------------
+
+suite.describe('stroke units (SK1, SK2)', function()
+  suite.it('gives the user width on the identity and a scale of w * s', function()
+    -- Identity, vertical direction: 2 * |1| / 1 = 2. Scale 2 uniform: 3 * |4| / 2 = 6.
+    expect(stroke.deviceWidth(2, transform.identity(), 0, 1)).toBe(2)
+    expect(stroke.deviceWidth(3, transform.scale(2, 2), 0, 1)).toBe(6)
+  end)
+
+  suite.it('keeps the width under a reflection, which has |det| 1', function()
+    -- scale(-1, 1), vertical: 3 * |-1| / |(0, 1)| = 3.
+    expect(stroke.deviceWidth(3, transform.scale(-1, 1), 0, 1)).toBe(3)
+  end)
+
+  suite.it('stretches a non-uniform scale by its direction: horizontal 2, vertical 6', function()
+    -- scale(3, 1), width 2. Horizontal direction (1, 0): 2 * 3 / |(3, 0)| = 2. Vertical (0, 1): 2 * 3 / |(0, 1)| = 6.
+    expect(stroke.deviceWidth(2, transform.scale(3, 1), 1, 0)).toBe(2)
+    expect(stroke.deviceWidth(2, transform.scale(3, 1), 0, 1)).toBe(6)
+  end)
+
+  suite.it('never exceeds width * sigmaMax, and reaches it, over 360 directions under a rotated matrix', function()
+    -- M = scale(3, 1) then rotate(0.4): sigmaMax is 3 for any rotation of scale(3, 1) (rotation is orthogonal).
+    local matrix = transform.multiply(transform.rotate(0.4), transform.scale(3, 1))
+    local bound = 2 * transform.sigmaMax(matrix)
+    local reached = 0
+
+    for degree = 0, 359 do
+      local angle = degree * math.pi / 180
+      local width = stroke.deviceWidth(2, matrix, math.cos(angle), math.sin(angle))
+
+      expect(width <= bound + 1e-9).toBe(true)
+      if near(width, bound, 1e-9) then reached += 1 end
+    end
+
+    expect(reached >= 1).toBe(true)
+  end)
+
+  suite.it('refuses a zero direction and a width outside MaxCoordinate', function()
+    expect(contains(refusal(function()
+      stroke.deviceWidth(1, transform.identity(), 0, 0)
+    end), 'magick: stroke direction is zero')).toBe(true)
+    expect(stroke.checkWidth(4194304)).toBe(4194304)
+    expect(contains(refusal(function()
+      stroke.checkWidth(4194305)
+    end), 'magick: MaxCoordinate 4194304 exceeded')).toBe(true)
+
+    expect(contains(refusal(function()
+      stroke.checkWidth(-1)
+    end), 'must be finite and not negative')).toBe(true)
+  end)
+end)
+
+suite.describe('joins, caps and dashes (SK3, SK4, SK6)', function()
+  suite.it('gives the miter ratio 1 / sin(theta / 2), which is sqrt 2 at a right angle', function()
+    -- theta = 90 degrees: 1 / sin(45 degrees) = sqrt(2) = 1.41421356...
+    expect(near(stroke.miterRatio(math.pi / 2), math.sqrt(2), 1e-12)).toBe(true)
+    -- theta = 30 degrees: 1 / sin(15 degrees) = 3.8637033...
+    expect(near(stroke.miterRatio(math.pi / 6), 3.8637033051562732, 1e-9)).toBe(true)
+  end)
+
+  suite.it('joins a right angle as a miter at limit 4, and as a bevel below sqrt 2', function()
+    expect(stroke.joinKind(math.pi / 2, 4)).toBe('miter')
+    expect(stroke.joinKind(math.pi / 2, math.sqrt(2))).toBe('miter')
+    expect(stroke.joinKind(math.pi / 2, 1.4)).toBe('bevel')
+  end)
+
+  suite.it('bevels a 20 degree join at limit 4 (ratio 5.7588) and mitres a 30 degree join (ratio 3.8637)', function()
+    -- 1 / sin(10 degrees) = 5.7588 > 4, so bevel. 1 / sin(15 degrees) = 3.8637 <= 4, so miter.
+    expect(stroke.joinKind(math.pi / 9, 4)).toBe('bevel')
+    expect(stroke.joinKind(math.pi / 6, 4)).toBe('miter')
+  end)
+
+  suite.it('draws a round zero-length cap as a disk of the width, a square as a square, and butt as nothing', function()
+    expect(stroke.zeroLengthCap('round', 6)).toEqual({ kind = 'disk', size = 6 })
+    expect(stroke.zeroLengthCap('square', 6)).toEqual({ kind = 'square', size = 6 })
+    expect(stroke.zeroLengthCap('butt', 6)).toEqual({ kind = 'none', size = 0 })
+  end)
+
+  suite.it('refuses 65 dashes, and a negative dash, and sums an empty or zero pattern to 0 (solid)', function()
+    local sixtyFive = {}
+
+    for index = 1, 65 do
+      sixtyFive[index] = 1
+    end
+
+    expect(stroke.checkDashes({ 1, 2, 3 })).toBe(6)
+    expect(stroke.checkDashes({})).toBe(0)
+    expect(contains(refusal(function()
+      stroke.checkDashes(sixtyFive)
+    end), 'magick: MaxDashEntries 64 exceeded')).toBe(true)
+
+    expect(contains(refusal(function()
+      stroke.checkDashes({ 1, -1 })
+    end), 'dash lengths must be finite and not negative')).toBe(true)
+  end)
+
+  suite.it('reduces a dash offset into [0, period) by floored modulo', function()
+    expect(stroke.dashOffset(-1, 5)).toBe(4)
+    expect(stroke.dashOffset(12, 5)).toBe(2)
+    expect(stroke.dashOffset(10, 5)).toBe(0)
+  end)
+end)
+
+-- Caps (B3 and E5): one rule for every cap ----------------------------------------------------------
+
+suite.describe('every named cap follows the E5 rule (B3)', function()
+  suite.it('accepts each cap at its limit, and refuses limit + 1 with the exact message', function()
+    -- Every cap in the table: a value at the limit passes, one above it is refused as
+    -- "magick: <CapName> <limit> exceeded". A cap with no code path in the sketches (MaxStops, MaxPiecesPerCurve,
+    -- MaxCommandsPerPath, and the rest of the later-issue caps) is tested through this same rule, which is its
+    -- contract; tests/rfc_contracts.jsl's relations pin the constants themselves.
+    for name, limit in caps.values do
+      expect(caps.check(name, limit)).toBe(limit)
+      expect(refusal(function()
+        caps.check(name, limit + 1)
+      end)).toBe(`magick: {name} {limit} exceeded`)
+    end
+  end)
+
+  suite.it('refuses an unknown cap name, so a typo cannot pass a check', function()
+    expect(refusal(function()
+      caps.check('MaxBogus', 1)
+    end)).toBe('magick: unknown cap MaxBogus')
+  end)
+
+  suite.it('pins the constants to the rules they state', function()
+    -- The default tile is inside the maximum tile; the image pixel cap is the square of the edge cap; the
+    -- working cap is a 4096 square; the coordinate cap is 2^22; a cubic at the coordinate limit needs
+    -- ceil(sqrt(0.75 * (4 * 2^22 * sqrt 2) / 0.25)) = 8431 pieces, under MaxPiecesPerCurve.
+    expect(caps.DefaultTileEdge <= caps.values.MaxTileEdge).toBe(true)
+    expect(caps.values.MaxImagePixels).toBe(caps.values.MaxImageEdge * caps.values.MaxImageEdge)
+    expect(caps.values.MaxWorkingPixels).toBe(4096 * 4096)
+    expect(caps.values.MaxCoordinate).toBe(2 ^ 22)
+    expect(caps.values.MaxDecodedPixels).toBe(caps.values.MaxImagePixels)
+    expect(math.ceil(math.sqrt(0.75 * (4 * 2 ^ 22 * math.sqrt(2)) / 0.25)) <= caps.values.MaxPiecesPerCurve).toBe(true)
+  end)
+
+  suite.it('refuses clip depth 17 and accepts 16, the boundary of MaxClipDepth', function()
+    expect(color.nestClip(15)).toBe(16)
+    expect(refusal(function()
+      color.nestClip(16)
+    end)).toBe('magick: MaxClipDepth 16 exceeded')
+  end)
+
+  suite.it('refuses group depth 33 and accepts 32, the boundary of MaxGroupDepth', function()
+    expect(color.nestGroup(31)).toBe(32)
+    expect(refusal(function()
+      color.nestGroup(32)
+    end)).toBe('magick: MaxGroupDepth 32 exceeded')
+  end)
+end)
+
+-- Noise seeds (D2 for 0.4.0, L4 for the legacy functions) --------------------------------------------
+
+suite.describe('seeds (D2, L4)', function()
+  suite.it('accepts 1 and 2^31 - 2 under the new rule, and refuses 0, -1, 2.5, 2^31 - 1 and NaN', function()
+    expect(seed.check(1)).toBe(1)
+    expect(seed.check(2147483646)).toBe(2147483646)
+    local message = 'magick: seed must be an integer in 1..2147483646'
+
+    expect(refusal(function()
+      seed.check(0)
+    end)).toBe(message)
+
+    expect(refusal(function()
+      seed.check(-1)
+    end)).toBe(message)
+
+    expect(refusal(function()
+      seed.check(2.5)
+    end)).toBe(message)
+
+    expect(refusal(function()
+      seed.check(2147483647)
+    end)).toBe(message)
+
+    expect(refusal(function()
+      seed.check(0 / 0)
+    end)).toBe(message)
+  end)
+
+  suite.it('gives the legacy rule: 0 and 2^31 - 1 are 1, -1 is 2^31 - 2, and 2.5 is 2', function()
+    expect(seed.legacy(0)).toBe(1)
+    expect(seed.legacy(1)).toBe(1)
+    expect(seed.legacy(2147483646)).toBe(2147483646)
+    expect(seed.legacy(2147483647)).toBe(1)
+    expect(seed.legacy(-1)).toBe(2147483646)
+    expect(seed.legacy(2.5)).toBe(2)
+  end)
+
+  suite.it('matches the package: magick.noise takes the same seeds as the legacy reference', function()
+    local function bytesOf(value: number): string
+      return buffer.tostring(magick.noise(4, 4, '#808080', value).data)
+    end
+
+    expect(bytesOf(2147483647)).toBe(bytesOf(1))
+    expect(bytesOf(2147483646) == bytesOf(1)).toBe(false)
+    expect(bytesOf(2.5)).toBe(bytesOf(2))
+    expect(bytesOf(0)).toBe(bytesOf(1))
+  end)
+
+  suite.it('uses the Park-Miller constants: multiplier 48271 and modulus 2^31 - 1, a prime', function()
+    expect(seed.Multiplier).toBe(48271)
+    expect(seed.Modulus).toBe(2147483647)
+
+    local prime = true
+
+    for divisor = 2, 46340 do
+      if seed.Modulus % divisor == 0 then prime = false end
+    end
+
+    expect(prime).toBe(true)
+  end)
+
+  suite.it('steps exactly: 1 to 48271, and (2^31 - 2) to 2^31 - 1 - 48271', function()
+    -- 2147483646 * 48271 is below 2^53, so the product is exact in f64; mod (2^31 - 1) it is -48271.
+    expect(2147483646 * 48271 < 2 ^ 53).toBe(true)
+    expect(seed.step(1)).toBe(48271)
+    expect(seed.step(2147483646)).toBe(2147483647 - 48271)
+  end)
+end)
+
+-- Group compositing (RFC-0001 section 10: G1 to G8) --------------------------------------------------
+
+suite.describe('isolated groups (G1 to G8)', function()
+  local white = { red = 1, green = 1, blue = 1, alpha = 1 }
+  local red = { red = 1, green = 0, blue = 0, alpha = 1 }
+  local blueHalf = { red = 0, green = 0, blue = 0.5, alpha = 0.5 }
+
+  suite.it('isolates: a child drawn src-in into an empty group reaches nothing, so the backdrop stays white', function()
+    -- The group starts transparent (G1). src-in keeps the source only where the group is opaque: nowhere.
+    local result = color.composeGroup(white, { { pixel = red, operator = 'src-in' } })
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 1, 1, 1, 1 }
+  end)
+
+  suite.it('applies opacity once per group: two children at opacity 0.5 give (0.75, 0.5, 0.75, 1)', function()
+    -- Child red, then blue at alpha 0.5 over it: (0.5, 0, 0.5, 1). Opacity 0.5 once: (0.25, 0, 0.25, 0.5).
+    -- Over white: (0.25 + 0.5, 0.5, 0.25 + 0.5, 1).
+    local result = color.composeGroup(white, { { pixel = red, operator = 'src-over' }, { pixel = blueHalf, operator = 'src-over' } }, { opacity = 0.5 })
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 0.75, 0.5, 0.75, 1 }
+  end)
+
+  suite.it('gives the group opacity 0 no effect and opacity 1 the full group', function()
+    local none = color.composeGroup(white, { { pixel = red, operator = 'src-over' } }, { opacity = 0 })
+    local full = color.composeGroup(white, { { pixel = red, operator = 'src-over' } }, { opacity = 1 })
+
+    expect({ none.red, none.green, none.blue, none.alpha }).toEqual { 1, 1, 1, 1 }
+    expect({ full.red, full.green, full.blue, full.alpha }).toEqual { 1, 0, 0, 1 }
+  end)
+
+  suite.it('composes blend then operator: a multiply group of red over white is red', function()
+    local result = color.composeGroup(white, { { pixel = red, operator = 'src-over' } }, { blend = 'multiply', operator = 'src-over' })
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 1, 0, 0, 1 }
+  end)
+
+  suite.it('refuses a blend with an operator other than src-over at composition', function()
+    expect(contains(refusal(function()
+      color.composeGroup(white, { { pixel = red, operator = 'src-over' } }, { blend = 'multiply', operator = 'src-in' })
+    end), 'blend modes composite with src-over only')).toBe(true)
+  end)
+
+  suite.it('leaves the backdrop alone for a zero-alpha group, under normal and under multiply', function()
+    local backdrop = { red = 0.25, green = 0.25, blue = 0.25, alpha = 0.5 }
+    local normal = color.composeGroup(backdrop, {})
+    local multiplied = color.composeGroup(backdrop, {}, { blend = 'multiply' })
+
+    expect({ normal.red, normal.green, normal.blue, normal.alpha }).toEqual { 0.25, 0.25, 0.25, 0.5 }
+    expect({ multiplied.red, multiplied.green, multiplied.blue, multiplied.alpha }).toEqual { 0.25, 0.25, 0.25, 0.5 }
+  end)
+
+  suite.it('clips the group before opacity: red at clip 0.5 over white is (1, 0.5, 0.5, 1)', function()
+    -- Clipped group pixel: (0.5, 0, 0, 0.5). Over white: 0.5 + 1 * 0.5 = 1 red, 0.5 green and blue, alpha 1.
+    local result = color.composeGroup(white, { { pixel = red, operator = 'src-over' } }, { clip = 0.5 })
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 1, 0.5, 0.5, 1 }
+  end)
+end)
+
+-- Transform: cubicBox and the T8 bounds, against independent dense sampling -----------------------
+
+suite.describe('cubic extrema (T8) against dense sampling', function()
+  local curves: { { number } } = {
+    -- The arch: y peaks at t = 1/2 with value 75.
+    { 0, 0, 0, 100, 100, 100, 100, 0 },
+    -- Collinear control points on the x axis.
+    { 0, 0, 30, 0, 60, 0, 90, 0 },
+    -- A zero-length handle at the start: y = 300 t^2 (1 - t), peak 400/9 at t = 2/3.
+    { 0, 0, 0, 0, 100, 100, 100, 0 },
+    -- Zero-length handles at both ends, a straight segment.
+    { 0, 0, 0, 0, 100, 0, 100, 0 },
+    -- An S-curve with a turn in each axis.
+    { 0, 0, 80, -40, 20, 90, 100, 30 },
+  }
+
+  suite.it('matches the hand-derived box of the arch: (0, 0, 100, 75)', function()
+    local left, top, right, bottom = transform.cubicBox(transform.identity(), table.unpack(curves[1]))
+
+    expect({ left, top, right, bottom }).toEqual { 0, 0, 100, 75 }
+  end)
+
+  suite.it('matches the hand-derived box of the zero-length handle: bottom 400/9', function()
+    local left, top, right, bottom = transform.cubicBox(transform.identity(), table.unpack(curves[3]))
+
+    expect(near(left, 0) and near(top, 0) and near(right, 100)).toBe(true)
+    expect(near(bottom, 400 / 9, 1e-9)).toBe(true)
+  end)
+
+  suite.it('agrees with dense sampling on every test curve, to 1e-6', function()
+    for _, curve in curves do
+      local left, top, right, bottom = transform.cubicBox(transform.identity(), table.unpack(curve))
+      local denseLeft, denseTop, denseRight, denseBottom = denseBox(curve)
+
+      expect(near(left, denseLeft, 1e-6) and near(right, denseRight, 1e-6)).toBe(true)
+      expect(near(top, denseTop, 1e-6) and near(bottom, denseBottom, 1e-6)).toBe(true)
+    end
+  end)
+
+  suite.it('agrees with dense sampling under a rotation and a reflection', function()
+    local matrix = transform.multiply(transform.scale(-2, 1), transform.rotate(0.7))
+
+    for _, curve in curves do
+      local mapped: { number } = {}
+
+      for index = 1, 8, 2 do
+        local pointX, pointY = transform.apply(matrix, curve[index], curve[index + 1])
+
+        table.insert(mapped, pointX)
+        table.insert(mapped, pointY)
+      end
+
+      local left, top, right, bottom = transform.cubicBox(matrix, table.unpack(curve))
+      local denseLeft, denseTop, denseRight, denseBottom = denseBox(mapped)
+
+      expect(near(left, denseLeft, 1e-6) and near(top, denseTop, 1e-6)).toBe(true)
+      expect(near(right, denseRight, 1e-6) and near(bottom, denseBottom, 1e-6)).toBe(true)
+    end
+  end)
+
+  suite.it('finds a quadratic-branch extremum on each side of the 1e-12 threshold', function()
+    -- y = (0, 1, 1, c): the quadratic coefficient A = u - 2v + w = c. With c = 1e-13 the linear branch runs
+    -- (root -C/B = 1/2); with c = 2e-12 the quadratic branch runs. Both must agree with dense sampling.
+    for _, coefficient in { 1e-13, 2e-12 } do
+      local curve = { 0, 0, 0.3, 1, 0.7, 1, 1, coefficient }
+      local _, top, _, bottom = transform.cubicBox(transform.identity(), table.unpack(curve))
+      local _, denseTop, _, denseBottom = denseBox(curve)
+
+      expect(near(top, denseTop, 1e-6) and near(bottom, denseBottom, 1e-6)).toBe(true)
+    end
+  end)
+
+  suite.it('bounds a whole curve set: the arch under scale(3, 1) with half width 0.5 inflates to (-2, -2, 302, 77)', function()
+    -- Device arch: x 0..300, y 0..75. sigmaMax(scale(3,1)) = 3, so the inflation is 0.5 * 3 = 1.5.
+    -- Rounded out: floor(-1.5) = -2, floor(-1.5) = -2, ceil(301.5) = 302, ceil(76.5) = 77.
+    local left, top, right, bottom = transform.bounds(transform.scale(3, 1), { curves[1] }, 0.5)
+
+    expect({ left, top, right, bottom }).toEqual { -2, -2, 302, 77 }
+  end)
+
+  suite.it('bounds a curve set with an elevated quadratic, and the empty set at the origin', function()
+    -- The quadratic (0,0),(50,100),(100,0) peaks at y = 50, the same box as its elevated cubic.
+    local elevated = transform.elevateQuadratic({ 0, 0, 50, 100, 100, 0 })
+    local left, top, right, bottom = transform.bounds(transform.identity(), { elevated }, 0)
+
+    expect({ left, top, right, bottom }).toEqual { 0, 0, 100, 50 }
+    expect({ transform.bounds(transform.identity(), {}, 1) }).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('elevates a quadratic to the same curve: the cubic and the quadratic agree at t = 0.3', function()
+    local quadratic = { 0, 0, 50, 100, 100, 0 }
+    local cubic = transform.elevateQuadratic(quadratic)
+    local along = 0.3
+    local rest = 1 - along
+    local quadX = rest * rest * 0 + 2 * rest * along * 50 + along * along * 100
+    local quadY = rest * rest * 0 + 2 * rest * along * 100 + along * along * 0
+    local cubicX, cubicY = cubicPoint(cubic, along)
+
+    expect(near(cubicX, quadX) and near(cubicY, quadY)).toBe(true)
+  end)
+end)
+
+-- Legacy transformed (owner-approved P4 change): the curve is kept -----------------------------------
+
+suite.describe('legacy transformed keeps its curve (P4)', function()
+  -- Source quadratic (0,0), (50,100), (100,0); scale 4. Exact device area under it and the chord
+  -- (the parabola's area is 2/3 base times height): (2/3) * 400 * 200 = 53333.33...
+  local source = { 0, 0, 50, 100, 100, 0 }
+  local exactArea = 2 / 3 * 400 * 200
+
+  suite.it('gives the exact area 53333.33 for the device curve', function()
+    expect(near(exactArea, 160000 / 3, 1e-9)).toBe(true)
+  end)
+
+  suite.it('retains the curve: 20 pieces at device tolerance 0.25, area 53200', function()
+    -- Device control (0,0),(200,400),(400,0): bend 800, pieces ceil(sqrt(800 / (8 * 0.25))) = ceil(20) = 20.
+    -- The polygon through 20 equal-parameter points has area 53333.33 * (1 - 1/400) = 53200.
+    local points = transform.flattenQuadratic(transform.scale(4, 4), source, 0.25)
+
+    expect(#points).toBe(20)
+    expect(near(polygonArea(0, 0, points), 53200, 1e-6)).toBe(true)
+  end)
+
+  suite.it('a control: the old baked version (10 source pieces, scaled) has area 52800, and differs', function()
+    -- Source bend 200, pieces ceil(sqrt(200 / 2)) = 10. Source polygon area 3333.33 * (1 - 1/100) = 3300, and
+    -- scaled by 4 squared it is 52800. Built here from the ten source points, then scaled.
+    local baked = transform.flattenQuadratic(transform.identity(), source, 0.25)
+    local scaled: { { number } } = {}
+
+    for _, point in baked do
+      table.insert(scaled, { point[1] * 4, point[2] * 4 })
+    end
+
+    expect(#baked).toBe(10)
+    expect(near(polygonArea(0, 0, scaled), 52800, 1e-6)).toBe(true)
+  end)
+
+  suite.it('is closer to the exact curve than the baked version: 133.3 against 533.3 square pixels', function()
+    local retained = polygonArea(0, 0, transform.flattenQuadratic(transform.scale(4, 4), source, 0.25))
+    local baked: { { number } } = {}
+
+    for _, point in transform.flattenQuadratic(transform.identity(), source, 0.25) do
+      table.insert(baked, { point[1] * 4, point[2] * 4 })
+    end
+
+    local bakedArea = polygonArea(0, 0, baked)
+
+    expect(math.abs(retained - exactArea) < math.abs(bakedArea - exactArea)).toBe(true)
+    expect(near(math.abs(retained - exactArea), 160000 / 3 - 53200, 1e-6)).toBe(true)
+    expect(near(math.abs(bakedArea - exactArea), 160000 / 3 - 52800, 1e-6)).toBe(true)
+  end)
+
+  suite.it('bounds the chord error by 2 * tolerance: 0.5 at 0.25 on the source piece count (P2)', function()
+    -- The worst chord midpoint of the 10 source pieces sits 200 / (4 * 10^2) = 0.5 from the curve. That is twice
+    -- the tolerance of 0.25, so P2's bound is 2 * tolerance for quadratics, not tolerance.
+    local points = transform.flattenQuadratic(transform.identity(), source, 0.25)
+    local worst = 0
+    local startX, startY = 0, 0
+
+    for index, point in points do
+      local midAlong = (index - 0.5) / #points
+      local rest = 1 - midAlong
+      local curveX = rest * rest * 0 + 2 * rest * midAlong * 50 + midAlong * midAlong * 100
+      local curveY = rest * rest * 0 + 2 * rest * midAlong * 100 + midAlong * midAlong * 0
+      local chordX, chordY = (startX + point[1]) / 2, (startY + point[2]) / 2
+
+      worst = math.max(worst, math.sqrt((curveX - chordX) ^ 2 + (curveY - chordY) ^ 2))
+      startX, startY = point[1], point[2]
+    end
+
+    expect(near(worst, 0.5, 1e-9)).toBe(true)
+    expect(worst <= 2 * 0.25 + 1e-9).toBe(true)
+  end)
+end)
+
+-- Fixed-seed property samples -------------------------------------------------------------------------
+
+suite.describe('property samples with a fixed seed', function()
+  suite.it('inverts 1000 random affine matrices: inverse(M) * M is the identity within 1e-9', function()
+    local random = sampler(20260101)
+    local checked = 0
+
+    for _ = 1, 1000 do
+      local matrix = {
+        scaleX = random() * 4 - 2, skewY = random() * 4 - 2, skewX = random() * 4 - 2,
+        scaleY = random() * 4 - 2, offsetX = random() * 40 - 20, offsetY = random() * 40 - 20,
+      }
+
+      -- A matrix of determinant under 1e-3 is skipped: its inverse is too large to check at 1e-9.
+      if math.abs(transform.determinant(matrix)) <= 1e-3 then continue end
+
+      local product = transform.multiply(transform.inverse(matrix), matrix)
+
+      checked += 1
+        expect(near(product.scaleX, 1, 1e-9) and near(product.scaleY, 1, 1e-9)).toBe(true)
+        expect(near(product.skewX, 0, 1e-9) and near(product.skewY, 0, 1e-9)).toBe(true)
+      expect(near(product.offsetX, 0, 1e-9) and near(product.offsetY, 0, 1e-9)).toBe(true)
+    end
+
+    expect(checked > 900).toBe(true)
+  end)
+
+  suite.it('flips the sign of the determinant under a reflection, for 1000 random matrices', function()
+    local random = sampler(7)
+
+    for _ = 1, 1000 do
+      local matrix = {
+        scaleX = random() * 4 - 2, skewY = random() * 4 - 2, skewX = random() * 4 - 2,
+        scaleY = random() * 4 - 2, offsetX = 0, offsetY = 0,
+      }
+      local reflected = transform.multiply(matrix, transform.scale(-1, 1))
+
+      expect(near(transform.determinant(reflected), -transform.determinant(matrix), 1e-9)).toBe(true)
+    end
+  end)
+
+  suite.it('round-trips every straight byte at alpha 1..255 in all three slots (W5)', function()
+    local scratch = buffer.create(8)
+    local failures = 0
+
+    for alpha = 1, 255 do
+      for channel = 0, 255 do
+        local otherChannel = 255 - channel
+        local thirdChannel = (channel * 7) % 256
+        local first, storedAlpha = color.premultiply(channel, alpha, scratch)
+        local second = color.premultiply(otherChannel, alpha, scratch)
+        local third = color.premultiply(thirdChannel, alpha, scratch)
+        local redOut, greenOut, blueOut = color.straight(first, second, third, storedAlpha)
+
+        if redOut ~= channel or greenOut ~= otherChannel or blueOut ~= thirdChannel then failures += 1 end
+      end
+    end
+
+    expect(failures).toBe(0)
+  end)
+
+  suite.it('keeps every Porter-Duff factor pair in [0, 1] and every result alpha in [0, 1], for 2000 samples', function()
+    local random = sampler(99)
+    local operators: { color.Operator } = {
+      'clear', 'src', 'dst', 'src-over', 'dst-over', 'src-in', 'dst-in',
+      'src-out', 'dst-out', 'src-atop', 'dst-atop', 'xor',
+    }
+
+    for _ = 1, 2000 do
+      local sourceAlpha, backdropAlpha = random(), random()
+
+      for _, operator in operators do
+        local fromSource, fromBackdrop = color.factors(operator, sourceAlpha, backdropAlpha)
+        local alpha = sourceAlpha * fromSource + backdropAlpha * fromBackdrop
+
+        expect(fromSource >= -1e-12 and fromSource <= 1 + 1e-12).toBe(true)
+        expect(fromBackdrop >= -1e-12 and fromBackdrop <= 1 + 1e-12).toBe(true)
+        expect(alpha >= -1e-12 and alpha <= 1 + 1e-12).toBe(true)
+      end
+    end
+  end)
+
+  suite.it('satisfies the alpha identities of the twelve operators: union = src-out + dst-out + src-in, xor = src-out + dst-out', function()
+    local random = sampler(4242)
+
+    for _ = 1, 2000 do
+      local sourceAlpha, backdropAlpha = random(), random()
+      local function alphaOf(operator: color.Operator): number
+        local fromSource, fromBackdrop = color.factors(operator, sourceAlpha, backdropAlpha)
+
+        return sourceAlpha * fromSource + backdropAlpha * fromBackdrop
+      end
+      local union = sourceAlpha + backdropAlpha - sourceAlpha * backdropAlpha
+
+      expect(near(alphaOf('src-over'), union, 1e-12)).toBe(true)
+      expect(near(alphaOf('dst-over'), union, 1e-12)).toBe(true)
+      expect(near(alphaOf('src-over'), alphaOf('src-out') + alphaOf('dst-out') + alphaOf('src-in'), 1e-12)).toBe(true)
+      expect(near(alphaOf('xor'), alphaOf('src-out') + alphaOf('dst-out'), 1e-12)).toBe(true)
+      expect(near(alphaOf('src-in'), sourceAlpha * backdropAlpha, 1e-12)).toBe(true)
+      expect(near(alphaOf('clear'), 0, 1e-12)).toBe(true)
+    end
+  end)
+
+  suite.it('keeps every separable blend value in [0, 1] for 2000 random pairs, in all seven modes', function()
+    local random = sampler(31337)
+    local modes: { color.BlendMode } = { 'normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten', 'soft-light' }
+
+    for _ = 1, 2000 do
+      local backdrop, source = random(), random()
+
+      for _, mode in modes do
+        local value = color.separable(mode, backdrop, source)
+
+        expect(value >= -1e-12 and value <= 1 + 1e-12).toBe(true)
+      end
+    end
+  end)
+
+  suite.it('keeps blended premultiplied pixels valid: colour within [0, alpha] and alpha within [0, 1]', function()
+    local random = sampler(2026)
+    local modes: { color.BlendMode } = { 'normal', 'multiply', 'screen', 'overlay', 'darken', 'lighten', 'soft-light' }
+
+    for _ = 1, 1000 do
+      local sourceAlpha, backdropAlpha = random(), random()
+      local source = {
+        red = random() * sourceAlpha, green = random() * sourceAlpha, blue = random() * sourceAlpha, alpha = sourceAlpha,
+      }
+
+      local backdrop = {
+        red = random() * backdropAlpha, green = random() * backdropAlpha, blue = random() * backdropAlpha, alpha = backdropAlpha,
+      }
+
+      for _, mode in modes do
+        local result = color.blendPixel(mode, 'src-over', source, backdrop, 1)
+
+        expect(result.alpha >= -1e-12 and result.alpha <= 1 + 1e-12).toBe(true)
+        expect(result.red >= -1e-12 and result.red <= result.alpha + 1e-12).toBe(true)
+        expect(result.green >= -1e-12 and result.green <= result.alpha + 1e-12).toBe(true)
+        expect(result.blue >= -1e-12 and result.blue <= result.alpha + 1e-12).toBe(true)
+      end
+    end
+  end)
+
+  suite.it('mixes stops within their range: the mix of two colours stays between them, per channel', function()
+    local random = sampler(555)
+
+    for _ = 1, 500 do
+      local first = { offset = 0, red = random(), green = random(), blue = random(), alpha = random() }
+      local second = { offset = 1, red = random(), green = random(), blue = random(), alpha = random() }
+      local along = random()
+      local mixed = paint.mixStop(first, second, along)
+
+      expect(mixed.alpha >= math.min(first.alpha, second.alpha) - 1e-12 and mixed.alpha <= math.max(first.alpha, second.alpha) + 1e-12).toBe(true)
+      expect(mixed.red >= math.min(first.red, second.red) - 1e-9 and mixed.red <= math.max(first.red, second.red) + 1e-9).toBe(true)
+    end
+  end)
+end)
+
+return suite

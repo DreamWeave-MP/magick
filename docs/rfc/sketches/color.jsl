@@ -10,6 +10,8 @@ refused with a magick: error. The tests in tests/rfc.jsl run all of it.
 Everything that touches an image or a tile is a STUB.
 ]]
 
+local caps = require './caps'
+
 local Color = {}
 
 export type Space = 'srgb' | 'linear'
@@ -219,12 +221,43 @@ function Color.clipPixel(pixel: Pixel, coverage: number): Pixel
   }
 end
 
---- Nested clips multiply, and the nesting depth is capped at 16 (MaxClipDepth). A depth past the cap
---- is refused with the cap's name.
-function Color.nestClip(depth: number): number
-  if depth + 1 > 16 then error('magick: MaxClipDepth 16 exceeded', 2) end
+--- One child of a group: a premultiplied pixel and the operator it is drawn with (G2 step 1).
+export type Child = { pixel: Pixel, operator: Operator }
 
-  return depth + 1
+--- Nested clips multiply, and the nesting depth is capped at MaxClipDepth (16, RFC-0001 F5). A depth past the
+--- cap is refused with `magick: MaxClipDepth 16 exceeded`.
+function Color.nestClip(depth: number): number
+  return caps.check('MaxClipDepth', depth + 1)
+end
+
+--- Nested groups: the depth of a group inside `depth` groups, capped at MaxGroupDepth (32, G4).
+function Color.nestGroup(depth: number): number
+  return caps.check('MaxGroupDepth', depth + 1)
+end
+
+--- REFERENCE. An isolated group, pixel by pixel (RFC-0001 section 10). G1: the children are composited in
+--- painter order, each with its operator, into a group pixel that starts fully transparent, so nothing reaches
+--- the backdrop directly. G2 step 2: the clip (a coverage in 0..1) multiplies the group pixel. G2 step 3 and 4:
+--- the group's opacity is applied once, and its blend and operator composite it onto the backdrop, through
+--- blendPixel. An empty group is alpha 0 and leaves the backdrop alone under src-over.
+function Color.composeGroup(
+  backdrop: Pixel,
+  children: { Child },
+  options: { blend: BlendMode?, operator: Operator?, opacity: number?, clip: number? }?
+): Pixel
+  local group: Pixel = { red = 0, green = 0, blue = 0, alpha = 0 }
+  local blend: BlendMode = if options and options.blend then options.blend else 'normal'
+  local operator: Operator = if options and options.operator then options.operator else 'src-over'
+  local opacity: number = if options and options.opacity then options.opacity else 1
+  local clip: number? = if options then options.clip else nil
+
+  for _, child in children do
+    group = Color.blendPixel('normal', child.operator, child.pixel, group, 1)
+  end
+
+  if clip then group = Color.clipPixel(group, clip) end
+
+  return Color.blendPixel(blend, operator, group, backdrop, opacity)
 end
 
 --- Stub: the working tile a straight RGBA8 image becomes (premultiplied, space as given).

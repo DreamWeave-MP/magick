@@ -1,0 +1,40 @@
+--!strict
+--[[
+Seeds (RFC-0001 D2 for 0.4.0 seeded features, L4 for the legacy functions). REFERENCE arithmetic only.
+
+Seed.check is the new rule: an integer in 1..2147483646, anything else refused. Seed.step is the
+Park-Miller (Lehmer) step the legacy generator uses (multiplier 48271, modulus 2^31 - 1), exact in f64
+because state * 48271 < 2^53 for every state below the modulus. Seed.legacy is the legacy rule, which
+keeps its own behaviour: floored modulo, and a state of 0 becomes 1. The two rules differ on purpose.
+]]
+
+local Seed = {}
+
+Seed.Modulus = 2147483647
+Seed.Multiplier = 48271
+Seed.MaxSeed = 2147483646
+
+--- The new rule. Refuses a non-integer, a value below 1, and a value above 2^31 - 2.
+function Seed.check(seed: number): number
+  if seed ~= seed or seed ~= math.floor(seed) or seed < 1 or seed > Seed.MaxSeed then
+    error('magick: seed must be an integer in 1..2147483646', 2)
+  end
+
+  return seed
+end
+
+--- One Lehmer step: state * 48271 mod (2^31 - 1).
+function Seed.step(state: number): number
+  return (state * Seed.Multiplier) % Seed.Modulus
+end
+
+--- The legacy rule (src/init.jsl `seeded`): floored modulo of the modulus, then 0 is taken as 1.
+function Seed.legacy(seed: number?): number
+  local state = math.floor(seed or 1) % Seed.Modulus
+
+  if state <= 0 then return 1 end
+
+  return state
+end
+
+return Seed

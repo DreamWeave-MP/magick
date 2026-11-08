@@ -9,8 +9,8 @@ edges are on a grid from the origin; the default tile edge is 128 px and the max
 Output is straight RGBA8 written tile by tile into one Image.
 ]]
 
+local caps = require './caps'
 local scene = require './scene'
-local color = require './color'
 
 local Render = {}
 
@@ -50,6 +50,26 @@ function Render.workingBytes(tileEdge: number, workers: number, haloPixels: numb
   local encodeBytes = if encode then math.floor(outputBytes * 2.01) else 0
 
   return workers * perWorker + outputBytes + encodeBytes
+end
+
+--- REFERENCE. The checks a render makes before any tile runs (RFC-0001 section 11, options): tileSize a whole
+--- number at most MaxTileEdge; workers a whole number from 1 to MaxWorkers; haloPixels at most MaxHaloPx; the
+--- output's larger edge at most MaxImageEdge; and the total bound of workingBytes at most the budget. Returns the
+--- bound. A bound above the budget is refused with `magick: render needs <n> bytes, budget is <m>`.
+function Render.plan(tileEdge: number, workers: number, haloPixels: number, outputWidth: number, outputHeight: number, encode: boolean, budget: number): number
+  caps.check('MaxTileEdge', tileEdge)
+  caps.check('MaxWorkers', workers)
+  caps.check('MaxHaloPx', haloPixels)
+  caps.check('MaxImageEdge', math.max(outputWidth, outputHeight))
+
+  if tileEdge < 1 or tileEdge ~= math.floor(tileEdge) then error('magick: tileSize must be a whole number of at least 1', 2) end
+  if workers < 1 or workers ~= math.floor(workers) then error('magick: workers must be a whole number of at least 1', 2) end
+
+  local bytes = Render.workingBytes(tileEdge, workers, haloPixels, outputWidth, outputHeight, encode)
+
+  if bytes > budget then error(`magick: render needs {bytes} bytes, budget is {budget}`, 2) end
+
+  return bytes
 end
 
 --- Stub: renders a document to a straight RGBA8 image, tile by tile in row-major tile order. Refuses

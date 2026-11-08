@@ -1,0 +1,56 @@
+--!strict
+--[[
+Hard caps of RFC-0001 section 11 (B3) and the error rule of E5. REFERENCE: `Caps.check` is the one
+rule every cap follows, `magick: <CapName> <limit> exceeded`. Caps with a code path in the sketches are
+checked through it (clip and group depth, tile edge, workers, halo, image edge, dashes, width). The rest
+are constants with a stated relation, tested in tests/rfc.jsl, because their code is a later issue.
+]]
+
+local Caps = {}
+
+Caps.DefaultTileEdge = 128
+
+Caps.values = {
+  MaxCoordinate = 4194304,
+  MaxCommandsPerPath = 1048576,
+  MaxPiecesPerCurve = 16384,
+  MaxSegmentsPerCoverage = 1048576,
+  MaxDashEntries = 64,
+  MaxDashesPerStroke = 1048576,
+  MaxStops = 256,
+  MaxClipDepth = 16,
+  MaxGroupDepth = 32,
+  MaxTileEdge = 256,
+  MaxImageEdge = 8192,
+  MaxImagePixels = 67108864,
+  MaxWorkingPixels = 16777216,
+  MaxHaloPx = 64,
+  MaxDecodedPixels = 67108864,
+  MaxReferenceDepth = 0,
+  MaxNodes = 65536,
+  MaxDabsPerStroke = 65536,
+  MaxDabsPerScene = 1048576,
+  MaxStrokesPerPlan = 16384,
+  MaxPlanLevels = 8,
+  MaxWorkers = 8,
+}
+
+--- The limit of a named cap. An unknown name is refused, so a typo cannot pass a check silently.
+function Caps.limit(name: string): number
+  local limit = Caps.values[name]
+
+  if limit == nil then error(`magick: unknown cap {name}`, 2) end
+
+  return limit
+end
+
+--- Refuses a value above its cap, with the E5 message, and returns the value otherwise.
+function Caps.check(name: string, value: number): number
+  local limit = Caps.limit(name)
+
+  if value > limit then error(`magick: {name} {limit} exceeded`, 2) end
+
+  return value
+end
+
+return Caps
