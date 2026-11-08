@@ -7,7 +7,7 @@ suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and 
 
 Measured against: `jess` 0.3.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
-- `jess package test .`: 274 passed, 0 failed (182 of them before `tests/compat.jsl` was added).
+- `jess package test .`: 328 passed, 0 failed (each test counted once per provider; 274 before `tests/rfc.jsl`, which adds 54).
 - `jess package check .`: no errors, strict types over every `.jsl`.
 - `jess run --package . bench/bench.jsl`: all 91 workloads ran and held their fingerprints.
 
