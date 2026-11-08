@@ -1,0 +1,106 @@
+--!strict
+-- The facts docs/RFC-0001-renderer.md relies on, as the 0.1.3 implementation has them today. A
+-- renderer change that moves one of them is a change to the RFC, not a quiet fix.
+local magick = require '@magick'
+local path = require '@magick/path'
+local test = require '@jess/test'
+
+local expect = test.expect
+local suite = test.new()
+
+--- The coverage bytes of a mask, a row a list.
+local function rows(mask: magick.Mask): { { number } }
+  local out: { { number } } = {}
+
+  for row = 0, mask.height - 1 do
+    local values: { number } = {}
+
+    for column = 0, mask.width - 1 do
+      table.insert(values, buffer.readu8(mask.data, row * mask.width + column))
+    end
+
+    table.insert(out, values)
+  end
+
+  return out
+end
+
+suite.describe('pixel corners', function()
+  suite.it('covers the pixels between a rectangle its corners, one column short of the spare one', function()
+    -- Corners 0,0 and 4,4 cover pixels 0..3 by 0..3. The mask is 5 wide because bounds reach
+    -- column 4's left edge, and that spare column is clear.
+    local mask, left, top = path.new():rect(0, 0, 4, 4):mask()
+
+    expect({ left, top, mask.width, mask.height }).toEqual { 0, 0, 5, 4 }
+    expect(rows(mask)).toEqual {
+      { 255, 255, 255, 255, 0 },
+      { 255, 255, 255, 255, 0 },
+      { 255, 255, 255, 255, 0 },
+      { 255, 255, 255, 255, 0 },
+    }
+  end)
+
+  suite.it('fills legacy Image rectangles by inclusive pixel indices, the other convention', function()
+    -- Image:rect(0, 0, 4, 4) fills pixels 0..4, five of them: the legacy methods are not the
+    -- corner rule the path module uses, and the RFC keeps both.
+    local image = magick.new(6, 6, '#000000'):rect(0, 0, 4, 4, '#ffffff')
+
+    expect({ image:get(4, 4) }).toEqual { 255, 255, 255, 255 }
+    expect({ image:get(5, 4) }).toEqual { 0, 0, 0, 255 }
+  end)
+end)
+
+suite.describe('tolerance', function()
+  suite.it('defaults to a quarter pixel, and the default paints what 0.25 paints', function()
+    local defaulted = path.new()
+    local explicit = path.new(0.25)
+    local curveDefault = defaulted:moveTo(0, 0):quadTo(50, 100, 100, 0):close():mask()
+    local curveExplicit = explicit:moveTo(0, 0):quadTo(50, 100, 100, 0):close():mask()
+
+    expect(defaulted.tolerance).toBe(0.25)
+    expect(buffer.tostring(curveDefault.data)).toBe(buffer.tostring(curveExplicit.data))
+  end)
+end)
+
+suite.describe('transformed', function()
+  suite.it('returns a new path and leaves the source as it was', function()
+    local shape = path.new():rect(0, 0, 2, 2)
+    local moved = shape:transformed(2, 10, 20)
+
+    expect(moved == shape).toBe(false)
+    expect({ shape:bounds() }).toEqual { 0, 0, 2, 2 }
+    expect({ moved:bounds() }).toEqual { 10, 20, 14, 24 }
+  end)
+
+  suite.it('scales each point before it offsets it, so it is T*S in column-vector order', function()
+    -- Corner (1, 1) becomes (1 * 2 + 10, 1 * 2 + 20) = (12, 22), not (2 * 11, 2 * 21).
+    local moved = path.new():rect(1, 1, 2, 2):transformed(2, 10, 20)
+
+    expect({ moved:bounds() }).toEqual { 12, 22, 14, 24 }
+  end)
+end)
+
+suite.describe('legacy inputs the RFC rules out for new APIs', function()
+  suite.it('fills the rows of a rectangle with a NaN corner across the whole image, silently', function()
+    -- Legacy Image:rect clamps with math.min and math.max, which pass NaN through, so the rows
+    -- 0..2 are filled from edge to edge and row 3 is untouched. No error is raised.
+    local nan = 0 / 0
+    local image = magick.new(4, 4, '#000000'):rect(0, 0, nan, 2, '#ffffff')
+
+    expect({ image:get(3, 2) }).toEqual { 255, 255, 255, 255 }
+    expect({ image:get(0, 3) }).toEqual { 0, 0, 0, 255 }
+  end)
+
+  suite.it('fails a path with a NaN coordinate instead of returning a mask', function()
+    local nan = 0 / 0
+    -- pcall around path:mask(): a NaN corner makes the legacy path throw, and this pins that it
+    -- throws rather than returning a mask.
+    local ok = pcall(function()
+      path.new():rect(0, 0, nan, 4):mask()
+    end)
+
+    expect(ok).toBe(false)
+  end)
+end)
+
+return suite
