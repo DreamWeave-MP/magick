@@ -7,9 +7,9 @@ suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and 
 
 Measured against: `jess` 0.3.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
-- `jess package test .`: 274 passed, 0 failed (182 of them before `tests/compat.jsl` was added).
+- `jess package test .`: 346 passed, 0 failed (182 of them before `tests/compat.jsl` was added, and 72 in `tests/gate.jsl`).
 - `jess package check .`: no errors, strict types over every `.jsl`.
-- `jess run --package . bench/bench.jsl`: all 91 workloads ran and held their fingerprints.
+- `jess run --package . bench/bench.jsl`: all 98 workloads ran and held their fingerprints (91 of them before the gate rows).
 
 ## Policy
 
@@ -225,5 +225,8 @@ behavior kept under its old name.
 - `tests/png.jsl`, `tests/path.jsl`, `tests/resample.jsl`: the codecs, paths and resampling.
 - `tests/compat.jsl`: the examples in this document, and the consumer call shapes.
 - `tests/style.jsl`: `@jess/style` over the payload.
+- `tests/gate.jsl`: tiny exact fixtures, the reference scenes of `tests/scenes.jsl` and empty and
+  one-pixel images. `tools/gallery.jsl` renders the scenes to PNG and checks them against
+  `tests/gallery/`.
 - `bench/bench.jsl`: every workload, held to its fingerprint; methodology and the reference table
   are in `BENCHMARKS.md`.

@@ -6,6 +6,19 @@ ImageMagick is used only as a development oracle; this package does not spawn it
 
 What 0.1.x promises consumers, and what it keeps as it always did, is in [COMPATIBILITY.md](COMPATIBILITY.md).
 
+## Gates
+
+`tests/gate.jsl` holds the package to tiny exact fixtures (transparency, clipping, alpha, curves,
+holes, gradients, line caps), to the reference scenes of `tests/scenes.jsl` at the pixels their
+comments derive, and to empty and one-pixel-wide images. Every value is exact except area, which
+a flattened curve or circle holds to a quarter pixel, declared in the suite. `jess package test .`
+writes nothing.
+
+`tools/gallery.jsl` renders the same scenes to PNG and compares them with recorded checksums and
+baseline files, reporting the first differing pixel. It needs both filesystem capabilities, and
+re-baselining is an explicit `rebaseline` run whose output is reviewed. The commands are in
+[BENCHMARKS.md](BENCHMARKS.md#gates).
+
 ## 0.1.3 changes
 
 `@magick/path` fills shapes with anti-aliased coverage: polygons, rectangles (rounded or as frames), ellipses, rings, lines and polylines with butt, round or square caps, and contours of lines, quadratic and cubic curves. Coverage is worked out exactly for the flattened outline, so a pixel an edge halves is half covered. Contours that wind the same way join; one that winds the other way cuts a hole. `Path:mask()` gives the coverage and where it lies; `Path:fill(image, color)` composites a color through it. `Path:pen()` hands the path to code that draws outlines through plain functions, such as a font reader.
