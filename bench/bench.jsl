@@ -9,6 +9,7 @@
 -- other work, fails here instead of posting a time. With `record` the fingerprints are printed as
 -- lines of the table below instead of being checked.
 local bytes = require '@dream/bytes'
+local fs = require '@dream/fs'
 local magick = require '@magick'
 local path = require '@magick/path'
 
@@ -25,6 +26,43 @@ type Result = Image | Mask | buffer | number
 local filter: string?, mode: string? = ...
 local only = if filter and filter ~= '' then filter else nil
 local recording = mode == 'record'
+
+--- The file a proc entry reads, or nil where there is none: /proc is Linux's, and a read of it is
+--- granted only with filesystem.read.
+local function proc(file: string): string?
+  -- pcall only around a read of /proc, which is absent off Linux: a missing file is recorded as
+  -- missing, not raised.
+  local ok, text = pcall(fs.readFileString, file)
+
+  if ok then return text end
+
+  return nil
+end
+
+--- Where these numbers were taken, printed before the first workload as lines starting with '#':
+--- the jess version and whether its toolchain is verified, the time, and the machine as /proc
+--- describes it when the run may read it. Luau's own version is not exposed by the runtime, and
+--- the commit of the package is not either: BENCHMARKS.md's record carries both.
+local function provenance()
+  print(`# jess {jess.version}, {if jess.bench.verified then 'verified toolchain' else 'unverified toolchain'}`)
+  print('# Luau: version not exposed by the runtime')
+  print(`# started {os.date('!%Y-%m-%dT%H:%M:%SZ')}`)
+
+  if not jess.granted('filesystem.read') then
+    print('# machine: not recorded, grant filesystem.read to read /proc')
+
+    return
+  end
+
+  local cpuinfo, version = proc '/proc/cpuinfo', proc '/proc/version'
+  local model = if cpuinfo then string.match(cpuinfo, 'model name%s*:%s*([^\n]+)') else nil
+  local processors = if cpuinfo then select(2, string.gsub('\n' .. cpuinfo, '\nprocessor%s*:', '')) else 0
+  local kernel = if version then string.match(version, '^(%S+ version %S+)') else nil
+
+  print(`# machine: {model or 'unknown CPU'}, {processors} logical processors, {kernel or 'unknown kernel'}`)
+end
+
+if not recording then provenance() end
 
 --- What each workload returns: the geometry of an image and the CRC-32 of its bytes, the length
 --- of a file and its CRC-32, or a number.
@@ -120,6 +158,13 @@ local Expected: { [string]: string } = {
   ['readBMP'] = '512x512:bb8eb2dd',
   ['readTGA'] = '512x512:954a715a',
   ['readTGA packets'] = '512x512:0d9557be',
+  ['gate curves'] = '256x256:b0abddf7',
+  ['gate holes'] = '256x256:66b71e69',
+  ['gate alpha gradient'] = '256x256:e8979b69',
+  ['gate 1x1 half coverage'] = '1x1:3f459352',
+  ['gate 1x17 rows'] = '1x17:65e06997',
+  ['gate 17x1 row'] = '17x1:65e06997',
+  ['gate empty'] = '0x0:00000000',
 }
 
 local function fingerprint(result: Result): string
@@ -467,6 +512,42 @@ workload('rect columns', function()
 end)
 workload('verticalGradient icon', function() return magick.verticalGradient(Icon, Icon, '#f5f5f5', '#5c5c5c') end)
 
+-- Reference scenes and extreme sizes: the curves, holes and alpha ramp of tests/scenes.jsl at the
+-- size of the paths above, and the calls that run on one pixel or one line of pixels, where what
+-- a call sets up is most of what it costs. Each builds its image on every call, so every call
+-- starts from the same pixels.
+local function curvesOn(image: Image): Image
+  path.new(0.25):moveTo(16, 224):quadTo(128, -64, 240, 224):close():fill(image, '#3060c0')
+
+  return path.new(0.25):moveTo(16, 240):cubicTo(64, 112, 192, 112, 240, 240):close():fill(image, '#c06030')
+end
+
+workload('gate curves', function() return curvesOn(freshHalf(half)) end)
+
+workload('gate holes', function()
+  local image = freshHalf(half)
+
+  path.new():rect(16, 16, 240, 240):moveTo(96, 96):lineTo(96, 160):lineTo(160, 160):lineTo(160, 96):close():fill(image, '#ffffff')
+
+  return image
+end)
+
+workload('gate alpha gradient', function()
+  return freshHalf(half):over(magick.verticalGradient(Medium, Medium, '#ff000000', '#ff0000ff'))
+end)
+
+workload('gate 1x1 half coverage', function() return path.new():rect(0, 0, 0.5, 1):fill(magick.new(1, 1), '#ffffff') end)
+workload('gate 1x17 rows', function() return path.new():rect(0, 4.5, 1, 8.5):fill(magick.new(1, 17, '#000000'), '#ffffff') end)
+workload('gate 17x1 row', function() return path.new():rect(4.5, 0, 8.5, 1):fill(magick.new(17, 1, '#000000'), '#ffffff') end)
+
+workload('gate empty', function()
+  local image = magick.new(0, 0, '#ffffff')
+
+  image:rect(0, 0, 0, 0, '#ff0000')
+
+  return image:over(magick.new(0, 0))
+end)
+
 -- Codecs. A decoder is given the filters and layouts other encoders write, not only this one's.
 local Signature = '\137PNG\r\n\26\n'
 
@@ -541,3 +622,12 @@ workload('readDDS', function() return magick.readDDS(encodedDds) end)
 workload('readBMP', function() return magick.readBMP(bitmap) end)
 workload('readTGA', function() return magick.readTGA(targa) end)
 workload('readTGA packets', function() return magick.readTGA(packedTarga) end)
+
+-- The process's high-water resident set, read once after the last workload. It is the largest the
+-- whole process has been, not what one workload needed: Luau reports no per-workload peak.
+if not recording then
+  local status = if jess.granted('filesystem.read') then proc '/proc/self/status' else nil
+  local peak = if status then string.match(status, 'VmHWM:%s*(%d+) kB') else nil
+
+  print(`# peak resident set: {if peak then peak .. ' kB' else 'not recorded, grant filesystem.read to read /proc'}`)
+end
