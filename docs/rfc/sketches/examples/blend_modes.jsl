@@ -1,6 +1,7 @@
 --!strict
 -- RFC-0001 section 8 (W9): one worked value per 0.2.0 blend mode, on opaque pixels, backdrop 0.5 and
--- source 0.25 in straight channels. Then one off-center value per branch of overlap and soft-light.
+-- source 0.25 in straight channels. Then off-center values for the overlap branch, and for both soft-light
+-- branches (the cs > 1/2 branch with D(x) at x <= 1/4 and at x > 1/4). tests/rfc.jsl asserts the same values.
 -- Run: jess run --package . docs/rfc/sketches/examples/blend_modes.jsl
 local color = require '../color'
 
@@ -18,6 +19,7 @@ local expectations: { { mode: color.BlendMode, backdrop: number, source: number,
   { mode = 'soft-light', backdrop = 0.5, source = 0.25, value = 0.375 },
   { mode = 'overlay', backdrop = 0.75, source = 0.25, value = 0.625 },
   { mode = 'soft-light', backdrop = 0.5, source = 0.75, value = 0.5 + 0.5 * (math.sqrt(0.5) - 0.5) },
+  { mode = 'soft-light', backdrop = 0.2, source = 0.75, value = 0.324 },
 }
 
 for _, case in expectations do
