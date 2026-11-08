@@ -48,6 +48,11 @@ jobs:
           jess run --package . --capability filesystem.read --capability filesystem.write
           tools/gallery.jsl target/gallery-b
 
+      - name: Gallery reports the verified build it ran on
+        run: |
+          grep -q '"verified": true' target/gallery-a/report.json
+          grep -q '"jess": "0.3.0"' target/gallery-a/report.json
+
       - name: Gallery runs are byte-identical
         run: |
           cmp target/gallery-a/report.json target/gallery-b/report.json
