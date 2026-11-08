@@ -1,0 +1,36 @@
+--!strict
+--[[
+@magick/brush: 0.4.0+ SKETCH (MAG-030 and MAG-031 territory). NOT part of 0.2.0. Every function is
+a STUB. It is here so the 0.2.0 paint and color types are checked against a brush that needs them.
+
+A brush is a stamp: a dab is a coverage tile at a position with a paint. Dab randomness is not a
+mutable generator. Each value comes from the stable hash of (seed, node, stroke, dab, sample)
+(RFC-0001 section 10), so a dab's pixels do not depend on the order or the worker that drew it.
+]]
+
+local paint = require './paint'
+
+local Brush = {}
+
+export type Paint = paint.Paint
+
+--- One stamp along a stroke. `spacing` is a fraction of the tip's width.
+export type Dab = { x: number, y: number, radius: number, angle: number, pressure: number }
+
+--- A brush: a tip, a spacing, and the paint it lays down. Immutable once made.
+export type Brush = { tipRadius: number, spacing: number, paint: Paint, maxDabs: number }
+
+--- Limits, checked where a stroke is made. A stroke above MaxDabs fails with a reason.
+Brush.MaxDabs = 65536
+
+--- Stub: a brush from a tip radius, a spacing fraction and a paint.
+function Brush.new(tipRadius: number, spacing: number, paint: Paint): Brush
+  error('magick: sketch stub, not implemented before 0.4.0', 2)
+end
+
+--- Stub: the dabs a path of points lays down, in stroke order.
+function Brush.dabs(brush: Brush, points: { { number } }, seed: number): { Dab }
+  error('magick: sketch stub, not implemented before 0.4.0', 2)
+end
+
+return Brush

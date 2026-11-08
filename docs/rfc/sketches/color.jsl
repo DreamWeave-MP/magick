@@ -1,0 +1,102 @@
+--!strict
+--[[
+@magick/color (0.2.0), SKETCH of RFC-0001 sections 6 and 7.
+
+Everything with a body here is a REFERENCE for the arithmetic the RFC fixes: byte rounding,
+premultiplication through an f32 store, straight conversion with the transparent-RGB policy,
+and the Porter-Duff factors. Each is short enough to read in full, and the examples check them.
+Everything in the Working section that touches images is a STUB and is not implemented.
+
+Working tiles are premultiplied, RGBA, f32 per channel (16 bytes a pixel), rows from the top.
+Space is 'srgb' (encoded values, the default: it matches legacy Image and the W3C algebra as
+browsers apply it) or 'linear' (sRGB transfer removed before compositing, encoded again on output).
+]]
+
+local Color = {}
+
+export type Space = 'srgb' | 'linear'
+
+--- A premultiplied working tile. `data` holds width * height * 4 f32 values.
+export type Working = { width: number, height: number, space: Space, data: buffer }
+
+export type Operator =
+  'clear' | 'src' | 'dst' | 'src-over' | 'dst-over' | 'src-in' | 'dst-in'
+  | 'src-out' | 'dst-out' | 'src-atop' | 'dst-atop' | 'xor'
+
+--- The separable blend modes 0.2.0 ships. Every other name is rejected with
+--- `magick: unknown blend mode <name>`; nonseparable modes are not in 0.2.0.
+export type BlendMode = 'normal' | 'multiply' | 'screen' | 'overlay' | 'darken' | 'lighten' | 'soft-light'
+
+--- A straight byte: clamped to 0..255, rounded half up. RFC section 7.
+function Color.byte(value: number): number
+  return math.floor(math.clamp(value, 0, 255) + 0.5)
+end
+
+--- A channel in 0..1 as the byte a straight RGBA8 image stores. Alpha uses the same rule.
+function Color.unitByte(value: number): number
+  return math.floor(math.clamp(value, 0, 1) * 255 + 0.5)
+end
+
+--- Premultiplies one straight byte channel by its byte alpha. The product is stored through an
+--- f32 buffer, as a working tile stores it, and read back, so the reference matches the tile.
+--- Returns the stored premultiplied channel and the stored alpha.
+function Color.premultiply(channel: number, alpha: number, scratch: buffer): (number, number)
+  buffer.writef32(scratch, 0, (channel / 255) * (alpha / 255))
+  buffer.writef32(scratch, 4, alpha / 255)
+
+  return buffer.readf32(scratch, 0), buffer.readf32(scratch, 4)
+end
+
+--- Straight output of one stored pixel. Clamps premultiplied channels to 0..alpha first. A
+--- pixel whose alpha byte is 0 stores RGB 0: the transparent-RGB policy.
+function Color.straight(premultipliedRed: number, premultipliedGreen: number, premultipliedBlue: number, alpha: number): (number, number, number, number)
+  local alphaByte = Color.unitByte(alpha)
+
+  if alphaByte == 0 then return 0, 0, 0, 0 end
+
+  local clampedAlpha = math.clamp(alpha, 0, 1)
+
+  local function channel(value: number): number
+    return Color.unitByte(math.clamp(value, 0, clampedAlpha) / clampedAlpha)
+  end
+
+  return channel(premultipliedRed), channel(premultipliedGreen), channel(premultipliedBlue), alphaByte
+end
+
+--- W3C Porter-Duff factors (Compositing and Blending Level 1, section 5.1): the source and
+--- backdrop multipliers for premultiplied colors. Result color is cs * fa + cb * fb, result
+--- alpha is as * fa + ab * fb.
+function Color.factors(operator: Operator, sourceAlpha: number, backdropAlpha: number): (number, number)
+  if operator == 'clear' then return 0, 0 end
+  if operator == 'src' then return 1, 0 end
+  if operator == 'dst' then return 0, 1 end
+  if operator == 'src-over' then return 1, 1 - sourceAlpha end
+  if operator == 'dst-over' then return 1 - backdropAlpha, 1 end
+  if operator == 'src-in' then return backdropAlpha, 0 end
+  if operator == 'dst-in' then return 0, sourceAlpha end
+  if operator == 'src-out' then return 1 - backdropAlpha, 0 end
+  if operator == 'dst-out' then return 0, 1 - sourceAlpha end
+  if operator == 'src-atop' then return backdropAlpha, 1 - sourceAlpha end
+  if operator == 'dst-atop' then return 1 - backdropAlpha, sourceAlpha end
+
+  return 1 - backdropAlpha, 1 - sourceAlpha
+end
+
+--- Stub: the working tile a straight RGBA8 image becomes (premultiplied, space as given).
+--- The image's pixels with alpha 0 lose their RGB; the legacy image keeps it.
+function Color.fromImage(image: { width: number, height: number, data: buffer }, space: Space): Working
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+--- Stub: straight RGBA8 output of a working tile, the only way a tile leaves the module.
+function Color.toImage(working: Working): { width: number, height: number, data: buffer }
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+--- Stub: porter-duff compositing of one tile over another in place, with the operator's factors
+--- and an opacity in 0..1 applied to the source. Clamps as RFC section 7 says.
+function Color.composite(destination: Working, source: Working, operator: Operator, opacity: number?): Working
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+return Color

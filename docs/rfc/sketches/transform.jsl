@@ -1,0 +1,124 @@
+--!strict
+--[[
+@magick/transform (0.2.0), SKETCH of RFC-0001 section 3.
+
+Column vectors. A matrix maps a point (pointX, pointY) to
+(scaleX * pointX + skewX * pointY + offsetX, skewY * pointX + scaleY * pointY + offsetY).
+Its six fields are SVG's matrix(a b c d e f) in order: a = scaleX, b = skewY, c = skewX,
+d = scaleY, e = offsetX, f = offsetY.
+multiply(first, second) is first o second: second is applied to a point first.
+So T*S*R in the RFC means: rotate, then scale, then translate.
+
+The arithmetic below is a REFERENCE for checking the convention and is small enough to be
+read in full. It is not the 0.2.0 module. The bounds and singular-handling rules are stated in
+the RFC and are the contract; the stub at the bottom is not implemented.
+]]
+
+local Transform = {}
+
+--- A 2x3 affine matrix. Values are immutable by convention: every function returns a new table.
+export type Matrix = {
+  scaleX: number,
+  skewY: number,
+  skewX: number,
+  scaleY: number,
+  offsetX: number,
+  offsetY: number,
+}
+
+--- The identity matrix.
+function Transform.identity(): Matrix
+  return { scaleX = 1, skewY = 0, skewX = 0, scaleY = 1, offsetX = 0, offsetY = 0 }
+end
+
+function Transform.translate(offsetX: number, offsetY: number): Matrix
+  return { scaleX = 1, skewY = 0, skewX = 0, scaleY = 1, offsetX = offsetX, offsetY = offsetY }
+end
+
+function Transform.scale(scaleX: number, scaleY: number?): Matrix
+  return { scaleX = scaleX, skewY = 0, skewX = 0, scaleY = scaleY or scaleX, offsetX = 0, offsetY = 0 }
+end
+
+--- Rotation by radians; positive turns +x toward +y, which is clockwise on screen (y down).
+function Transform.rotate(radians: number): Matrix
+  local cosine, sine = math.cos(radians), math.sin(radians)
+
+  return { scaleX = cosine, skewY = sine, skewX = -sine, scaleY = cosine, offsetX = 0, offsetY = 0 }
+end
+
+--- `first` o `second`: the point goes through `second`, then `first`.
+function Transform.multiply(first: Matrix, second: Matrix): Matrix
+  return {
+    scaleX = first.scaleX * second.scaleX + first.skewX * second.skewY,
+    skewY = first.skewY * second.scaleX + first.scaleY * second.skewY,
+    skewX = first.scaleX * second.skewX + first.skewX * second.scaleY,
+    scaleY = first.skewY * second.skewX + first.scaleY * second.scaleY,
+    offsetX = first.scaleX * second.offsetX + first.skewX * second.offsetY + first.offsetX,
+    offsetY = first.skewY * second.offsetX + first.scaleY * second.offsetY + first.offsetY,
+  }
+end
+
+function Transform.apply(matrix: Matrix, pointX: number, pointY: number): (number, number)
+  return
+    matrix.scaleX * pointX + matrix.skewX * pointY + matrix.offsetX,
+    matrix.skewY * pointX + matrix.scaleY * pointY + matrix.offsetY
+end
+
+function Transform.determinant(matrix: Matrix): number
+  return matrix.scaleX * matrix.scaleY - matrix.skewY * matrix.skewX
+end
+
+--- Singular when the determinant is zero, or small against the square of the linear part's
+--- largest entry (1e-12 relative). Nonfinite entries are rejected before this is asked.
+function Transform.isSingular(matrix: Matrix): boolean
+  local largest = math.max(
+    math.abs(matrix.scaleX),
+    math.abs(matrix.skewY),
+    math.abs(matrix.skewX),
+    math.abs(matrix.scaleY)
+  )
+  local determinant = Transform.determinant(matrix)
+
+  return determinant == 0 or math.abs(determinant) <= 1e-12 * largest * largest
+end
+
+--- The largest singular value of the linear part. Flattening divides a device tolerance by it,
+--- so that after the transform no point strays farther than the device tolerance.
+--- Closed form: sqrt((S + sqrt(S*S - 4*det*det)) / 2) with S the sum of the four squares. The
+--- identity gives exactly 1, so a tolerance divided by it is the legacy tolerance.
+function Transform.sigmaMax(matrix: Matrix): number
+  local sumOfSquares = matrix.scaleX * matrix.scaleX
+    + matrix.skewY * matrix.skewY
+    + matrix.skewX * matrix.skewX
+    + matrix.scaleY * matrix.scaleY
+  local determinant = Transform.determinant(matrix)
+  local spread = math.sqrt(math.max(0, sumOfSquares * sumOfSquares - 4 * determinant * determinant))
+
+  return math.sqrt((sumOfSquares + spread) / 2)
+end
+
+--- The inverse. Errors on a singular matrix rather than returning one that maps everything to
+--- a line, so a caller can never raster through a degenerate transform by accident.
+function Transform.inverse(matrix: Matrix): Matrix
+  if Transform.isSingular(matrix) then error('magick: transform is singular', 2) end
+
+  local determinant = Transform.determinant(matrix)
+
+  return {
+    scaleX = matrix.scaleY / determinant,
+    skewY = -matrix.skewY / determinant,
+    skewX = -matrix.skewX / determinant,
+    scaleY = matrix.scaleX / determinant,
+    offsetX = (matrix.skewX * matrix.offsetY - matrix.scaleY * matrix.offsetX) / determinant,
+    offsetY = (matrix.skewY * matrix.offsetX - matrix.scaleX * matrix.offsetY) / determinant,
+  }
+end
+
+--- Stub: the conservative device bounds of a point set, the box of the control points that the
+--- curves in a path lie inside (convex hull property), inflated by a stroke half width times
+--- sigmaMax. Not implemented in the sketch.
+function Transform.bounds(matrix: Matrix, points: { number }, strokeHalfWidth: number): (number, number, number, number)
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+return Transform
