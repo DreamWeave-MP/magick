@@ -10,6 +10,7 @@
 -- check is coarse. A shift of a fraction of a pixel moves an area by less than the tolerance, so
 -- the area checks catch gross geometry errors only; the exact pixels here and the scene
 -- fingerprints are what catch a small shift.
+local fs = require '@dream/fs'
 local gallery = require './gallery_check'
 local goldens = require './goldens'
 local json = require '@jess/json'
@@ -850,6 +851,29 @@ suite.describe('gallery', function()
     expect(decoded.scenes[1].matches).toBe(true)
     expect(decoded.scenes[2].pixels.observed).toBe(support.pixels(rect))
     expect(json.encodeTable(decoded, { indent = 2 })).toBe(text)
+  end)
+
+  suite.it('decodes every committed baseline PNG to the pixels and bytes its record names', function()
+    -- Needs filesystem.read: `jess package test . --capability filesystem.read`, as CI runs it.
+    for _, candidate in scenes.scenes do
+      local bytes = fs.readFile(`tests/gallery/{candidate.name}.png`) :: buffer
+      local decoded = magick.readPNG(bytes)
+
+      expect(support.pixels(decoded)).toBe(scenes.recorded[`{candidate.name} pixels`])
+      expect(support.digest(bytes)).toBe(scenes.recorded[`{candidate.name} png`])
+    end
+  end)
+
+  suite.it('refuses an output folder inside the baseline folder, and only that', function()
+    expect(gallery.within('tests/gallery', 'tests/gallery')).toBe(true)
+    expect(gallery.within('tests/gallery/', 'tests/gallery')).toBe(true)
+    expect(gallery.within('./tests//gallery/../gallery', 'tests/gallery')).toBe(true)
+    expect(gallery.within('tests\\gallery\\x', 'tests/gallery')).toBe(true)
+    expect(gallery.within('tests/gallery/x/y', 'tests/gallery')).toBe(true)
+    expect(gallery.within('tests/galleryx', 'tests/gallery')).toBe(false)
+    expect(gallery.within('tests', 'tests/gallery')).toBe(false)
+    expect(gallery.within('target/gallery', 'tests/gallery')).toBe(false)
+    expect(gallery.within('tests/gallery/../other', 'tests/gallery')).toBe(false)
   end)
 
   suite.it('refuses a report cut short, or one that lost a closing brace', function()

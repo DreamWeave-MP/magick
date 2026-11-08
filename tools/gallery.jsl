@@ -40,6 +40,34 @@ end
 local folder = first or 'target/gallery'
 local rebaselining = second == 'rebaseline'
 
+--- Where a path really is: its canonical form when it exists, or its nearest existing ancestor's
+--- canonical form with the rest appended. nil when nothing above it exists.
+local function resolve(path: string): string?
+  local canonical = fs.canonicalize(path)
+
+  if canonical then return canonical end
+
+  local parent = fs.parent(path)
+
+  if not parent or parent == path or parent == '' then return nil end
+
+  local above = resolve(parent)
+
+  if not above then return nil end
+
+  return fs.join(above, fs.fileName(path))
+end
+
+--- Whether a folder is the baseline folder or inside it, by its name or by where it really is,
+--- so a symbolic link into tests/gallery is caught too.
+local function intoBaseline(folder: string): boolean
+  if gallery.within(folder, Baseline) then return true end
+
+  local resolved, baseline = resolve(folder), resolve(Baseline)
+
+  return resolved ~= nil and baseline ~= nil and gallery.within(resolved, baseline)
+end
+
 --- The baseline file of a scene, as bytes, or nil when there is none.
 local function baselineBytes(name: string): buffer?
   -- pcall only around the read of a file that may be missing: a missing baseline is a finding the
@@ -55,6 +83,19 @@ local scenes = scenesModule.scenes
 local rows: { gallery.Row } = {}
 local failures = 0
 
+if not rebaselining and intoBaseline(folder) then
+  error(`gallery: {folder} is the baseline folder: a check writes its output elsewhere, and only rebaseline writes tests/gallery. {Usage}`, 0)
+end
+
+-- Every baseline is read before anything is written, so a check never compares a file it wrote.
+local baselines: { [string]: buffer? } = {}
+
+if not rebaselining then
+  for _, candidate in scenes do
+    baselines[candidate.name] = baselineBytes(candidate.name)
+  end
+end
+
 print(`gallery: {#scenes} scenes, {if rebaselining then 'rebaselining' else 'checking'}`)
 
 for _, candidate in scenes do
@@ -68,7 +109,7 @@ for _, candidate in scenes do
   else
     fs.writeFile(`{folder}/{candidate.name}.png`, png, { atomic = true, createParents = true })
 
-    local row = gallery.compare(candidate.name, scenesModule.recorded, image, png, baselineBytes(candidate.name))
+    local row = gallery.compare(candidate.name, scenesModule.recorded, image, png, baselines[candidate.name])
 
     table.insert(rows, row)
 
