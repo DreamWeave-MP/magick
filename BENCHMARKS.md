@@ -35,7 +35,7 @@ the runtime, and neither is the commit of the package, so a record names both by
 - the `#` lines the run printed, unedited;
 - the command line, and the build's toolchain: a run refuses a build without the verified one.
 
-The `# peak resident set` line is the process's high-water mark at the end of the run, `VmHWM`
+The `# peak resident set (VmHWM)` line is the process's high-water mark at the end of the run, `VmHWM`
 from `/proc/self/status`. It is the largest the whole process has been, not what one workload
 needed: Luau reports no per-workload peak, and `collectgarbage('count')` reports what is live, not
 what was. A per-workload peak needs sampling from outside the script (`/usr/bin/time -v` around a
@@ -62,6 +62,13 @@ lock, and read as the median of the runs' medians:
 5. Compare rows only within one set of runs, and quote the provenance of that set.
 
 ### Gates
+
+Continuous integration does not run these gates as of this branch. The workflow here
+(`.github/workflows/build_site.yml`) calls StroggForge's `modGlobalBuild.yml` at `v69`, and that
+workflow's `jess workspace run --trusted` steps are the template's `dreamweave-check`,
+`dreamweave-build`, `dreamweave-site`, `dreamweave-links` and `dreamweave-release` targets; none is
+`jess package test .`. Running the gate suite in CI is a follow-up, and until a CI run shows it
+the claim is unverified.
 
 These run without writing anything, except where a line says otherwise:
 

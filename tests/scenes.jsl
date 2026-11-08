@@ -1,14 +1,15 @@
 --!strict
 -- The reference scenes of the visual gates: small images drawn through the public API, each one
--- built from explicit colors and geometry so its pixels can be worked out by hand. The gate suite
--- (tests/gate.jsl) holds every scene to the pixels its comments derive, and to the fingerprints
--- recorded below; tools/gallery.jsl renders the same scenes to PNG and holds them to the baseline
--- files in tests/gallery/.
+-- built from explicit colors and geometry so its pixels can be worked out by hand. tools/gallery.jsl
+-- renders the same scenes to PNG and holds them to the baseline files in tests/gallery/.
 --
--- The fingerprints are regression locks, not oracles: each was recorded by
+-- The fingerprints are regression locks, not oracles. Each was recorded by
 -- `jess run --package . --capability filesystem.read --capability filesystem.write tools/gallery.jsl
--- rebaseline` on the 0.2.0 development tree, after the hand-derived checks in tests/gate.jsl held
--- for the same scene. A change that moves one is a visual change and needs a reviewed rebaseline.
+-- rebaseline` on the 0.2.0 development tree. Only some pixels are derived by hand, in
+-- tests/gate.jsl, and only at the points its tests name: `curves` at three points and by area,
+-- `clipped circle` by area alone, and the rest at the points listed there. Every other pixel of a
+-- scene is held by its fingerprint alone, so the fingerprint says the tree drew this, not that it
+-- drew the right thing. A change that moves one is a visual change and needs a reviewed rebaseline.
 local magick = require '@magick'
 local path = require '@magick/path'
 local support = require './support'

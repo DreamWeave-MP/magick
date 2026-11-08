@@ -10,9 +10,11 @@ What 0.1.x promises consumers, and what it keeps as it always did, is in [COMPAT
 
 `tests/gate.jsl` holds the package to tiny exact fixtures (transparency, clipping, alpha, curves,
 holes, gradients, line caps), to the reference scenes of `tests/scenes.jsl` at the pixels their
-comments derive, and to empty and one-pixel-wide images. Every value is exact except area, which
-a flattened curve or circle holds to a quarter pixel, declared in the suite. `jess package test .`
-writes nothing.
+comments derive, to empty and one-pixel-wide images, and to the value of grayscale and setAlpha at
+those sizes. Every value is exact except area: a flattened curve or circle is compared with its
+analytic area within a quarter pixel, declared in the suite. That is a coarse check, since a shift
+of a fraction of a pixel moves an area by less than a quarter pixel. The exact pixels and the scene
+fingerprints are what catch a small shift. `jess package test .` writes nothing.
 
 `tools/gallery.jsl` renders the same scenes to PNG and compares them with recorded checksums and
 baseline files, reporting the first differing pixel. It needs both filesystem capabilities, and

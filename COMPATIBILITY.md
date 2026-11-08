@@ -7,7 +7,7 @@ suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and 
 
 Measured against: `jess` 0.3.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
-- `jess package test .`: 346 passed, 0 failed (182 of them before `tests/compat.jsl` was added, and 72 in `tests/gate.jsl`).
+- `jess package test .`: 366 passed, 0 failed (182 of them before `tests/compat.jsl` was added, and 92 in `tests/gate.jsl`).
 - `jess package check .`: no errors, strict types over every `.jsl`.
 - `jess run --package . bench/bench.jsl`: all 98 workloads ran and held their fingerprints (91 of them before the gate rows).
 
@@ -218,7 +218,17 @@ Each of these would break a consumer, so none happens inside 0.1.x:
 A change that needs any of these goes into a new minor version as an opt-in, with the old
 behavior kept under its old name.
 
+## Known legacy behaviour
+
+These are what 0.1.3 does, kept as they are and pinned by the suites, not endorsed as correct:
+
+- `Image:rotate` of a 0 by 0 image returns a 2 by 1 image of 8 bytes, where `rotate90` of the same
+  image returns 0 by 0. Nothing about an empty image is promised here. The gate suite pins the
+  2 by 1 result as a defect (`tests/gate.jsl`, "pins the rotate of nothing as the legacy defect it
+  is"), so a fix changes that test and this entry together.
+
 ## Where the proof lives
+
 
 - `tests/basic.jsl`: every operation on seeded fixtures, held to the goldens in
   `tests/goldens.jsl` (the geometry and CRC-32 of each result, as imported).
@@ -228,5 +238,7 @@ behavior kept under its old name.
 - `tests/gate.jsl`: tiny exact fixtures, the reference scenes of `tests/scenes.jsl` and empty and
   one-pixel images. `tools/gallery.jsl` renders the scenes to PNG and checks them against
   `tests/gallery/`.
+  `tests/gallery_check.jsl` is the gallery's comparison and report, held to a round trip and to
+  a report cut short.
 - `bench/bench.jsl`: every workload, held to its fingerprint; methodology and the reference table
   are in `BENCHMARKS.md`.
