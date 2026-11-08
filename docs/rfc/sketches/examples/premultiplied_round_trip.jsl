@@ -26,3 +26,5 @@ assert(zeroRed == 0 and zeroGreen == 0 and zeroBlue == 0 and zeroAlpha == 0, 'al
 
 print('round trip exact for', checked, 'premultiplied values with alpha 1..255, with distinct red and green values')
 print('alpha 0 stores', zeroRed, zeroGreen, zeroBlue, zeroAlpha)
+
+return true

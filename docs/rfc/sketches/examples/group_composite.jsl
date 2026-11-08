@@ -30,3 +30,5 @@ local multiplied = color.blendPixel('multiply', 'src-over', childRed, white, 1)
 assert(multiplied.red == 1 and multiplied.green == 0 and multiplied.blue == 0 and multiplied.alpha == 1,
   'multiply of red over white is red')
 print('multiply group on white', multiplied.red, multiplied.green, multiplied.blue)
+
+return true

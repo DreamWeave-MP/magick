@@ -761,6 +761,23 @@ suite.describe('property samples with a fixed seed', function()
     end
   end)
 
+  suite.it('weights a mix by its position: at 1/4, the alpha of 1 and 1/2 mixes to 7/8', function()
+    -- alpha = 1 * (1 - 1/4) + 0.5 * (1/4) = 0.75 + 0.125 = 0.875. A swapped weighting would give 0.625.
+    local mixed = paint.mixStop({ offset = 0, red = 1, green = 0, blue = 0, alpha = 1 }, { offset = 1, red = 0, green = 0, blue = 1, alpha = 0.5 }, 0.25)
+
+    expect(near(mixed.alpha, 0.875, 1e-12)).toBe(true)
+  end)
+
+  suite.it('runs each worked example, so its asserts are part of the gate', function()
+    -- Each example is a script whose asserts are its checks; requiring it runs them. A failed assert is a failed test.
+    require '../docs/rfc/sketches/examples/transform_order'
+    require '../docs/rfc/sketches/examples/premultiplied_round_trip'
+    require '../docs/rfc/sketches/examples/blend_modes'
+    require '../docs/rfc/sketches/examples/group_composite'
+
+    expect(true).toBe(true)
+  end)
+
   suite.it('mixes stops within their range: the mix of two colours stays between them, per channel', function()
     local random = sampler(555)
 

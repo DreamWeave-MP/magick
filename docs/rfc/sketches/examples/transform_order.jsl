@@ -36,3 +36,5 @@ print('cubic box', cubicLeft, cubicTop, cubicRight, cubicBottom)
 local refused = not pcall(transform.inverse, transform.scale(0, 1))
 assert(refused, 'singular inverse must fail')
 print('singular inverse refused')
+
+return true
