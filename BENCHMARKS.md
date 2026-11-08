@@ -17,6 +17,91 @@ jess run --package jpk/magick jpk/magick/bench/bench.jsl [filter]
 
 It refuses a build without the verified toolchain.
 
+## Measuring now
+
+Every table in this file below this section is a historical record. It says what one build did on
+one machine on the date it names, and it is not a measurement of the package as it stands. Measure
+again before quoting a number, and quote a number only with the provenance of its own run.
+
+### Provenance
+
+A run of `bench/bench.jsl` prints its provenance before the first workload, as lines starting with
+`#`: the jess version and whether its toolchain is verified, the start time in UTC, and the machine
+(CPU model, logical processors, kernel). The machine lines need `--capability filesystem.read`,
+which lets the bench read `/proc`; without it the line says so. Luau's version is not exposed by
+the runtime, and neither is the commit of the package, so a record names both by hand:
+
+- the package commit, `git rev-parse --short HEAD`, and whether the tree was clean;
+- the `#` lines the run printed, unedited;
+- the command line, and the build's toolchain: a run refuses a build without the verified one.
+
+The `# peak resident set (VmHWM)` line is the process's high-water mark at the end of the run, `VmHWM`
+from `/proc/self/status`. It is the largest the whole process has been, not what one workload
+needed: Luau reports no per-workload peak, and `collectgarbage('count')` reports what is live, not
+what was. A per-workload peak needs sampling from outside the script (`/usr/bin/time -v` around a
+single workload's run, or a sampler of `/proc/<pid>/status`), and the bench does not do it.
+
+### Controlled A/B
+
+Two builds of the package are compared by turns, on the same machine, inside one hold of its bench
+lock, and read as the median of the runs' medians:
+
+1. Check that the jess is verified: `jess --version` has no unverified suffix.
+2. Make a worktree of the base, `git worktree add ../magick-base <base>`, and keep the head where it
+   is.
+3. Run the bench from inside each tree, one at a time, in the order base, head, head, base, base,
+   head, each under a memory cap:
+
+   ```sh
+   systemd-run --user --scope -q -p MemoryMax=3G -p MemorySwapMax=0 \
+     jess run --package . --capability filesystem.read bench/bench.jsl [filter]
+   ```
+
+4. Take each row's median across the runs, and call a difference under about 5 percent noise. The
+   machine is shared, so the same comparison on another day is a new measurement.
+5. Compare rows only within one set of runs, and quote the provenance of that set.
+
+### Gates
+
+The gates run in continuous integration by `.github/workflows/tests.yml`, which this package owns.
+That workflow is UNEXECUTED until its first run on GitHub: nothing in it has run, and it is not green
+until a run shows it is. It installs jess `v0.3.0`, the DreamWeave-MP/jess release, from its Linux
+asset through StroggForge's `jess-setup` action at `v70`, and runs `jess package test .`,
+`jess package check .`, the gallery twice with a byte comparison of its reports and PNGs, and a
+check that the gallery refuses `tests/gallery`. The site build in `build_site.yml` runs none of these:
+its StroggForge workflow at `v69` runs only the template's `dreamweave-check`, build, site, links and
+release targets. Benchmarks are not in CI.
+
+These run without writing anything, except where a line says otherwise:
+
+```sh
+jess package test .    # every suite, including tests/gate.jsl
+jess package check .   # strict types over every .jsl, tools/ included
+```
+
+The gallery renders the reference scenes of `tests/scenes.jsl` to PNG files and checks them against
+their recorded CRC-32s and against their baseline PNGs in `tests/gallery/`. It writes only under the
+folder it is given, and it needs both filesystem capabilities:
+
+```sh
+jess run --package . --capability filesystem.read --capability filesystem.write \
+  tools/gallery.jsl target/gallery
+```
+
+It exits 1 when a scene differs, and `target/gallery/report.json` says where: the expected and
+observed checksums of the pixels and of the file, the geometry, and the first pixel that differs
+from the baseline. The report has no times and no paths, so two runs of the same runtime write the
+same bytes; check that with `cmp` on two folders.
+
+Re-baselining is a separate, reviewed action. The same command with `rebaseline` as its last
+argument writes `tests/gallery/<name>.png` and prints the lines for the table in `tests/scenes.jsl`.
+Paste those lines, review the PNGs and the diff, and commit them with the change that moved the
+scenes. Nothing else rewrites a baseline.
+
+The gate rows of the bench are `jess run --package . --capability filesystem.read bench/bench.jsl
+gate`. A new row's fingerprint is recorded with `bench/bench.jsl <filter> record`, which prints the
+lines for its table, and is checked on every later run.
+
 ## l3i 2.0: before and after
 
 2026-10-13, Intel Core i7-10870H @ 2.20GHz, a verified release build of Jess on l3i 2.0.2 (Luau

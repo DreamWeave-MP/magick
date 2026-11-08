@@ -1,0 +1,147 @@
+--!strict
+-- The gallery of @magick's reference scenes (tests/scenes.jsl): each scene is rendered, written
+-- as a PNG, and checked against the fingerprints recorded for it and against its baseline PNG in
+-- tests/gallery/. A check writes the PNGs and a report.json of every comparison into the output
+-- folder. The comparison and the report are tests/gallery_check.jsl's, which the package suite
+-- holds; this script only reads and writes files.
+--
+--   jess run --package . --capability filesystem.read --capability filesystem.write \
+--     tools/gallery.jsl [outDir] [rebaseline]
+--
+-- Run it from the package's folder. Without `rebaseline` it writes only under outDir and fails
+-- when any scene differs from its record. `rebaseline` is the one action that changes the
+-- baseline: it writes tests/gallery/<name>.png for every scene and prints the lines for the table
+-- in tests/scenes.jsl. Review those files and lines in the diff before committing them. The
+-- arguments are exactly those two, in that order; anything else is refused.
+--
+-- Checksums are CRC-32 over the RGBA bytes (support.pixels) and over the encoded PNG file
+-- (support.digest), both from @dream/bytes.
+local fs = require '@dream/fs'
+local gallery = require '../tests/gallery_check'
+local magick = require '@magick'
+local scenesModule = require '../tests/scenes'
+local support = require '../tests/support'
+
+local Usage = 'usage: tools/gallery.jsl [outDir] [rebaseline]'
+local Baseline = 'tests/gallery'
+
+local first: string?, second: string?, extra: string? = ...
+
+if extra then error(`gallery: too many arguments. {Usage}`, 0) end
+
+if first == 'check' or first == 'rebaseline' then
+  error(`gallery: '{first}' is not an output folder or a command here: the folder comes first and rebaseline second. {Usage}`, 0)
+end
+
+if second and second ~= 'rebaseline' then
+  error(`gallery: unknown command '{second}'. {Usage}`, 0)
+end
+
+local folder = first or 'target/gallery'
+local rebaselining = second == 'rebaseline'
+
+--- Where a path really is: its canonical form when it exists, or its nearest existing ancestor's
+--- canonical form with the rest appended. nil when nothing above it exists.
+local function resolve(path: string): string?
+  local canonical = fs.canonicalize(path)
+
+  if canonical then return canonical end
+
+  local parent = fs.parent(path)
+
+  if not parent or parent == path or parent == '' then return nil end
+
+  local above = resolve(parent)
+
+  if not above then return nil end
+
+  return fs.join(above, fs.fileName(path))
+end
+
+--- Whether a folder is the baseline folder or inside it, by its name or by where it really is,
+--- so a symbolic link into tests/gallery is caught too.
+local function intoBaseline(folder: string): boolean
+  if gallery.within(folder, Baseline) then return true end
+
+  local resolved, baseline = resolve(folder), resolve(Baseline)
+
+  return resolved ~= nil and baseline ~= nil and gallery.within(resolved, baseline)
+end
+
+--- The baseline file of a scene, as bytes, or nil when there is none.
+local function baselineBytes(name: string): buffer?
+  -- pcall only around the read of a file that may be missing: a missing baseline is a finding the
+  -- report names, not a failure of the whole gallery.
+  local ok, bytes = pcall(fs.readFile, `{Baseline}/{name}.png`)
+
+  if ok then return bytes :: buffer end
+
+  return nil
+end
+
+local scenes = scenesModule.scenes
+local rows: { gallery.Row } = {}
+local failures = 0
+
+if not rebaselining and intoBaseline(folder) then
+  error(`gallery: {folder} is the baseline folder: a check writes its output elsewhere, and only rebaseline writes tests/gallery. {Usage}`, 0)
+end
+
+-- Every baseline is read before anything is written, so a check never compares a file it wrote.
+local baselines: { [string]: buffer? } = {}
+
+if not rebaselining then
+  for _, candidate in scenes do
+    baselines[candidate.name] = baselineBytes(candidate.name)
+  end
+end
+
+print(`gallery: {#scenes} scenes, {if rebaselining then 'rebaselining' else 'checking'}`)
+
+for _, candidate in scenes do
+  local image = candidate.render()
+  local png = magick.png(image)
+
+  if rebaselining then
+    fs.writeFile(`{Baseline}/{candidate.name}.png`, png, { atomic = true, createParents = true })
+    print(`  ['{candidate.name} pixels'] = '{support.pixels(image)}',`)
+    print(`  ['{candidate.name} png'] = '{support.digest(png)}',`)
+  else
+    fs.writeFile(`{folder}/{candidate.name}.png`, png, { atomic = true, createParents = true })
+
+    local row = gallery.compare(candidate.name, scenesModule.recorded, image, png, baselines[candidate.name])
+
+    -- The file as written is read back and held to the bytes that were compared: a runner that
+    -- wrote other bytes would pass on the record it checked, not on the file it left.
+    local stored = fs.readFile(`{folder}/{candidate.name}.png`) :: buffer
+
+    if support.digest(stored) ~= row.png.observed then row.matches = false end
+
+    table.insert(rows, row)
+
+    if row.matches then
+      print(`  ok    {candidate.name}`)
+    else
+      failures += 1
+      print(`  DIFF  {candidate.name}: pixels observed {row.pixels.observed}, recorded {row.pixels.expected}, baseline {row.baseline.pixels}; file observed {row.png.observed}, recorded {row.png.expected}, baseline {row.baseline.png}`)
+    end
+  end
+end
+
+if rebaselining then
+  print(`gallery: wrote {#scenes} baseline PNGs under {Baseline}; paste the lines above into tests/scenes.jsl`)
+
+  return
+end
+
+fs.writeFile(
+  `{folder}/report.json`,
+  gallery.report(rows, { jess = jess.version, verified = jess.bench.verified }, failures),
+  { atomic = true, createParents = true }
+)
+
+if failures > 0 then
+  error(`gallery: {failures} of {#scenes} scenes differ from their record: see {folder}/report.json`, 0)
+end
+
+print(`gallery: {#scenes} scenes match their record; report at {folder}/report.json`)

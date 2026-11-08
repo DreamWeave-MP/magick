@@ -1,0 +1,233 @@
+--!strict
+-- Properties that hold at every size, not at the sizes a reader picked: every operation in the
+-- sweep below returns the shape its contract gives, at every width and height from 0 to 17, and
+-- returns the same bytes twice from the same seeded input; and the gallery's comparer, fuzzed
+-- over 500 seeded cases, reports what a plain walk over the bytes finds. Nothing here reads a
+-- clock or a file, and every input is a function of its seed.
+local gallery = require './gallery_check'
+local magick = require '@magick'
+local path = require '@magick/path'
+local support = require './support'
+local test = require '@jess/test'
+
+local expect = test.expect
+local suite = test.new()
+
+type Image = support.Image
+type Shape = { width: number, height: number, data: buffer }
+
+--- The sizes the sweep covers, each dimension from 0 to this.
+local Largest = 17
+
+--- Whether a result has whole, non-negative geometry and a buffer of exactly its bytes.
+local function wellFormed(value: Shape, bytesPerPixel: number): boolean
+  if value.width < 0 or value.height < 0 then return false end
+  if value.width ~= math.floor(value.width) or value.height ~= math.floor(value.height) then return false end
+
+  return buffer.len(value.data) == value.width * value.height * bytesPerPixel
+end
+
+--- One operation of the sweep: its name, the bytes a pixel of its result takes (4 for an image, 1
+--- for a mask), and what it does to a seeded image of the size given.
+type Operation = { name: string, bytes: number, run: (image: Image) -> Shape }
+
+local Pattern = '#102030'
+
+local operations: { Operation } = {
+  { name = 'fill', bytes = 4, run = function(image: Image) return image:fill '#336699' end },
+  { name = 'set', bytes = 4, run = function(image: Image) return image:set(0, 0, 1, 2, 3, 4) end },
+  { name = 'clone', bytes = 4, run = function(image: Image) return image:clone() end },
+  { name = 'rect', bytes = 4, run = function(image: Image) return image:rect(0, 0, image.width, image.height, '#ff0000') end },
+  { name = 'rectOver', bytes = 4, run = function(image: Image) return image:rectOver(1, 1, 3, 3, '#ff000080') end },
+  { name = 'polygon', bytes = 4, run = function(image: Image) return image:polygon({ { 0, 0 }, { 9, 0 }, { 0, 9 } }, '#00ff00') end },
+  { name = 'polygonOver', bytes = 4, run = function(image: Image) return image:polygonOver({ { 0, 0 }, { 9, 0 }, { 0, 9 } }, '#00ff0080') end },
+  { name = 'circle', bytes = 4, run = function(image: Image) return image:circle(4, 4, 3, nil, '#00ff00') end },
+  { name = 'line', bytes = 4, run = function(image: Image) return image:line(0, 0, 9, 9, '#ffffff', 2) end },
+  { name = 'strokeRect', bytes = 4, run = function(image: Image) return image:strokeRect(0, 0, 9, 9, '#ffffff', 1) end },
+  { name = 'roundRect', bytes = 4, run = function(image: Image) return image:roundRect(0, 0, 9, 9, 2, '#ffffff') end },
+  { name = 'crop', bytes = 4, run = function(image: Image) return image:crop(3, 2, 1, 1) end },
+  { name = 'extent', bytes = 4, run = function(image: Image) return image:extent(image.width + 2, image.height + 1, 1, 0, '#000000') end },
+  { name = 'trim', bytes = 4, run = function(image: Image) return image:trim() end },
+  { name = 'rotate90', bytes = 4, run = function(image: Image) return image:rotate90(false) end },
+  { name = 'rotate', bytes = 4, run = function(image: Image) return image:rotate(45) end },
+  { name = 'resize', bytes = 4, run = function(image: Image) return image:resize(image.width * 2 + 1, image.height) end },
+  { name = 'resizeFit', bytes = 4, run = function(image: Image) return image:resizeFit(5, 5) end },
+  { name = 'scale', bytes = 4, run = function(image: Image) return image:scale(3, 2) end },
+  { name = 'roll', bytes = 4, run = function(image: Image) return image:roll(1, 1) end },
+  { name = 'over', bytes = 4, run = function(image: Image) return image:over(magick.new(2, 2, '#ffffff80'), 1, 1) end },
+  { name = 'overMask', bytes = 4, run = function(image: Image) return image:overMask(image:alphaMask(), '#f0e0c0') end },
+  { name = 'copyAlpha', bytes = 4, run = function(image: Image) return image:copyAlpha(magick.new(image.width, image.height, '#808080'), 'dstin') end },
+  { name = 'darken', bytes = 4, run = function(image: Image) return image:darken(magick.new(3, 3, '#405060'), 1, 1) end },
+  { name = 'screen', bytes = 4, run = function(image: Image) return image:screen(magick.new(3, 3, '#405060'), 1, 1) end },
+  { name = 'grayscale', bytes = 4, run = function(image: Image) return image:grayscale() end },
+  { name = 'threshold', bytes = 4, run = function(image: Image) return image:threshold(0.5) end },
+  { name = 'colorize', bytes = 4, run = function(image: Image) return image:colorize('#336699', 40) end },
+  { name = 'transparent', bytes = 4, run = function(image: Image) return image:transparent(Pattern) end },
+  { name = 'opaque', bytes = 4, run = function(image: Image) return image:opaque(Pattern, '#ff0000') end },
+  { name = 'setAlpha', bytes = 4, run = function(image: Image) return image:setAlpha(0.5) end },
+  { name = 'polynomial', bytes = 4, run = function(image: Image) return image:polynomial(1.5, -0.2) end },
+  { name = 'contrastStretch', bytes = 4, run = function(image: Image) return image:contrastStretch(1, 1) end },
+  { name = 'sigmoidalContrast', bytes = 4, run = function(image: Image) return image:sigmoidalContrast(5, 40) end },
+  { name = 'alphaMask', bytes = 1, run = function(image: Image) return image:alphaMask() end },
+  { name = 'gaussianBlur', bytes = 4, run = function(image: Image) return magick.gaussianBlur(image, 1.5) end },
+  { name = 'shadowed', bytes = 4, run = function(image: Image) return magick.shadowed(image, 40, 2, 1, 1) end },
+  { name = 'modulate', bytes = 4, run = function(image: Image) return magick.modulate(image, 120, 80) end },
+  { name = 'emboss', bytes = 4, run = function(image: Image) return magick.emboss(image, 1) end },
+  { name = 'tint', bytes = 4, run = function(image: Image) return magick.tint(image, '#ff8040', 60) end },
+  { name = 'montage', bytes = 4, run = function(image: Image) return magick.montage({ image, image }, 2) end },
+  -- Tiles a fixed 2 by 2 source over each target size. A zero-wide source throws today, which is
+  -- pinned on its own below rather than sampled here.
+  { name = 'tile', bytes = 4, run = function(image: Image) return magick.tile(image.width + 1, image.height, magick.new(2, 2, '#336699')) end },
+  { name = 'verticalGradient', bytes = 4, run = function(image: Image) return magick.verticalGradient(image.width, image.height, '#000000', '#ffffff') end },
+  { name = 'path fill', bytes = 4, run = function(image: Image) return path.new():circle(2, 2, 2):fill(image, '#ffffff') end },
+}
+
+suite.it('tiling a zero-wide source throws the legacy error, pinned as the defect it is', function()
+  -- pcall only around the tile that throws today: magick.tile over a source with no width reads past
+  -- its buffer (src/init.jsl). COMPATIBILITY.md records it; a fix changes this test on purpose.
+  local ok, failure = pcall(magick.tile, 1, 1, magick.new(0, 1))
+
+  expect(ok).toBe(false)
+  expect(string.find(tostring(failure), 'buffer access out of bounds', 1, true) ~= nil).toBe(true)
+end)
+
+suite.it('every operation returns the shape its contract gives at every size from 0x0 to 17x17', function()
+  for width = 0, Largest do
+    for height = 0, Largest do
+      for _, operation in operations do
+        local result = operation.run(support.noisy(width, height, 1000 + width * 31 + height))
+        local label = `{operation.name} {width}x{height}`
+
+        expect(`{label}: {wellFormed(result, operation.bytes)}`).toBe(`{label}: true`)
+      end
+    end
+  end
+end)
+
+suite.it('every operation returns the same bytes twice from the same seeded input at every size', function()
+  for width = 0, Largest do
+    for height = 0, Largest do
+      local seed = 2000 + width * 31 + height
+
+      for _, operation in operations do
+        local first = operation.run(support.noisy(width, height, seed))
+        local second = operation.run(support.noisy(width, height, seed))
+        local label = `{operation.name} {width}x{height}`
+        local same = first.width == second.width and first.height == second.height
+          and buffer.tostring(first.data) == buffer.tostring(second.data)
+
+        expect(`{label} repeats: {same}`).toBe(`{label} repeats: true`)
+      end
+    end
+  end
+end)
+
+--- The first pixel at which two same-size images differ, found by walking every channel of every
+--- pixel in order. An independent walk: it shares no code with the comparer.
+type Pixel = { column: number, row: number, expected: { number }, observed: { number } }
+
+local function naiveFirstPixel(expected: Image, observed: Image): Pixel?
+  for row = 0, expected.height - 1 do
+    for column = 0, expected.width - 1 do
+      local offset = (row * expected.width + column) * 4
+      local differs = false
+
+      for channel = 0, 3 do
+        if buffer.readu8(expected.data, offset + channel) ~= buffer.readu8(observed.data, offset + channel) then
+          differs = true
+        end
+      end
+
+      if differs then
+        return {
+          column = column,
+          row = row,
+          expected = { expected:get(column, row) },
+          observed = { observed:get(column, row) },
+        }
+      end
+    end
+  end
+
+  return nil
+end
+
+--- The first byte at which two buffers differ, walking the shorter one, or nil.
+local function naiveFirstByte(expected: buffer, observed: buffer): number?
+  local shared = math.min(buffer.len(expected), buffer.len(observed))
+
+  for offset = 0, shared - 1 do
+    if buffer.readu8(expected, offset) ~= buffer.readu8(observed, offset) then return offset end
+  end
+
+  if buffer.len(expected) ~= buffer.len(observed) then return shared end
+
+  return nil
+end
+
+suite.it('the gallery comparer agrees with a plain walk over 500 seeded cases', function()
+  local random = support.generator(7)
+  local cases = 500
+
+  for index = 1, cases do
+    local width, height = 1 + random(9), 1 + random(9)
+    local observed = support.noisy(width, height, 3000 + index)
+    local base: Image
+    local shape = random(3)
+
+    if shape == 0 then
+      base = support.noisy(width, height, 3000 + index)
+    elseif shape == 1 then
+      base = support.noisy(width, height, 3000 + index)
+      local at = random(width * height) * 4
+      local pixels = base.data
+
+      buffer.writeu8(pixels, at, (buffer.readu8(pixels, at) + 1 + random(254)) % 256)
+    else
+      base = support.noisy(1 + random(9), 1 + random(9), 4000 + index)
+    end
+
+    -- The baseline is a file: its bytes come from encoding the baseline image, or from encoding it
+    -- at level 0 so that only the bytes differ.
+    local baselineFile = if random(4) == 0 then magick.png(base, 0) else magick.png(base)
+    local recordedFor = if random(2) == 0 then observed else base
+    local recorded = {
+      ['fuzz pixels'] = support.pixels(recordedFor),
+      ['fuzz png'] = support.digest(magick.png(recordedFor)),
+    }
+    local png = magick.png(observed)
+    local row = gallery.compare('fuzz', recorded, observed, png, baselineFile)
+
+    local decoded = magick.readPNG(baselineFile)
+    local label = `case {index}`
+
+    expect(`{label} baseline geometry: {row.baseline.geometry ~= nil and row.baseline.geometry.width or -1}x{row.baseline.geometry ~= nil and row.baseline.geometry.height or -1}`)
+      .toBe(`{label} baseline geometry: {decoded.width}x{decoded.height}`)
+
+    if decoded.width == observed.width and decoded.height == observed.height then
+      local naive = naiveFirstPixel(decoded, observed)
+
+      expect(row.firstByte == nil).toBe(true)
+
+      if naive == nil then
+        expect(row.firstDifference == nil).toBe(true)
+      else
+        expect(row.firstDifference).toEqual(naive)
+      end
+    else
+      expect(row.firstDifference == nil).toBe(true)
+      expect(if row.firstByte then row.firstByte.offset else nil).toBe(naiveFirstByte(decoded.data, observed.data))
+    end
+
+    local pixelsEqual = buffer.tostring(decoded.data) == buffer.tostring(observed.data)
+      and decoded.width == observed.width and decoded.height == observed.height
+    local expectedMatch = pixelsEqual and support.digest(baselineFile) == recorded['fuzz png']
+      and support.pixels(decoded) == recorded['fuzz pixels']
+      and support.pixels(observed) == recorded['fuzz pixels']
+      and support.digest(png) == recorded['fuzz png']
+
+    expect(`{label} matches: {row.matches}`).toBe(`{label} matches: {expectedMatch}`)
+  end
+end)
+
+return suite
