@@ -1,0 +1,165 @@
+--!strict
+-- The gallery of @magick's reference scenes (tests/scenes.jsl): each scene is rendered, written
+-- as a PNG, and checked against the fingerprints recorded for it and against its baseline PNG in
+-- tests/gallery/. A check writes the PNGs and a report.json of every comparison into the output
+-- folder, with the expected and observed CRC-32 of the RGBA bytes and of the file, the geometry,
+-- and the first pixel that differs from the baseline. The report carries no times or paths of
+-- the machine, so the same runtime writes the same bytes twice.
+--
+--   jess run --package . --capability filesystem.read --capability filesystem.write \
+--     tools/gallery.jsl [outDir] [check|rebaseline]
+--
+-- Run it from the package's folder. `check` (the default) writes only under outDir and fails when
+-- any scene differs from its record. `rebaseline` is the one action that changes the baseline: it
+-- writes tests/gallery/<name>.png for every scene and prints the lines for the table in
+-- tests/scenes.jsl. Review those files and lines in the diff before committing them.
+--
+-- Checksums are CRC-32 over the RGBA bytes (support.pixels) and over the encoded PNG file
+-- (support.digest), both from @dream/bytes.
+local fs = require '@dream/fs'
+local json = require '@jess/json'
+local jessMagick = require '@magick'
+local scenesModule = require '../tests/scenes'
+local support = require '../tests/support'
+
+type Image = support.Image
+
+--- The first pixel at which a scene differs from its baseline.
+type Difference = { column: number, row: number, expected: { number }, observed: { number } }
+
+--- One scene's comparison, as the report holds it.
+type Row = {
+  scene: string,
+  geometry: { width: number, height: number },
+  pixels: { expected: string, observed: string },
+  png: { expected: string, observed: string },
+  baseline: { pixels: string, matches: boolean },
+  firstDifference: Difference?,
+  matches: boolean,
+}
+
+local outDir: string?, mode: string? = ...
+local folder = outDir or 'target/gallery'
+local rebaselining = mode == 'rebaseline'
+
+if mode and mode ~= 'check' and mode ~= 'rebaseline' then
+  error(`gallery: unknown mode '{mode}': use check or rebaseline`, 0)
+end
+
+local Baseline = 'tests/gallery'
+
+--- The first pixel, in row order, at which two images of the same geometry differ.
+local function firstDifference(expected: Image, observed: Image): Difference?
+  for row = 0, expected.height - 1 do
+    for column = 0, expected.width - 1 do
+      local offset = (row * expected.width + column) * 4
+      local expectedPixel = buffer.readu32(expected.data, offset)
+      local observedPixel = buffer.readu32(observed.data, offset)
+
+      if expectedPixel ~= observedPixel then
+        return {
+          column = column,
+          row = row,
+          expected = { expected:get(column, row) },
+          observed = { observed:get(column, row) },
+        }
+      end
+    end
+  end
+
+  return nil
+end
+
+--- The baseline PNG of a scene, decoded, or nil when there is none.
+local function baselineOf(name: string): Image?
+  -- pcall only around the read of a file that may be missing: a missing baseline is a finding
+  -- the report names, not a failure of the whole gallery.
+  local ok, bytes = pcall(fs.readFile, `{Baseline}/{name}.png`)
+
+  if not ok then return nil end
+
+  return jessMagick.readPNG(bytes :: buffer)
+end
+
+local function rebaseline(name: string, image: Image, png: buffer)
+  fs.writeFile(`{Baseline}/{name}.png`, png, { atomic = true, createParents = true })
+  print(`  ['{name} pixels'] = '{support.pixels(image)}',`)
+  print(`  ['{name} png'] = '{support.digest(png)}',`)
+end
+
+local function check(name: string, image: Image, png: buffer): Row
+  local recorded = scenesModule.recorded
+  local expectedPixels = recorded[`{name} pixels`] or 'unrecorded'
+  local expectedPng = recorded[`{name} png`] or 'unrecorded'
+  local observedPixels = support.pixels(image)
+  local observedPng = support.digest(png)
+  local baseline = baselineOf(name)
+  local baselinePixels = if baseline then support.pixels(baseline) else 'missing'
+  -- A baseline of another geometry has no pixel to compare with the first one, so it has none.
+  local difference = nil
+
+  if baseline and baselinePixels ~= observedPixels and baseline.width == image.width and baseline.height == image.height then
+    difference = firstDifference(baseline, image)
+  end
+
+  local matches = observedPixels == expectedPixels and observedPng == expectedPng
+  local baselineMatches = baselinePixels == expectedPixels
+
+  return {
+    scene = name,
+    geometry = { width = image.width, height = image.height },
+    pixels = { expected = expectedPixels, observed = observedPixels },
+    png = { expected = expectedPng, observed = observedPng },
+    baseline = { pixels = baselinePixels, matches = baselineMatches },
+    firstDifference = difference,
+    matches = matches and baselineMatches,
+  }
+end
+
+local scenes = scenesModule.scenes
+local rows: { Row } = {}
+local failures = 0
+
+print(`gallery: {#scenes} scenes, {if rebaselining then 'rebaselining' else 'checking'}`)
+
+for _, candidate in scenes do
+  local image = candidate.render()
+  local png = jessMagick.png(image)
+
+  if rebaselining then
+    rebaseline(candidate.name, image, png)
+  else
+    fs.writeFile(`{folder}/{candidate.name}.png`, png, { atomic = true, createParents = true })
+
+    local row = check(candidate.name, image, png)
+
+    table.insert(rows, row)
+
+    if row.matches then
+      print(`  ok    {candidate.name}`)
+    else
+      failures += 1
+      print(`  DIFF  {candidate.name}: observed {row.pixels.observed}, recorded {row.pixels.expected}, baseline {row.baseline.pixels}`)
+    end
+  end
+end
+
+if rebaselining then
+  print(`gallery: wrote {#scenes} baseline PNGs under {Baseline}; paste the lines above into tests/scenes.jsl`)
+
+  return
+end
+
+local report = {
+  runtime = { jess = jess.version, verified = jess.bench.verified },
+  scenes = rows,
+  failed = failures,
+}
+
+fs.writeFile(`{folder}/report.json`, json.encodeTable(report, { indent = 2 }), { atomic = true, createParents = true })
+
+if failures > 0 then
+  error(`gallery: {failures} of {#scenes} scenes differ from their record: see {folder}/report.json`, 0)
+end
+
+print(`gallery: {#scenes} scenes match their record; report at {folder}/report.json`)
