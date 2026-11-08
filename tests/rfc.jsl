@@ -571,7 +571,7 @@ suite.describe('memory budget arithmetic (RFC-0001 B3, render sketch)', function
     local withEncode = render.workingBytes(128, 8, 64, 8192, 8192, true)
 
     expect(withoutEncode).toBe(347086848)
-    expect(withEncode).toBe(618206658)
+    expect(withEncode).toBe(886642114)
     expect(withoutEncode < render.DefaultBudgetBytes).toBe(true)
     expect(withEncode > render.DefaultBudgetBytes).toBe(true)
   end)

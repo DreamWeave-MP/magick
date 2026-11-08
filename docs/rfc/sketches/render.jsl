@@ -35,7 +35,10 @@ Render.MaxGroupDepth = 32
 ---   perWorker = (1 + MaxGroupDepth) * tile + coverage + halo
 ---   coverage  = (tile + 1) * tile * 8    (f64 cells, one spare column a row, `tile` rows)
 ---   halo      = (tile + 2 * haloPixels)^2 * 16   (f32 RGBA, one halo tile a worker holds)
----   total     = workers * perWorker + output + (encode ? output * 1.01 : 0)
+---   total     = workers * perWorker + output + (encode ? output * 2.01 : 0)
+--- The encode term is a conservative bound, not a measurement: the filtered scanlines of a PNG encode
+--- are one output-sized copy, and the compressed stream is at most 1.01 output (stored blocks), so 2.01
+--- holds whatever the codec does. MAG-025 replaces it with a measured peak.
 --- where tile = tileEdge^2 * 16, and output = width * height * 4 (one straight RGBA8 Image).
 function Render.workingBytes(tileEdge: number, workers: number, haloPixels: number, outputWidth: number, outputHeight: number, encode: boolean): number
   local tileBytes = tileEdge * tileEdge * 16
@@ -44,7 +47,7 @@ function Render.workingBytes(tileEdge: number, workers: number, haloPixels: numb
   local haloBytes = haloSide * haloSide * 16
   local perWorker = (1 + Render.MaxGroupDepth) * tileBytes + coverageBytes + haloBytes
   local outputBytes = outputWidth * outputHeight * 4
-  local encodeBytes = if encode then math.floor(outputBytes * 1.01) else 0
+  local encodeBytes = if encode then math.floor(outputBytes * 2.01) else 0
 
   return workers * perWorker + outputBytes + encodeBytes
 end
