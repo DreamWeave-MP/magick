@@ -227,17 +227,19 @@ suite.describe('premultiplied tiles (docs/rfc/sketches/color.jsl)', function()
 
     for alpha = 1, 255 do
       for channel = 0, 255 do
+        -- Two different values in red and green, so a straight() that copies one slot into another fails.
         local premultiplied, storedAlpha = color.premultiply(channel, alpha, scratch)
-        local red, green, blue = color.straight(premultiplied, premultiplied, premultiplied, storedAlpha)
+        local otherPremultiplied = color.premultiply(255 - channel, alpha, scratch)
+        local red, green, blue = color.straight(premultiplied, otherPremultiplied, premultiplied, storedAlpha)
 
-        if red ~= channel or green ~= channel or blue ~= channel then failures += 1 end
+        if red ~= channel or green ~= 255 - channel or blue ~= channel then failures += 1 end
       end
     end
 
     expect(failures).toBe(0)
   end)
 
-  suite.it('stores RGB 0 at alpha 0 whatever RGB went in', function()
+  suite.it('stores RGB 0 in straight output at alpha 0, whatever RGB went in (tile storage is a stub)', function()
     expect({ color.straight(0.5, 0.5, 0.5, 0) }).toEqual { 0, 0, 0, 0 }
   end)
 
@@ -344,7 +346,252 @@ suite.describe('legacy inputs the RFC rules out for new APIs', function()
     expect(bytesOf(0)).toBe(bytesOf(1))
     expect(bytesOf(modulus)).toBe(bytesOf(1))
     expect(bytesOf(-1) == bytesOf(1)).toBe(false)
+    -- A non-integer seed is floored first, as the legacy code does (L4).
+    expect(bytesOf(2.5) == bytesOf(2)).toBe(true)
   end)
 end)
+
+--- Runs a refusal, and returns the message it raised ('' when it did not raise).
+local function refusal(callback: () -> ()): string
+  -- pcall around the reference call under test: the refusal is what is checked, and its message is returned.
+  local ok, message = pcall(callback)
+
+  if ok then return '' end
+
+  return tostring(message)
+end
+
+--- Whether `text` contains `part` as plain text.
+local function contains(text: string, part: string): boolean
+  return string.find(text, part, 1, true) ~= nil
+end
+
+suite.describe('refusals of names outside the 0.2.0 sets (RFC-0001 W8, W9, E3)', function()
+  suite.it('refuses an unknown blend mode in separable, with the RFC message', function()
+    local message = refusal(function()
+      color.separable('hue' :: color.BlendMode, 0.5, 0.25)
+    end)
+
+    expect(contains(message, 'magick: unknown blend mode hue')).toBe(true)
+  end)
+
+  suite.it('refuses an unknown blend mode in blendPixel, even under the normal operator', function()
+    local pixel = { red = 1, green = 0, blue = 0, alpha = 1 }
+    local message = refusal(function()
+      color.blendPixel('saturation' :: color.BlendMode, 'src-over', pixel, pixel, 1)
+    end)
+
+    expect(contains(message, 'magick: unknown blend mode saturation')).toBe(true)
+  end)
+
+  suite.it('refuses an unknown operator in factors and in blendPixel', function()
+    local pixel = { red = 1, green = 0, blue = 0, alpha = 1 }
+    local fromFactors = refusal(function()
+      color.factors('bogus-op' :: color.Operator, 0.3, 0.6)
+    end)
+
+    local fromBlend = refusal(function()
+      color.blendPixel('normal', 'bogus-op' :: color.Operator, pixel, pixel, 1)
+    end)
+
+    expect(contains(fromFactors, 'magick: unknown operator bogus-op')).toBe(true)
+    expect(contains(fromBlend, 'magick: unknown operator bogus-op')).toBe(true)
+  end)
+end)
+
+suite.describe('compositing vectors (RFC-0001 W8, W9, G2)', function()
+  suite.it('composites src-in, dst-over and xor with their factors', function()
+    local red = { red = 1, green = 0, blue = 0, alpha = 1 }
+    local halfGray = { red = 0.5, green = 0.5, blue = 0.5, alpha = 0.5 }
+    local white = { red = 1, green = 1, blue = 1, alpha = 1 }
+    local halfRed = { red = 0.5, green = 0, blue = 0, alpha = 0.5 }
+
+    local sourceIn = color.blendPixel('normal', 'src-in', red, halfGray, 1)
+    local destinationOver = color.blendPixel('normal', 'dst-over', red, white, 1)
+    local exclusive = color.blendPixel('normal', 'xor', halfRed, white, 1)
+
+    expect({ sourceIn.red, sourceIn.green, sourceIn.blue, sourceIn.alpha }).toEqual { 0.5, 0, 0, 0.5 }
+    expect({ destinationOver.red, destinationOver.green, destinationOver.blue, destinationOver.alpha }).toEqual { 1, 1, 1, 1 }
+    expect({ exclusive.red, exclusive.green, exclusive.blue, exclusive.alpha }).toEqual { 0.5, 0.5, 0.5, 0.5 }
+  end)
+
+  suite.it('composites a partly transparent source over white by src-over', function()
+    local halfRed = { red = 0.5, green = 0, blue = 0, alpha = 0.5 }
+    local white = { red = 1, green = 1, blue = 1, alpha = 1 }
+    local result = color.blendPixel('normal', 'src-over', halfRed, white, 1)
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 1, 0.5, 0.5, 1 }
+  end)
+
+  suite.it('applies opacity once under a non-normal blend: multiply at opacity 0.5 gives 0.3125', function()
+    local source = { red = 0.25, green = 0.25, blue = 0.25, alpha = 1 }
+    local backdrop = { red = 0.5, green = 0.5, blue = 0.5, alpha = 1 }
+    local result = color.blendPixel('multiply', 'src-over', source, backdrop, 0.5)
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 0.3125, 0.3125, 0.3125, 1 }
+  end)
+
+  suite.it('gives blend alpha as as + ab - as*ab, with the overlap term in the color', function()
+    -- Source straight 1 at alpha 0.5; backdrop straight 0.5 at alpha 0.5. Color: 0.25 + 0.125 + 0.125 = 0.5.
+    -- Alpha: 0.5 + 0.5 - 0.25 = 0.75.
+    local source = { red = 0.5, green = 0.5, blue = 0.5, alpha = 0.5 }
+    local backdrop = { red = 0.25, green = 0.25, blue = 0.25, alpha = 0.5 }
+    local result = color.blendPixel('multiply', 'src-over', source, backdrop, 1)
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 0.5, 0.5, 0.5, 0.75 }
+  end)
+
+  suite.it('gives the backdrop back when the source has zero alpha', function()
+    local nothing = { red = 0, green = 0, blue = 0, alpha = 0 }
+    local backdrop = { red = 0.25, green = 0.25, blue = 0.25, alpha = 0.5 }
+    local result = color.blendPixel('multiply', 'src-over', nothing, backdrop, 1)
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 0.25, 0.25, 0.25, 0.5 }
+  end)
+
+  suite.it('takes the soft-light D(x) quartic branch: backdrop 0.2, source 0.75 gives 0.324', function()
+    -- D(0.2) = ((16*0.2 - 12)*0.2 + 4)*0.2 = 0.448, so 0.2 + 0.5 * (0.448 - 0.2) = 0.324.
+    expect(near(color.separable('soft-light', 0.2, 0.75), 0.324)).toBe(true)
+  end)
+
+  suite.it('gives the group-on-white multiply red as red, with opacity 1', function()
+    local red = { red = 1, green = 0, blue = 0, alpha = 1 }
+    local white = { red = 1, green = 1, blue = 1, alpha = 1 }
+    local result = color.blendPixel('multiply', 'src-over', red, white, 1)
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 1, 0, 0, 1 }
+  end)
+
+  suite.it('clips a premultiplied pixel by its coverage, and nests clips to a depth of 16', function()
+    local red = { red = 1, green = 0, blue = 0, alpha = 1 }
+    local clipped = color.clipPixel(red, 0.5)
+
+    expect({ clipped.red, clipped.green, clipped.blue, clipped.alpha }).toEqual { 0.5, 0, 0, 0.5 }
+    expect(color.nestClip(15)).toBe(16)
+
+    local message = refusal(function()
+      color.nestClip(16)
+    end)
+
+    expect(contains(message, 'MaxClipDepth 16 exceeded')).toBe(true)
+  end)
+end)
+
+suite.describe('opacity and partial backdrop under a blend (RFC-0001 G2, W9)', function()
+  suite.it('applies opacity to the source term over a partly transparent backdrop: 0.21875, alpha 0.75', function()
+    -- Source straight 0.25 at alpha 1, opacity 0.5: as' = 0.5. Backdrop straight 0.5 at alpha 0.5.
+    -- Overlap = 0.25. First term 0.25 * 0.5 * (1 - 0.5) = 0.0625; second 0.25 * (1 - 0.5) = 0.125;
+    -- blend 0.25 * B(0.5, 0.25) = 0.25 * 0.125 = 0.03125. Total 0.21875. Alpha 0.5 + 0.5 - 0.25 = 0.75.
+    local source = { red = 0.25, green = 0.25, blue = 0.25, alpha = 1 }
+    local backdrop = { red = 0.25, green = 0.25, blue = 0.25, alpha = 0.5 }
+    local result = color.blendPixel('multiply', 'src-over', source, backdrop, 0.5)
+
+    expect({ result.red, result.green, result.blue, result.alpha }).toEqual { 0.21875, 0.21875, 0.21875, 0.75 }
+  end)
+
+  suite.it('refuses an unknown blend mode before the operator check, under a non-normal operator', function()
+    local pixel = { red = 1, green = 0, blue = 0, alpha = 1 }
+    -- pcall around blendPixel: the unknown mode must be named, not reported as an operator error.
+    local ok, message = pcall(color.blendPixel, 'hue' :: color.BlendMode, 'src-in', pixel, pixel, 1)
+
+    expect(ok).toBe(false)
+    expect(contains(tostring(message), 'magick: unknown blend mode hue')).toBe(true)
+  end)
+end)
+
+suite.describe('coverage rules and stop mixing (RFC-0001 F1, F2, M9)', function()
+  suite.it('evaluates the fill rules on a winding sum, folding evenodd with period 2', function()
+    local paint = require '../docs/rfc/sketches/paint'
+
+    expect(paint.coverage('evenodd', 0.5)).toBe(0.5)
+    expect(paint.coverage('evenodd', 1)).toBe(1)
+    expect(paint.coverage('evenodd', 1.5)).toBe(0.5)
+    expect(paint.coverage('evenodd', 2)).toBe(0)
+    expect(paint.coverage('evenodd', -2.5)).toBe(0.5)
+    expect(paint.coverage('nonzero', 2)).toBe(1)
+    expect(paint.coverage('nonzero', 0.5)).toBe(0.5)
+  end)
+
+  suite.it('pins evenodd on the overlap example: 255, 0, 0, where the exact answer is 0, 0, 0', function()
+    -- Two identical rect(0.5,0,2,1): windings 1.0 at column 0 and 2.0 at column 1. Evenodd on the summed
+    -- winding gives column 0 as 1, the approximation RFC-0001 section 6 states. Nonzero gives 1 and 1.
+    local paint = require '../docs/rfc/sketches/paint'
+    local evenOdd = { paint.coverage('evenodd', 1.0), paint.coverage('evenodd', 2.0), 0 }
+    local nonZero = { paint.coverage('nonzero', 1.0), paint.coverage('nonzero', 2.0), 0 }
+
+    expect(evenOdd).toEqual { 1, 0, 0 }
+    expect(nonZero).toEqual { 1, 1, 0 }
+    expect(rows(path.new():rect(0.5, 0, 2, 1):rect(0.5, 0, 2, 1):mask())).toEqual { { 255, 255, 0 } }
+  end)
+
+  suite.it('mixes two stops premultiplied: opaque red and transparent blue at half give red at alpha 0.5', function()
+    local paint = require '../docs/rfc/sketches/paint'
+    local opaqueRed = { offset = 0, red = 1, green = 0, blue = 0, alpha = 1 }
+    local clearBlue = { offset = 1, red = 0, green = 0, blue = 1, alpha = 0 }
+    local mixed = paint.mixStop(opaqueRed, clearBlue, 0.5)
+
+    expect({ mixed.red, mixed.green, mixed.blue, mixed.alpha }).toEqual { 1, 0, 0, 0.5 }
+  end)
+
+  suite.it('mixes unequal alphas premultiplied: a straight mix would give blue 0.5 and red 0.5', function()
+    local paint = require '../docs/rfc/sketches/paint'
+    local firstStop = { offset = 0, red = 1, green = 0, blue = 0, alpha = 1 }
+    local secondStop = { offset = 1, red = 0, green = 0, blue = 1, alpha = 0.5 }
+    local mixed = paint.mixStop(firstStop, secondStop, 0.5)
+
+    -- Premultiplied: red 0.5 and blue 0.25 over alpha 0.75, straight red 2/3 and blue 1/3.
+    expect(near(mixed.red, 2 / 3) and near(mixed.blue, 1 / 3) and near(mixed.alpha, 0.75)).toBe(true)
+  end)
+end)
+
+suite.describe('memory budget arithmetic (RFC-0001 B3, render sketch)', function()
+  suite.it('counts tiles, coverage cells, halo and output: 8192 square at tile 256 is over 512 MiB', function()
+    local render = require '../docs/rfc/sketches/render'
+    local bytes = render.workingBytes(256, 8, 64, 8192, 8192, false)
+
+    expect(bytes).toBe(568344576)
+    expect(bytes > render.DefaultBudgetBytes).toBe(true)
+  end)
+
+  suite.it('keeps 8192 square at tile 128 under 512 MiB, and counts the encode buffer when asked', function()
+    local render = require '../docs/rfc/sketches/render'
+    local withoutEncode = render.workingBytes(128, 8, 64, 8192, 8192, false)
+    local withEncode = render.workingBytes(128, 8, 64, 8192, 8192, true)
+
+    expect(withoutEncode).toBe(347086848)
+    expect(withEncode).toBe(618206658)
+    expect(withoutEncode < render.DefaultBudgetBytes).toBe(true)
+    expect(withEncode > render.DefaultBudgetBytes).toBe(true)
+  end)
+end)
+
+suite.describe('matrix guards (RFC-0001 T6)', function()
+  suite.it('refuses an infinite matrix field, positive or negative, with the RFC message', function()
+    local positive = refusal(function()
+      transform.assertFinite({ scaleX = math.huge, skewY = 0, skewX = 0, scaleY = 1, offsetX = 0, offsetY = 0 })
+    end)
+
+    local negative = refusal(function()
+      transform.inverse({ scaleX = 1, skewY = 0, skewX = 0, scaleY = -math.huge, offsetX = 0, offsetY = 0 })
+    end)
+
+    expect(contains(positive, 'magick: transform must be finite')).toBe(true)
+    expect(contains(negative, 'magick: transform must be finite')).toBe(true)
+  end)
+
+  suite.it('treats a determinant of 1e-13 at unit scale as singular, and 1e-11 as invertible', function()
+    expect(transform.isSingular(transform.scale(1, 1e-13))).toBe(true)
+    expect(transform.isSingular(transform.scale(1, 1e-11))).toBe(false)
+  end)
+
+  suite.it('refuses to invert a near-singular matrix with the RFC message', function()
+    local message = refusal(function()
+      transform.inverse(transform.scale(1, 1e-13))
+    end)
+
+    expect(contains(message, 'magick: transform is singular')).toBe(true)
+  end)
+end)
+
 
 return suite
