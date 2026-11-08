@@ -550,9 +550,10 @@ suite.describe('cubic extrema (T8) against dense sampling', function()
   end)
 end)
 
--- Legacy transformed (owner-approved P4 change): the curve is kept -----------------------------------
+-- P4, reference only: the retained curve and the old bake, computed by the sketch. This does NOT test Path:transformed in the
+-- package. The package change is owned by MAG-004 (RFC-0001 P4, section 16), and its real-function test is listed there.
 
-suite.describe('legacy transformed keeps its curve (P4)', function()
+suite.describe('P4 reference: the retained curve against the old bake (sketch, not the package)', function()
   -- Source quadratic (0,0), (50,100), (100,0); scale 4. Exact device area under it and the chord
   -- (the parabola's area is 2/3 base times height): (2/3) * 400 * 200 = 53333.33...
   local source = { 0, 0, 50, 100, 100, 0 }
@@ -562,7 +563,7 @@ suite.describe('legacy transformed keeps its curve (P4)', function()
     expect(near(exactArea, 160000 / 3, 1e-9)).toBe(true)
   end)
 
-  suite.it('retains the curve: 20 pieces at device tolerance 0.25, area 53200', function()
+  suite.it('reference: the retained curve has 20 pieces at device tolerance 0.25, area 53200', function()
     -- Device control (0,0),(200,400),(400,0): bend 800, pieces ceil(sqrt(800 / (8 * 0.25))) = ceil(20) = 20.
     -- The polygon through 20 equal-parameter points has area 53333.33 * (1 - 1/400) = 53200.
     local points = transform.flattenQuadratic(transform.scale(4, 4), source, 0.25)
@@ -571,7 +572,7 @@ suite.describe('legacy transformed keeps its curve (P4)', function()
     expect(near(polygonArea(0, 0, points), 53200, 1e-6)).toBe(true)
   end)
 
-  suite.it('a control: the old baked version (10 source pieces, scaled) has area 52800, and differs', function()
+  suite.it('control: the old baked version (10 source pieces, scaled) has area 52800, and differs', function()
     -- Source bend 200, pieces ceil(sqrt(200 / 2)) = 10. Source polygon area 3333.33 * (1 - 1/100) = 3300, and
     -- scaled by 4 squared it is 52800. Built here from the ten source points, then scaled.
     local baked = transform.flattenQuadratic(transform.identity(), source, 0.25)
@@ -585,7 +586,7 @@ suite.describe('legacy transformed keeps its curve (P4)', function()
     expect(near(polygonArea(0, 0, scaled), 52800, 1e-6)).toBe(true)
   end)
 
-  suite.it('is closer to the exact curve than the baked version: 133.3 against 533.3 square pixels', function()
+  suite.it('reference: the retained curve is closer to the exact curve than the baked version: 133.3 against 533.3 square pixels', function()
     local retained = polygonArea(0, 0, transform.flattenQuadratic(transform.scale(4, 4), source, 0.25))
     local baked: { { number } } = {}
 
