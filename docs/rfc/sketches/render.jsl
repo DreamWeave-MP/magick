@@ -35,10 +35,11 @@ Render.MaxGroupDepth = 32
 ---   perWorker = (1 + MaxGroupDepth) * tile + coverage + halo
 ---   coverage  = (tile + 1) * tile * 8    (f64 cells, one spare column a row, `tile` rows)
 ---   halo      = (tile + 2 * haloPixels)^2 * 16   (f32 RGBA, one halo tile a worker holds)
----   total     = workers * perWorker + output + (encode ? output * 2.01 : 0)
---- The encode term is a conservative bound, not a measurement: the filtered scanlines of a PNG encode
---- are one output-sized copy, and the compressed stream is at most 1.01 output (stored blocks), so 2.01
---- holds whatever the codec does. MAG-025 replaces it with a measured peak.
+---   total     = workers * perWorker + output + (encode ? output * 3.02 : 0)
+--- The encode term is a bound, not a measurement. Magick.png (src/init.jsl) holds `lines` (the output plus one byte
+--- a row) until it returns, `packed` (a zlib stream, at most 1.0001 lines by the stored-block bound: 5 bytes a 65535-byte
+--- block plus framing), and `out`, a copy of `packed` built while `packed` is live. The peak is lines + packed + out,
+--- at most output * (1 + 2 * 1.0001) = 3.0002 output, and 3.02 covers it. MAG-025 replaces it with a measured peak.
 --- where tile = tileEdge^2 * 16, and output = width * height * 4 (one straight RGBA8 Image).
 function Render.workingBytes(tileEdge: number, workers: number, haloPixels: number, outputWidth: number, outputHeight: number, encode: boolean): number
   local tileBytes = tileEdge * tileEdge * 16
@@ -47,7 +48,7 @@ function Render.workingBytes(tileEdge: number, workers: number, haloPixels: numb
   local haloBytes = haloSide * haloSide * 16
   local perWorker = (1 + Render.MaxGroupDepth) * tileBytes + coverageBytes + haloBytes
   local outputBytes = outputWidth * outputHeight * 4
-  local encodeBytes = if encode then math.floor(outputBytes * 2.01) else 0
+  local encodeBytes = if encode then math.floor(outputBytes * 3.02) else 0
 
   return workers * perWorker + outputBytes + encodeBytes
 end

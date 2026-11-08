@@ -5,6 +5,8 @@
 local magick = require '@magick'
 local path = require '@magick/path'
 local test = require '@jess/test'
+local color = require '../docs/rfc/sketches/color'
+local paint = require '../docs/rfc/sketches/paint'
 local transform = require '../docs/rfc/sketches/transform'
 local color = require '../docs/rfc/sketches/color'
 
@@ -571,7 +573,7 @@ suite.describe('memory budget arithmetic (RFC-0001 B3, render sketch)', function
     local withEncode = render.workingBytes(128, 8, 64, 8192, 8192, true)
 
     expect(withoutEncode).toBe(347086848)
-    expect(withEncode).toBe(886642114)
+    expect(withEncode).toBe(1157761925)
     expect(withoutEncode < render.DefaultBudgetBytes).toBe(true)
     expect(withEncode > render.DefaultBudgetBytes).toBe(true)
   end)
@@ -602,6 +604,55 @@ suite.describe('matrix guards (RFC-0001 T6)', function()
     end)
 
     expect(contains(message, 'magick: transform is singular')).toBe(true)
+  end)
+end)
+
+
+suite.describe('self-crossing and retraced contours (C2, F1, F2)', function()
+  suite.it('pins the bowtie: the crossing pixel (1, 1) is 0 where the exact nonzero coverage is 0.5', function()
+    -- Contour (0,0) (3,3) (3,0) (0,3): its two lobes at the crossing (1.5, 1.5) each cover 0.25 of pixel (1, 1), with
+    -- windings +1 and -1. The summed signed area is 0, so the summed rule gives 0. The exact answer is 0.5. The 0.2.0
+    -- rule is the summed approximation (RFC-0001 F1, section 6), and this vector is its documented result.
+    local mask = path.new():moveTo(0, 0):lineTo(3, 3):lineTo(3, 0):lineTo(0, 3):close():mask()
+
+    expect(rows(mask)).toEqual {
+      { 128, 0, 128, 0 },
+      { 255, 0, 255, 0 },
+      { 128, 0, 128, 0 },
+    }
+  end)
+
+  suite.it('pins the retraced rectangle: one contour traced twice gives column 0 = 255 under nonzero', function()
+    -- Winding 2 everywhere inside, so nonzero is 1 (exact too): 255 at column 0, where half the pixel is covered.
+    local mask = path.new()
+      :moveTo(0.5, 0):lineTo(2.5, 0):lineTo(2.5, 1):lineTo(0.5, 1):lineTo(0.5, 0)
+      :lineTo(2.5, 0):lineTo(2.5, 1):lineTo(0.5, 1):close()
+      :mask()
+
+    expect(rows(mask)[1][1]).toBe(255)
+  end)
+
+  suite.it('gives the retraced rectangle evenodd 1 at column 0 (the summed value; the exact even-odd answer is 0)', function()
+    -- The same contour's summed winding at column 0 is 1 (two half-covers), so the summed evenodd rule returns 1.
+    -- This is the approximation RFC-0001 F2 states and MAG-006 documents; exact parity is not in 0.2.0.
+    expect(paint.coverage('evenodd', 1)).toBe(1)
+  end)
+
+  suite.it('applies nonzero to a negative winding by magnitude: -1 gives 1, -0.5 gives 0.5', function()
+    expect(paint.coverage('nonzero', -1)).toBe(1)
+    expect(paint.coverage('nonzero', -0.5)).toBe(0.5)
+  end)
+end)
+
+suite.describe('opacity under blend, in both forms (RFC-0001 W9)', function()
+  suite.it('gives premultiplied 0.21875 and straight 0.2917 for the same result (alpha 0.75)', function()
+    -- Premultiplied colour 0.21875 at alpha 0.75: straight colour 0.21875 / 0.75 = 0.291666...
+    local source = { red = 0.25, green = 0.25, blue = 0.25, alpha = 1 }
+    local backdrop = { red = 0.25, green = 0.25, blue = 0.25, alpha = 0.5 }
+    local result = color.blendPixel('multiply', 'src-over', source, backdrop, 0.5)
+
+    expect(math.abs(result.red - 0.21875) < 1e-12).toBe(true)
+    expect(math.abs(result.red / result.alpha - 0.2916666666666667) < 1e-9).toBe(true)
   end)
 end)
 
