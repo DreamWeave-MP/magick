@@ -1,0 +1,359 @@
+--!strict
+-- The visual gates of @magick 0.2.0 development: tiny exact fixtures for transparency, clipping,
+-- alpha, curves, holes and gradients, each value worked out by hand in its comment; the reference
+-- scenes of tests/scenes.jsl, held to those pixels and to the fingerprints recorded there; extreme
+-- and empty images; and reproducibility, byte for byte. Nothing here is random or timed, and the
+-- suite writes no files: tools/gallery.jsl does that, and compares against the same scenes.
+--
+-- The one tolerance is for area: a curve or a circle is flattened to within a tolerance of its
+-- own, so its covered area is compared to the analytic area within `AreaTolerance` pixels.
+local goldens = require './goldens'
+local magick = require '@magick'
+local path = require '@magick/path'
+local scenes = require './scenes'
+local support = require './support'
+local test = require '@jess/test'
+
+local expect = test.expect
+local suite = test.new()
+
+type Image = support.Image
+type Shape = { width: number, height: number, data: buffer }
+
+--- The largest error, in pixels of area, a flattened curve or circle may have.
+local AreaTolerance = 0.25
+
+--- The RGBA of one pixel, as a list.
+local function at(image: Image, column: number, row: number): { number }
+  local red, green, blue, alpha = image:get(column, row)
+
+  return { red, green, blue, alpha }
+end
+
+--- The coverage the image holds in all, alpha over 255, in whole pixels.
+local function alphaArea(image: Image): number
+  local total = 0
+
+  for offset = 3, buffer.len(image.data) - 1, 4 do
+    total += buffer.readu8(image.data, offset)
+  end
+
+  return total / 255
+end
+
+--- Whether a value that is an image or a mask is shaped as it says: a width and height that are
+--- whole and not negative, and a buffer of exactly that many bytes per pixel.
+local function wellFormed(value: Shape, bytesPerPixel: number): boolean
+  if value.width < 0 or value.height < 0 then return false end
+  if value.width ~= math.floor(value.width) or value.height ~= math.floor(value.height) then return false end
+
+  return buffer.len(value.data) == value.width * value.height * bytesPerPixel
+end
+
+--- The scenes, by name, as tests/scenes.jsl gives them.
+local function scene(name: string): Image
+  for _, candidate in scenes.scenes do
+    if candidate.name == name then return candidate.render() end
+  end
+
+  error(`no reference scene named '{name}'`, 2)
+end
+
+suite.describe('transparency', function()
+  suite.it('leaves what is under a clear source pixel alone', function()
+    -- Row 1 of the source is clear, and row 0 has one clear pixel: the base is (64, 80, 96).
+    local image = scene 'transparent pixels'
+
+    expect(at(image, 0, 0)).toEqual { 64, 80, 96, 255 }
+    expect(at(image, 0, 1)).toEqual { 64, 80, 96, 255 }
+    expect(at(image, 3, 1)).toEqual { 64, 80, 96, 255 }
+  end)
+
+  suite.it('blends a half-opaque blue over the base by its alpha', function()
+    -- Alpha 128: the blue is 128/255 of what it covers, the base 127/255. Red 64 * 127/255 is
+    -- 31.9 and rounds to 32; green 80 * 127/255 is 39.8 and rounds to 40; blue is 128 + 96 *
+    -- 127/255, 175.8, and rounds to 176. Covered is 1, so alpha stays opaque.
+    expect(at(scene 'transparent pixels', 2, 0)).toEqual { 32, 40, 176, 255 }
+  end)
+
+  suite.it('blends a quarter-opaque white over the base by its alpha', function()
+    -- Alpha 64: red 64 + 64 * 191/255 is 111.9 and rounds to 112; green 64 + 80 * 191/255 is
+    -- 123.9, 124; blue 64 + 96 * 191/255 is 135.9, 136.
+    expect(at(scene 'transparent pixels', 3, 0)).toEqual { 112, 124, 136, 255 }
+  end)
+
+  suite.it('keeps the alpha of a source laid over a clear pixel', function()
+    -- Covered is 128/255 with nothing under it, so the pixel keeps alpha 128 and its red whole.
+    local image = magick.new(1, 1)
+
+    image:over(magick.fromRGBA(1, 1, buffer.fromstring '\255\0\0\128'))
+
+    expect(at(image, 0, 0)).toEqual { 255, 0, 0, 128 }
+  end)
+
+  suite.it('leaves an alpha-zero pixel of a source with no color in the destination', function()
+    local image = magick.new(2, 1, '#102030')
+
+    image:over(magick.fromRGBA(2, 1, buffer.fromstring '\255\255\255\0\0\0\0\0'))
+
+    expect(at(image, 0, 0)).toEqual { 16, 32, 48, 255 }
+    expect(at(image, 1, 0)).toEqual { 16, 32, 48, 255 }
+  end)
+end)
+
+suite.describe('clipping', function()
+  suite.it('clips a rectangle to the image', function()
+    -- Image:rect takes both corners as inside it: columns -2..3 and rows 1..4, clipped to the
+    -- 8 by 6 image.
+    local image = scene 'clipped rect'
+
+    expect(at(image, 0, 1)).toEqual { 255, 0, 0, 255 }
+    expect(at(image, 3, 4)).toEqual { 255, 0, 0, 255 }
+    expect(at(image, 4, 1)).toEqual { 0, 0, 0, 255 }
+    expect(at(image, 0, 0)).toEqual { 0, 0, 0, 255 }
+    expect(at(image, 2, 5)).toEqual { 0, 0, 0, 255 }
+  end)
+
+  suite.it('covers the half of a circle inside the image by its area', function()
+    -- A circle of radius 5 on the left edge: half of its pi * 25 lies inside.
+    local area = alphaArea(scene 'clipped circle')
+
+    expect(math.abs(area - math.pi * 25 / 2) < AreaTolerance).toBe(true)
+  end)
+
+  suite.it('draws nothing where a shape lies wholly outside', function()
+    local image = magick.new(3, 3, '#000000')
+
+    path.new():rect(5, 5, 8, 8):fill(image, '#ffffff')
+
+    expect(alphaArea(image)).toBe(9)
+  end)
+end)
+
+suite.describe('alpha', function()
+  suite.it('composites one half-opaque red pixel over green by hand', function()
+    -- Opacity 128/255 over opaque green: red 255 * 128/255 is 128; green 255 * 127/255 is 127.
+    expect(at(scene 'alpha over', 1, 1)).toEqual { 128, 127, 0, 255 }
+    expect(at(scene 'alpha over', 0, 0)).toEqual { 0, 255, 0, 255 }
+  end)
+
+  suite.it('gives a half-covered pixel half the color, as the coverage stands for it', function()
+    -- A rectangle's left half in the only pixel: coverage 128 of white over clear.
+    expect(at(scene 'half pixel', 0, 0)).toEqual { 255, 255, 255, 128 }
+  end)
+end)
+
+suite.describe('curves', function()
+  suite.it('fills the inside of a quadratic arch and leaves the outside clear', function()
+    -- The arch's apex is (8, 6): the pixel (8, 13) lies wholly between it and the chord at 14.
+    local image = scene 'curves'
+
+    expect(at(image, 8, 13)).toEqual { 48, 96, 192, 255 }
+    expect(at(image, 0, 0)).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('fills a cubic arch of the same shape the same way', function()
+    -- The cubic's apex is at x 24, and y 6 by symmetry of its control points.
+    expect(at(scene 'curves', 24, 13)).toEqual { 192, 96, 48, 255 }
+  end)
+
+  suite.it('covers each arch by the area a parabolic segment encloses', function()
+    -- A quadratic segment's area is 2/3 of its base times its sagitta: 2/3 * 12 * 8 = 64. The
+    -- cubic is the same curve, elevated, so it encloses the same 64.
+    local image = scene 'curves'
+    local left, right = magick.new(16, 16), magick.new(16, 16)
+
+    left:over(image, 0, 0)
+    right:over(image, -16, 0)
+
+    expect(math.abs(alphaArea(left) - 64) < AreaTolerance).toBe(true)
+    expect(math.abs(alphaArea(right) - 64) < AreaTolerance).toBe(true)
+  end)
+end)
+
+suite.describe('holes', function()
+  suite.it('cuts a hole where the inner contour winds the other way', function()
+    -- Outer 1..11 and inner 4..8 by 4..8: the inner square's pixels are clear, its surround not.
+    local image = scene 'holes'
+
+    expect(at(image, 1, 1)).toEqual { 255, 255, 255, 255 }
+    expect(at(image, 3, 5)).toEqual { 255, 255, 255, 255 }
+    expect(at(image, 4, 4)).toEqual { 0, 0, 0, 0 }
+    expect(at(image, 7, 7)).toEqual { 0, 0, 0, 0 }
+    expect(at(image, 8, 8)).toEqual { 255, 255, 255, 255 }
+    expect(at(image, 11, 11)).toEqual { 0, 0, 0, 0 }
+  end)
+end)
+
+suite.describe('gradients', function()
+  suite.it('steps a black-to-white ramp by the row, rounding each step', function()
+    -- Five rows: the value at row r is 255 * r / 4, rounded: 0, 64, 128, 191, 255.
+    local image = scene 'gradient'
+
+    for row, value in { 0, 64, 128, 191, 255 } do
+      expect(at(image, 3, row - 1)).toEqual { value, value, value, 255 }
+    end
+  end)
+
+  suite.it('lays an alpha ramp over white so each row shows what its alpha leaves', function()
+    -- Red at alpha a over white: red stays 255, green is 255 - a, so green is 255, 191, 127, 64, 0.
+    local image = scene 'gradient alpha'
+
+    expect(at(image, 2, 0)).toEqual { 255, 255, 255, 255 }
+    expect(at(image, 2, 1)).toEqual { 255, 191, 191, 255 }
+    expect(at(image, 2, 2)).toEqual { 255, 127, 127, 255 }
+    expect(at(image, 2, 3)).toEqual { 255, 64, 64, 255 }
+    expect(at(image, 2, 4)).toEqual { 255, 0, 0, 255 }
+  end)
+end)
+
+suite.describe('line caps', function()
+  suite.it('stops a butt cap at the line ends and a square cap a half width past them', function()
+    -- Width 4 from x 4 to 12: butt covers columns 4..11, square also columns 2..13.
+    local image = scene 'line caps'
+
+    expect(at(image, 4, 2)).toEqual { 255, 255, 255, 255 }
+    expect(at(image, 3, 2)).toEqual { 0, 0, 0, 0 }
+    expect(at(image, 2, 10)).toEqual { 255, 255, 255, 255 }
+    expect(at(image, 1, 10)).toEqual { 0, 0, 0, 0 }
+    expect(at(image, 13, 10)).toEqual { 255, 255, 255, 255 }
+    expect(at(image, 14, 10)).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('rounds a round cap, so its far corner stays clear', function()
+    -- The cap is a circle of radius 2 about (4, 6): the pixel at column 1 is beyond it.
+    expect(at(scene 'line caps', 1, 6)).toEqual { 0, 0, 0, 0 }
+  end)
+end)
+
+suite.describe('extreme sizes', function()
+  -- The sizes the operations must cover: empty in one or both directions, one pixel, and one
+  -- pixel wide or high with a long side.
+  local sizes = { { 0, 0 }, { 0, 3 }, { 3, 0 }, { 1, 1 }, { 1, 17 }, { 17, 1 } }
+
+  -- The operations each size is run through, over an image of that size. Only the shape of each
+  -- result is held: `rotate` of nothing gives a 2 by 1 image today, which COMPATIBILITY.md does
+  -- not promise either way, so no size is pinned here.
+  local operations: { { name: string, bytes: number, run: (image: Image) -> unknown } } = {
+    { name = 'rect', bytes = 4, run = function(image: Image) return image:rect(0, 0, image.width, image.height, '#ff0000') end },
+    { name = 'rect outside', bytes = 4, run = function(image: Image) return image:rect(image.width + 1, image.height + 1, image.width + 3, image.height + 3, '#ff0000') end },
+    { name = 'rectOver tiled', bytes = 4, run = function(image: Image) return image:rectOver(0, 0, image.width, image.height, magick.new(1, 1, '#00ff0080')) end },
+    { name = 'over', bytes = 4, run = function(image: Image) return image:over(magick.new(image.width, image.height, '#ffffff80')) end },
+    { name = 'over offset', bytes = 4, run = function(image: Image) return image:over(magick.new(2, 2, '#ffffff'), -1, -1) end },
+    { name = 'overMask', bytes = 4, run = function(image: Image) return image:overMask(magick.mask(image.width, image.height, buffer.create(image.width * image.height)), '#ffffff') end },
+    { name = 'polygon', bytes = 4, run = function(image: Image) return image:polygon({ { 0, 0 }, { image.width, 0 }, { 0, image.height } }, '#00ff00') end },
+    { name = 'circle', bytes = 4, run = function(image: Image) return image:circle(image.width / 2, image.height / 2, 1, nil, '#00ff00') end },
+    { name = 'line', bytes = 4, run = function(image: Image) return image:line(0, 0, image.width, image.height, '#00ff00', 2) end },
+    { name = 'strokeRect', bytes = 4, run = function(image: Image) return image:strokeRect(0, 0, image.width, image.height, '#ffffff', 1) end },
+    { name = 'roundRect', bytes = 4, run = function(image: Image) return image:roundRect(0, 0, image.width, image.height, 2, '#ffffff') end },
+    { name = 'clone', bytes = 4, run = function(image: Image) return image:clone() end },
+    { name = 'crop whole', bytes = 4, run = function(image: Image) return image:crop(image.width, image.height, 0, 0) end },
+    { name = 'extent', bytes = 4, run = function(image: Image) return image:extent(image.width + 2, image.height + 2, 1, 1, '#000000') end },
+    { name = 'trim', bytes = 4, run = function(image: Image) return image:trim() end },
+    { name = 'rotate90', bytes = 4, run = function(image: Image) return image:rotate90(true) end },
+    { name = 'rotate', bytes = 4, run = function(image: Image) return image:rotate(30) end },
+    { name = 'resize', bytes = 4, run = function(image: Image) return image:resize(image.width * 2, image.height * 2) end },
+    { name = 'resize nearest', bytes = 4, run = function(image: Image) return image:resize(image.width, image.height, true) end },
+    { name = 'scale', bytes = 4, run = function(image: Image) return image:scale(3, 3) end },
+    { name = 'roll', bytes = 4, run = function(image: Image) return image:roll(1, 1) end },
+    { name = 'grayscale', bytes = 4, run = function(image: Image) return image:grayscale() end },
+    { name = 'threshold', bytes = 4, run = function(image: Image) return image:threshold(0.5) end },
+    { name = 'setAlpha', bytes = 4, run = function(image: Image) return image:setAlpha(0.5) end },
+    { name = 'colorize', bytes = 4, run = function(image: Image) return image:colorize('#336699', 40) end },
+    { name = 'alphaMask', bytes = 1, run = function(image: Image) return image:alphaMask() end },
+    { name = 'gaussianBlur', bytes = 4, run = function(image: Image) return magick.gaussianBlur(image, 1.5) end },
+    { name = 'shadowed', bytes = 4, run = function(image: Image) return magick.shadowed(image, 40, 2, 1, 1) end },
+    { name = 'montage', bytes = 4, run = function(image: Image) return magick.montage({ image }) end },
+    { name = 'tile', bytes = 4, run = function(image: Image) return magick.tile(image.width, image.height, image) end },
+    { name = 'verticalGradient', bytes = 4, run = function(image: Image) return magick.verticalGradient(image.width, image.height, '#000000', '#ffffff') end },
+    { name = 'path fill', bytes = 4, run = function(image: Image) return path.new():rect(0, 0, image.width, image.height):fill(image, '#ffffff') end },
+    { name = 'path circle', bytes = 4, run = function(image: Image) return path.new():circle(image.width / 2, image.height / 2, 1):fill(image, '#ffffff') end },
+    { name = 'path empty', bytes = 4, run = function(image: Image) return path.new():fill(image, '#ffffff') end },
+  }
+
+  for _, size in sizes do
+    local width, height = size[1], size[2]
+
+    suite.it(`{width}x{height} images come back well formed from every operation`, function()
+      for _, operation in operations do
+        local result = operation.run(magick.new(width, height, '#102030'))
+
+        expect(wellFormed(result :: Shape, operation.bytes)).toBe(true)
+      end
+    end)
+
+    suite.it(`{width}x{height} images keep their pixels through PNG`, function()
+      local image = magick.new(width, height, '#102030')
+      local decoded = magick.readPNG(magick.png(image))
+
+      expect(support.pixels(decoded)).toBe(support.pixels(image))
+    end)
+  end
+
+  suite.it('gives an empty image no bytes and an empty path no mask', function()
+    local empty = magick.new(0, 0, '#ffffff')
+    local mask, left, top = path.new():mask()
+
+    expect(buffer.len(empty.data)).toBe(0)
+    expect({ mask.width, mask.height, left, top }).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('reads a pixel outside a one-pixel image as zeros, and writes it to nothing', function()
+    local image = magick.new(1, 1, '#ffffff')
+
+    image:set(1, 0, 1, 2, 3, 255)
+
+    expect(at(image, 1, 0)).toEqual { 0, 0, 0, 0 }
+    expect(at(image, 0, 0)).toEqual { 255, 255, 255, 255 }
+  end)
+
+  suite.it('draws a one-pixel-high rectangle as one row, with its halves at the ends', function()
+    local image = magick.new(17, 1, '#000000')
+
+    path.new():rect(4.5, 0, 8.5, 1):fill(image, '#ffffff')
+
+    expect(at(image, 4, 0)).toEqual { 128, 128, 128, 255 }
+    expect(at(image, 6, 0)).toEqual { 255, 255, 255, 255 }
+    expect(at(image, 8, 0)).toEqual { 128, 128, 128, 255 }
+    expect(at(image, 9, 0)).toEqual { 0, 0, 0, 255 }
+  end)
+end)
+
+suite.describe('reproducibility', function()
+  suite.it('renders each scene to the same bytes and PNG twice', function()
+    for _, candidate in scenes.scenes do
+      local first, second = candidate.render(), candidate.render()
+
+      expect(buffer.tostring(first.data) == buffer.tostring(second.data)).toBe(true)
+      expect(buffer.tostring(magick.png(first)) == buffer.tostring(magick.png(second))).toBe(true)
+    end
+  end)
+
+  suite.it('is not moved by other scenes drawn in between', function()
+    local before = buffer.tostring(scene('holes').data)
+
+    scene 'curves'
+    scene 'gradient alpha'
+
+    expect(buffer.tostring(scene('holes').data) == before).toBe(true)
+  end)
+end)
+
+suite.describe('reference scenes', function()
+  local pin, settle, unused = support.goldens(scenes.recorded)
+
+  suite.afterEach(settle)
+
+  suite.it('match the fingerprints recorded for them', function()
+    for _, candidate in scenes.scenes do
+      local image = candidate.render()
+
+      pin(`{candidate.name} pixels`, support.pixels(image))
+      pin(`{candidate.name} png`, support.digest(magick.png(image)))
+    end
+
+    expect(table.concat(unused(), ', ')).toBe ''
+  end)
+end)
+
+return suite

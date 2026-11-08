@@ -1,0 +1,179 @@
+--!strict
+-- The reference scenes of the visual gates: small images drawn through the public API, each one
+-- built from explicit colors and geometry so its pixels can be worked out by hand. The gate suite
+-- (tests/gate.jsl) holds every scene to the pixels its comments derive, and to the fingerprints
+-- recorded below; tools/gallery.jsl renders the same scenes to PNG and holds them to the baseline
+-- files in tests/gallery/.
+--
+-- The fingerprints are regression locks, not oracles: each was recorded by
+-- `jess run --package . --capability filesystem.read --capability filesystem.write tools/gallery.jsl
+-- rebaseline` on the 0.2.0 development tree, after the hand-derived checks in tests/gate.jsl held
+-- for the same scene. A change that moves one is a visual change and needs a reviewed rebaseline.
+local magick = require '@magick'
+local path = require '@magick/path'
+local support = require './support'
+
+type Image = support.Image
+
+export type Scene = { name: string, render: () -> Image }
+
+local scenes: { Scene } = {}
+
+local function scene(name: string, render: () -> Image)
+  table.insert(scenes, { name = name, render = render })
+end
+
+local function bytesOf(...: number): buffer
+  return buffer.fromstring(string.char(...))
+end
+
+scene('clipped rect', function()
+  local image = magick.new(8, 6, '#000000')
+
+  -- Both corners are inside Image:rect, so columns -2..3 and rows 1..4 are red; the rest of the
+  -- rectangle lies outside the image and is clipped away.
+  return image:rect(-2, 1, 3, 4, '#ff0000')
+end)
+
+scene('alpha over', function()
+  local image = magick.new(4, 4, '#00ff00')
+
+  -- One half-opaque red pixel over opaque green: (128, 127, 0, 255).
+  return image:over(magick.fromRGBA(1, 1, bytesOf(255, 0, 0, 128)), 1, 1)
+end)
+
+scene('transparent pixels', function()
+  local image = magick.new(4, 2, '#405060')
+  local source = magick.fromRGBA(
+    4,
+    2,
+    bytesOf(
+      255, 255, 255, 0, 255, 0, 0, 255, 0, 0, 255, 128, 255, 255, 255, 64,
+      1, 2, 3, 0, 0, 0, 0, 0, 9, 9, 9, 0, 200, 100, 50, 0
+    )
+  )
+
+  return image:over(source)
+end)
+
+scene('holes', function()
+  local image = magick.new(12, 12)
+
+  -- The outer rectangle winds one way and the inner one the other, so the inner is a hole.
+  path.new()
+    :rect(1, 1, 11, 11)
+    :moveTo(4, 4)
+    :lineTo(4, 8)
+    :lineTo(8, 8)
+    :lineTo(8, 4)
+    :close()
+    :fill(image, '#ffffff')
+
+  return image
+end)
+
+scene('curves', function()
+  local image = magick.new(32, 16)
+
+  -- Left: a quadratic arch from (2, 14) over (8, -2) to (14, 14). Right: the same arch as a cubic
+  -- whose control points are the quadratic's, elevated by two thirds, moved 16 to the right.
+  path.new(0.01)
+    :moveTo(2, 14)
+    :quadTo(8, -2, 14, 14)
+    :close()
+    :fill(image, '#3060c0')
+
+  path.new(0.01)
+    :moveTo(18, 14)
+    :cubicTo(22, 3.3333333333333, 26, 3.3333333333333, 30, 14)
+    :close()
+    :fill(image, '#c06030')
+
+  return image
+end)
+
+scene('clipped circle', function()
+  local image = magick.new(10, 10)
+
+  -- A circle of radius 5 centred on the left edge: the half inside the image is covered.
+  return path.new(0.05):circle(0, 5, 5):fill(image, '#ffffff')
+end)
+
+scene('gradient', function()
+  return magick.verticalGradient(4, 5, '#000000', '#ffffff')
+end)
+
+scene('gradient alpha', function()
+  local image = magick.new(4, 5, '#ffffff')
+  local ramp = magick.verticalGradient(4, 5, '#ff000000', '#ff0000ff')
+
+  return image:over(ramp)
+end)
+
+scene('line caps', function()
+  local image = magick.new(16, 12)
+
+  path.new():line(4, 2, 12, 2, 4, 'butt'):fill(image, '#ffffff')
+  path.new():line(4, 6, 12, 6, 4, 'round'):fill(image, '#ffffff')
+  path.new():line(4, 10, 12, 10, 4, 'square'):fill(image, '#ffffff')
+
+  return image
+end)
+
+scene('half pixel', function()
+  local image = magick.new(1, 1)
+
+  -- The left half of the only pixel: white at half coverage.
+  return path.new():rect(0, 0, 0.5, 1):fill(image, '#ffffff')
+end)
+
+scene('one column', function()
+  local image = magick.new(1, 17, '#000000')
+
+  -- Rows 4 and 8 are half covered, rows 5 to 7 whole.
+  return path.new():rect(0, 4.5, 1, 8.5):fill(image, '#ffffff')
+end)
+
+scene('one row', function()
+  local image = magick.new(17, 1, '#000000')
+
+  return path.new():rect(4.5, 0, 8.5, 1):fill(image, '#ffffff')
+end)
+
+--- The scenes, in the order the gallery renders and the gate suite checks them.
+local Scenes: { Scene } = scenes
+
+--- What each scene's pixels and its PNG file were when recorded: `<name> pixels` is the geometry
+--- and CRC-32 of the RGBA bytes (support.pixels), `<name> png` the length and CRC-32 of the file
+--- `magick.png` encodes (support.digest). The placeholders are replaced by the first rebaseline.
+local Recorded: { [string]: string } = {
+  ['clipped rect pixels'] = '8x6:258ecf47',
+  ['clipped rect png'] = '89:b3c80d46',
+  ['alpha over pixels'] = '4x4:0d2338d8',
+  ['alpha over png'] = '88:6302bafb',
+  ['transparent pixels pixels'] = '4x2:e8fc71ba',
+  ['transparent pixels png'] = '87:7873314a',
+  ['holes pixels'] = '12x12:5cd3940c',
+  ['holes png'] = '96:5c75da1f',
+  ['curves pixels'] = '32x16:2c79aacb',
+  ['curves png'] = '227:cf9009f9',
+  ['clipped circle pixels'] = '10x10:caa22dd3',
+  ['clipped circle png'] = '117:41b22ccd',
+  ['gradient pixels'] = '4x5:96bca3f9',
+  ['gradient png'] = '94:adf7c85c',
+  ['gradient alpha pixels'] = '4x5:16fb8198',
+  ['gradient alpha png'] = '93:2af94847',
+  ['line caps pixels'] = '16x12:1ff2d7a9',
+  ['line caps png'] = '123:db748616',
+  ['half pixel pixels'] = '1x1:3f459352',
+  ['half pixel png'] = '70:84c7bd8f',
+  ['one column pixels'] = '1x17:65e06997',
+  ['one column png'] = '93:25640511',
+  ['one row pixels'] = '17x1:65e06997',
+  ['one row png'] = '88:3fbca953',
+}
+
+return table.freeze {
+  scenes = Scenes,
+  recorded = Recorded,
+}
