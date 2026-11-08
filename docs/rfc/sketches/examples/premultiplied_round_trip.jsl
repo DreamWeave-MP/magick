@@ -9,11 +9,13 @@ local checked, failures = 0, 0
 
 for alpha = 1, 255 do
   for channel = 0, 255 do
+    -- Two different values in red and green, so a straight() that copies one slot into another fails.
     local premultipliedChannel, storedAlpha = color.premultiply(channel, alpha, scratch)
-    local red, green, blue = color.straight(premultipliedChannel, premultipliedChannel, premultipliedChannel, storedAlpha)
+    local otherPremultiplied = color.premultiply(255 - channel, alpha, scratch)
+    local red, green, blue = color.straight(premultipliedChannel, otherPremultiplied, premultipliedChannel, storedAlpha)
 
     checked += 1
-    if red ~= channel or green ~= channel or blue ~= channel then failures += 1 end
+    if red ~= channel or green ~= 255 - channel or blue ~= channel then failures += 1 end
   end
 end
 
