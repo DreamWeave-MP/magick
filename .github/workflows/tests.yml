@@ -1,0 +1,64 @@
+name: Tests
+
+# This package's own gates, run on every push and pull request. Nothing here publishes or builds
+# the site: build_site.yml does that, through StroggForge, and runs none of these steps.
+#
+# jess is pinned to v0.3.0, the DreamWeave-MP/jess release, and installed from its GitHub release
+# asset by StroggForge's jess-setup action at v70, the action the site build uses. The steps are the
+# gates of this package as its README and BENCHMARKS.md describe them: the package suites, the
+# strict check, and the gallery run twice against the committed baselines with the baseline
+# folder refused. Benchmarks are not run here: a timing from a shared runner says nothing about
+# this package, and BENCHMARKS.md says how to measure one.
+#
+# UNEXECUTED until its first run on GitHub. Nothing in this file has run yet; the first run is
+# the check that its install and its commands work on the runner.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jess
+        uses: DreamWeave-MP/StroggForge/.github/actions/jess-setup@v70
+        with:
+          jess-version: v0.3.0
+
+      - name: Package suites
+        run: jess package test .
+
+      - name: Strict check
+        run: jess package check .
+
+      - name: Gallery, first run
+        run: >-
+          jess run --package . --capability filesystem.read --capability filesystem.write
+          tools/gallery.jsl target/gallery-a
+
+      - name: Gallery, second run
+        run: >-
+          jess run --package . --capability filesystem.read --capability filesystem.write
+          tools/gallery.jsl target/gallery-b
+
+      - name: Gallery runs are byte-identical
+        run: |
+          cmp target/gallery-a/report.json target/gallery-b/report.json
+          for file in target/gallery-a/*.png; do
+            cmp "$file" "target/gallery-b/$(basename "$file")"
+          done
+
+      - name: Gallery refuses the baseline folder
+        run: |
+          if jess run --package . --capability filesystem.read --capability filesystem.write \
+            tools/gallery.jsl tests/gallery; then
+            echo "::error::the gallery wrote into tests/gallery, the baseline folder"
+            exit 1
+          fi
