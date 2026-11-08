@@ -629,5 +629,5 @@ if not recording then
   local status = if jess.granted('filesystem.read') then proc '/proc/self/status' else nil
   local peak = if status then string.match(status, 'VmHWM:%s*(%d+) kB') else nil
 
-  print(`# peak resident set: {if peak then peak .. ' kB' else 'not recorded, grant filesystem.read to read /proc'}`)
+  print(`# peak resident set (VmHWM): {if peak then peak .. ' kB' else 'not recorded, grant filesystem.read to read /proc'}`)
 end
