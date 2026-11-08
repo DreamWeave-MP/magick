@@ -6,8 +6,13 @@
 -- suite writes no files: tools/gallery.jsl does that, and compares against the same scenes.
 --
 -- The one tolerance is for area: a curve or a circle is flattened to within a tolerance of its
--- own, so its covered area is compared to the analytic area within `AreaTolerance` pixels.
+-- own, so its covered area is compared to the analytic area within `AreaTolerance` pixels. That
+-- check is coarse. A shift of a fraction of a pixel moves an area by less than the tolerance, so
+-- the area checks catch gross geometry errors only; the exact pixels here and the scene
+-- fingerprints are what catch a small shift.
+local gallery = require './gallery_check'
 local goldens = require './goldens'
+local json = require '@jess/json'
 local magick = require '@magick'
 local path = require '@magick/path'
 local scenes = require './scenes'
@@ -231,9 +236,10 @@ suite.describe('extreme sizes', function()
   -- pixel wide or high with a long side.
   local sizes = { { 0, 0 }, { 0, 3 }, { 3, 0 }, { 1, 1 }, { 1, 17 }, { 17, 1 } }
 
-  -- The operations each size is run through, over an image of that size. Only the shape of each
-  -- result is held: `rotate` of nothing gives a 2 by 1 image today, which COMPATIBILITY.md does
-  -- not promise either way, so no size is pinned here.
+  -- The 34 operations each size is run through, over an image of that size. Only the shape of each
+  -- result is held here, and the values are held by the checks after this loop. The one size a
+  -- shape cannot tell apart from a correct result, `rotate` of nothing, is pinned below as the
+  -- legacy defect it is.
   local operations: { { name: string, bytes: number, run: (image: Image) -> unknown } } = {
     { name = 'rect', bytes = 4, run = function(image: Image) return image:rect(0, 0, image.width, image.height, '#ff0000') end },
     { name = 'rect outside', bytes = 4, run = function(image: Image) return image:rect(image.width + 1, image.height + 1, image.width + 3, image.height + 3, '#ff0000') end },
@@ -316,6 +322,154 @@ suite.describe('extreme sizes', function()
     expect(at(image, 6, 0)).toEqual { 255, 255, 255, 255 }
     expect(at(image, 8, 0)).toEqual { 128, 128, 128, 255 }
     expect(at(image, 9, 0)).toEqual { 0, 0, 0, 255 }
+  end)
+end)
+
+suite.describe('values at extreme sizes', function()
+  suite.it('grays a one-pixel image by the luma of its color, alpha kept', function()
+    -- Luma of (51, 102, 153): 0.212656 * 51 + 0.715158 * 102 + 0.072186 * 153 is 94.84, so 95.
+    expect(at(magick.new(1, 1, '#33669980'):grayscale(), 0, 0)).toEqual { 95, 95, 95, 128 }
+  end)
+
+  suite.it('grays every pixel of a one-pixel-wide and of a one-pixel-high image', function()
+    local column = magick.new(1, 17, '#33669980'):grayscale()
+    local line = magick.new(17, 1, '#33669980'):grayscale()
+
+    for index = 0, 16 do
+      expect(at(column, 0, index)).toEqual { 95, 95, 95, 128 }
+      expect(at(line, index, 0)).toEqual { 95, 95, 95, 128 }
+    end
+  end)
+
+  suite.it('sets the alpha of a one-pixel image and of its lines, and keeps the color', function()
+    -- A value up to 1 is a share of full: 0.5 of 255 is 127.5, rounded to 128. Above 1 it is the
+    -- alpha itself.
+    expect(at(magick.new(1, 1, '#336699'):setAlpha(0.5), 0, 0)).toEqual { 51, 102, 153, 128 }
+
+    local column = magick.new(1, 17, '#336699'):setAlpha(0.5)
+    local line = magick.new(17, 1, '#336699'):setAlpha(200)
+
+    for index = 0, 16 do
+      expect(at(column, 0, index)).toEqual { 51, 102, 153, 128 }
+      expect(at(line, index, 0)).toEqual { 51, 102, 153, 200 }
+    end
+  end)
+
+  suite.it('draws a one-pixel-wide column as one column, row by row', function()
+    -- Rows 4 and 8 are half covered by white over black, rows 5 to 7 whole, the rest black.
+    local image = scene 'one column'
+
+    for row = 0, 16 do
+      local value = if row == 4 or row == 8 then 128 elseif row >= 5 and row <= 7 then 255 else 0
+
+      expect(at(image, 0, row)).toEqual { value, value, value, 255 }
+    end
+  end)
+
+  suite.it('pins the rotate of nothing as the legacy defect it is', function()
+    -- Image:rotate of a 0 by 0 image gives a 2 by 1 image of 8 bytes. COMPATIBILITY.md records it
+    -- as a known legacy behaviour, not a correct one: a fix changes this line on purpose.
+    local image = magick.new(0, 0):rotate(30)
+
+    expect({ image.width, image.height, buffer.len(image.data) }).toEqual { 2, 1, 8 }
+  end)
+end)
+
+suite.describe('gallery', function()
+  --- Whether text parses as JSON. pcall only around json.decode, which throws on text it cannot
+  --- read: the throw is the answer.
+  local function parses(text: string): boolean
+    return (pcall(function() json.decode(text) end))
+  end
+
+  suite.it('holds a baseline to its bytes as well as to its pixels', function()
+    local image = scene 'holes'
+    local png = magick.png(image)
+    local reencoded = magick.png(image, 0)
+
+    -- The same pixels in another file: the record of the bytes must refuse it.
+    expect(support.digest(reencoded) == support.digest(png)).toBe(false)
+
+    local row = gallery.compare('holes', scenes.recorded, image, png, reencoded)
+
+    expect(row.baseline.pixels).toBe(support.pixels(image))
+    expect(row.baseline.matches).toBe(false)
+    expect(row.matches).toBe(false)
+    expect(row.firstDifference == nil).toBe(true)
+    expect(gallery.compare('holes', scenes.recorded, image, png, png).matches).toBe(true)
+  end)
+
+  suite.it('names the first pixel a same-size baseline differs at', function()
+    local image = scene 'holes'
+    local altered = scene 'holes'
+
+    altered:set(1, 1, 0, 0, 0, 255)
+
+    local row = gallery.compare('holes', scenes.recorded, image, magick.png(image), magick.png(altered))
+
+    expect(row.matches).toBe(false)
+    expect(row.firstDifference).toEqual {
+      column = 1,
+      row = 1,
+      expected = { 0, 0, 0, 255 },
+      observed = { 255, 255, 255, 255 },
+    }
+    expect(row.firstByte == nil).toBe(true)
+  end)
+
+  suite.it('names the geometry and the first differing byte when a baseline has another size', function()
+    local image = scene 'holes'
+    local other = scene 'curves'
+    local row = gallery.compare('holes', scenes.recorded, image, magick.png(image), magick.png(other))
+
+    expect(row.matches).toBe(false)
+    expect(row.baseline.geometry).toEqual { width = 32, height = 16 }
+    expect(row.firstDifference == nil).toBe(true)
+
+    -- The first byte where the two data differ, found by a second, plain walk over both.
+    local expectedOffset = nil
+
+    for offset = 0, math.min(buffer.len(other.data), buffer.len(image.data)) - 1 do
+      if expectedOffset == nil and buffer.readu8(other.data, offset) ~= buffer.readu8(image.data, offset) then
+        expectedOffset = offset
+      end
+    end
+
+    expect(row.firstByte ~= nil).toBe(true)
+    expect(row.firstByte and row.firstByte.offset).toBe(expectedOffset)
+  end)
+
+  suite.it('writes a report that reads back to the same structure and bytes', function()
+    local holes = scene 'holes'
+    local rect = scene 'clipped rect'
+    local rows = {
+      gallery.compare('holes', scenes.recorded, holes, magick.png(holes), magick.png(holes)),
+      gallery.compare('clipped rect', scenes.recorded, rect, magick.png(rect), magick.png(rect)),
+    }
+    local text = gallery.report(rows, { jess = '0.3.0', verified = true }, 0)
+    local decoded = json.decode(text) :: gallery.Report
+
+    expect(decoded.failed).toBe(0)
+    expect(decoded.runtime.jess).toBe '0.3.0'
+    expect(#decoded.scenes).toBe(2)
+    expect(decoded.scenes[1].scene).toBe 'holes'
+    expect(decoded.scenes[1].matches).toBe(true)
+    expect(decoded.scenes[2].pixels.observed).toBe(support.pixels(rect))
+    expect(json.encodeTable(decoded, { indent = 2 })).toBe(text)
+  end)
+
+  suite.it('refuses a report cut short, or one that lost a closing brace', function()
+    local holes = scene 'holes'
+    local text = gallery.report({
+      gallery.compare('holes', scenes.recorded, holes, magick.png(holes), magick.png(holes)),
+    }, { jess = '0.3.0', verified = true }, 0)
+    local cut = string.sub(text, 1, -2)
+    local lost = string.gsub(text, '\n        },', '\n        ,', 1)
+
+    expect(lost ~= text).toBe(true)
+    expect(parses(text)).toBe(true)
+    expect(parses(cut)).toBe(false)
+    expect(parses(lost)).toBe(false)
   end)
 end)
 
