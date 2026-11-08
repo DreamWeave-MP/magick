@@ -24,5 +24,5 @@ assert(failures == 0, `round trip failed for {failures} channel values`)
 local zeroRed, zeroGreen, zeroBlue, zeroAlpha = color.straight(0.5, 0.5, 0.5, 0)
 assert(zeroRed == 0 and zeroGreen == 0 and zeroBlue == 0 and zeroAlpha == 0, 'alpha 0 stores RGB 0')
 
-print('round trip exact for', checked, 'premultiplied values with alpha 1..255, each in the red, green and blue slots')
+print('round trip exact for', checked, 'premultiplied values with alpha 1..255, with distinct red and green values')
 print('alpha 0 stores', zeroRed, zeroGreen, zeroBlue, zeroAlpha)
