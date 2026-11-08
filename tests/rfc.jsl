@@ -1,9 +1,12 @@
 --!strict
--- The facts docs/RFC-0001-renderer.md relies on, as the 0.1.3 implementation has them today. A
--- renderer change that moves one of them is a change to the RFC, not a quiet fix.
+-- The facts docs/RFC-0001-renderer.md relies on: the 0.1.3 behaviour it records as legacy, and the
+-- reference arithmetic in docs/rfc/sketches that the RFC fixes as the 0.2.0 contract. A change that
+-- moves one of these is a change to the RFC, not a quiet fix.
 local magick = require '@magick'
 local path = require '@magick/path'
 local test = require '@jess/test'
+local transform = require '../docs/rfc/sketches/transform'
+local color = require '../docs/rfc/sketches/color'
 
 local expect = test.expect
 local suite = test.new()
@@ -23,6 +26,11 @@ local function rows(mask: magick.Mask): { { number } }
   end
 
   return out
+end
+
+--- Whether a value is within a rounding error of another.
+local function near(actual: number, expected: number): boolean
+  return math.abs(actual - expected) < 1e-9
 end
 
 suite.describe('pixel corners', function()
@@ -50,6 +58,21 @@ suite.describe('pixel corners', function()
   end)
 end)
 
+suite.describe('coverage of overlapping contours', function()
+  suite.it('covers a half pixel once, as area, and nothing in it is more than the rule gives', function()
+    local mask = path.new():rect(0.5, 0, 2, 1):mask()
+
+    expect(rows(mask)).toEqual { { 128, 255, 0 } }
+  end)
+
+  suite.it('adds two same-direction overlapping contours and clamps the sum, so 0.5 plus 0.5 is 255', function()
+    -- Not exact area (0.5): the 0.1.3 rule sums signed areas and clamps |sum| to 1 (RFC-0001 C2, F1).
+    local mask = path.new():rect(0.5, 0, 2, 1):rect(0.5, 0, 2, 1):mask()
+
+    expect(rows(mask)).toEqual { { 255, 255, 0 } }
+  end)
+end)
+
 suite.describe('tolerance', function()
   suite.it('defaults to a quarter pixel, and the default paints what 0.25 paints', function()
     local defaulted = path.new()
@@ -59,6 +82,27 @@ suite.describe('tolerance', function()
 
     expect(defaulted.tolerance).toBe(0.25)
     expect(buffer.tostring(curveDefault.data)).toBe(buffer.tostring(curveExplicit.data))
+  end)
+end)
+
+suite.describe('finalizing and closed contours', function()
+  suite.it('gives a 0 by 0 mask for a contour of fewer than three points, dropped when it closes', function()
+    local mask, left, top = path.new():moveTo(0, 0):lineTo(4, 0):mask()
+
+    expect({ mask.width, mask.height, left, top }).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('closes an open contour of three points when it is rasterized', function()
+    local mask = path.new():moveTo(0, 0):lineTo(4, 0):lineTo(0, 4):mask()
+
+    expect({ mask.width, mask.height }).toEqual { 5, 4 }
+  end)
+
+  suite.it('does not count an open contour in bounds, nor copy it in transformed', function()
+    local outline = path.new():moveTo(1, 2):lineTo(5, 2):lineTo(5, 7)
+
+    expect({ outline:bounds() }).toEqual { 0, 0, 0, 0 }
+    expect({ outline:transformed(2, 10, 20):bounds() }).toEqual { 0, 0, 0, 0 }
   end)
 end)
 
@@ -80,6 +124,192 @@ suite.describe('transformed', function()
   end)
 end)
 
+suite.describe('reflection', function()
+  --- A raw outline: an outer rectangle wound one way, and a hole wound the other, mirrored about
+  --- x = 6 when `mirror` is set. Raw contours keep their winding, as a reflection keeps relative
+  --- winding.
+  local function outline(mirror: boolean): magick.Mask
+    local shape = path.new()
+
+    local function draw(points: { { number } })
+      local function at(index: number): (number, number)
+        local pointX = if mirror then 6 - points[index][1] else points[index][1]
+
+        return pointX, points[index][2]
+      end
+
+      shape:moveTo(at(1))
+      for index = 2, #points do
+        shape:lineTo(at(index))
+      end
+      shape:close()
+    end
+
+    draw { { 0, 0 }, { 6, 0 }, { 6, 4 }, { 0, 4 } }
+    draw { { 1, 1 }, { 1, 3 }, { 2, 3 }, { 2, 1 } }
+
+    local mask = shape:mask()
+
+    return mask
+  end
+
+  suite.it('gives the mirror of the mask, holes included, with the hole kept', function()
+    local original = rows(outline(false))
+    local mirrored = rows(outline(true))
+
+    -- Original row 1: the hole is at column 1. Mirrored, it is at column 4.
+    expect(original[2]).toEqual { 255, 0, 255, 255, 255, 255, 0 }
+    expect(mirrored[2]).toEqual { 255, 255, 255, 255, 0, 255, 0 }
+
+    for row = 1, 4 do
+      for column = 1, 6 do
+        expect(mirrored[row][column]).toBe(original[row][7 - column])
+      end
+    end
+  end)
+end)
+
+suite.describe('transform reference (docs/rfc/sketches/transform.jsl)', function()
+  suite.it('composes T*S*R so rotation acts first, with the worked point (10, 22)', function()
+    local composed = transform.multiply(
+      transform.translate(10, 20),
+      transform.multiply(transform.scale(2, 2), transform.rotate(math.pi / 2))
+    )
+    local pointX, pointY = transform.apply(composed, 1, 0)
+
+    expect(near(pointX, 10) and near(pointY, 22)).toBe(true)
+  end)
+
+  suite.it('gives the largest singular value, exactly 1 for the identity', function()
+    expect(transform.sigmaMax(transform.identity())).toBe(1)
+    expect(near(transform.sigmaMax(transform.scale(3, 1)), 3)).toBe(true)
+    expect(near(transform.sigmaMax(transform.rotate(0.3)), 1)).toBe(true)
+    expect(near(transform.sigmaMax(transform.scale(2, -1)), 2)).toBe(true)
+  end)
+
+  suite.it('inverts a general matrix back to the point it came from', function()
+    local matrix = transform.multiply(transform.translate(3, -2), transform.multiply(transform.rotate(0.7), transform.scale(2, -0.5)))
+    local forwardX, forwardY = transform.apply(matrix, 1.25, -4)
+    local backX, backY = transform.apply(transform.inverse(matrix), forwardX, forwardY)
+
+    expect(near(backX, 1.25) and near(backY, -4)).toBe(true)
+  end)
+
+  suite.it('refuses a singular matrix to inverse, with the RFC message', function()
+    -- pcall around transform.inverse: the singular matrix must throw, and the test records the message.
+    local ok, message = pcall(transform.inverse, transform.scale(0, 1))
+
+    expect(ok).toBe(false)
+    expect(string.find(tostring(message), 'magick: transform is singular', 1, true) ~= nil).toBe(true)
+  end)
+
+  suite.it('refuses a NaN or infinite matrix with the RFC message', function()
+    local nan = 0 / 0
+    -- pcall around transform.assertFinite: a NaN field must throw, and the test records the message.
+    local ok, message = pcall(transform.assertFinite, { scaleX = nan, skewY = 0, skewX = 0, scaleY = 1, offsetX = 0, offsetY = 0 })
+
+    expect(ok).toBe(false)
+    expect(string.find(tostring(message), 'magick: transform must be finite', 1, true) ~= nil).toBe(true)
+  end)
+
+  suite.it('takes a cubic box from its transformed control points, extrema included', function()
+    -- y(t) = 3t(1-t)(... ) peaks at t = 1/2 with value 75; x is monotonic from 0 to 100.
+    local left, top, right, bottom = transform.cubicBox(transform.identity(), 0, 0, 0, 100, 100, 100, 100, 0)
+
+    expect({ left, top, right, bottom }).toEqual { 0, 0, 100, 75 }
+  end)
+end)
+
+suite.describe('premultiplied tiles (docs/rfc/sketches/color.jsl)', function()
+  suite.it('round-trips every 8-bit channel at every nonzero alpha, through f32 storage', function()
+    local scratch = buffer.create(8)
+    local failures = 0
+
+    for alpha = 1, 255 do
+      for channel = 0, 255 do
+        local premultiplied, storedAlpha = color.premultiply(channel, alpha, scratch)
+        local red, green, blue = color.straight(premultiplied, premultiplied, premultiplied, storedAlpha)
+
+        if red ~= channel or green ~= channel or blue ~= channel then failures += 1 end
+      end
+    end
+
+    expect(failures).toBe(0)
+  end)
+
+  suite.it('stores RGB 0 at alpha 0 whatever RGB went in', function()
+    expect({ color.straight(0.5, 0.5, 0.5, 0) }).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('gives the 12 W3C Porter-Duff factors for an alpha of 0.3 source and 0.6 backdrop', function()
+    local sourceAlpha, backdropAlpha = 0.3, 0.6
+    local factorTable: { [string]: { number } } = {
+      clear = { 0, 0 },
+      ['src'] = { 1, 0 },
+      ['dst'] = { 0, 1 },
+      ['src-over'] = { 1, 1 - sourceAlpha },
+      ['dst-over'] = { 1 - backdropAlpha, 1 },
+      ['src-in'] = { backdropAlpha, 0 },
+      ['dst-in'] = { 0, sourceAlpha },
+      ['src-out'] = { 1 - backdropAlpha, 0 },
+      ['dst-out'] = { 0, 1 - sourceAlpha },
+      ['src-atop'] = { backdropAlpha, 1 - sourceAlpha },
+      ['dst-atop'] = { 1 - backdropAlpha, sourceAlpha },
+      xor = { 1 - backdropAlpha, 1 - sourceAlpha },
+    }
+
+    for operator, expected in factorTable do
+      local fromSource, fromBackdrop = color.factors(operator :: color.Operator, sourceAlpha, backdropAlpha)
+
+      expect(near(fromSource, expected[1]) and near(fromBackdrop, expected[2])).toBe(true)
+    end
+  end)
+
+  suite.it('gives the seven 0.2.0 separable blend values at backdrop 0.5 and source 0.25', function()
+    local expected: { [string]: number } = {
+      normal = 0.25,
+      multiply = 0.125,
+      screen = 0.625,
+      overlay = 0.25,
+      darken = 0.25,
+      lighten = 0.5,
+      ['soft-light'] = 0.375,
+    }
+
+    for mode, value in expected do
+      expect(near(color.separable(mode :: color.BlendMode, 0.5, 0.25), value)).toBe(true)
+    end
+  end)
+
+  suite.it('takes the other branches of overlap and soft-light', function()
+    expect(near(color.separable('overlay', 0.75, 0.25), 0.625)).toBe(true)
+    expect(near(color.separable('soft-light', 0.5, 0.75), 0.5 + 0.5 * (math.sqrt(0.5) - 0.5))).toBe(true)
+  end)
+
+  suite.it('composites an isolated group: children in painter order, opacity once, then onto white', function()
+    local white = { red = 1, green = 1, blue = 1, alpha = 1 }
+    local childRed = { red = 1, green = 0, blue = 0, alpha = 1 }
+    local childBlue = { red = 0, green = 0, blue = 0.5, alpha = 0.5 }
+    local empty = { red = 0, green = 0, blue = 0, alpha = 0 }
+
+    local inside = color.blendPixel('normal', 'src-over', childBlue, color.blendPixel('normal', 'src-over', childRed, empty, 1), 1)
+    local onWhite = color.blendPixel('normal', 'src-over', inside, white, 0.5)
+
+    expect({ onWhite.red, onWhite.green, onWhite.blue, onWhite.alpha }).toEqual { 0.75, 0.5, 0.75, 1 }
+    expect({ color.straight(onWhite.red, onWhite.green, onWhite.blue, onWhite.alpha) }).toEqual { 191, 128, 191, 255 }
+  end)
+
+  suite.it('refuses a non-normal blend with a Porter-Duff operator other than src-over', function()
+    local pixel = { red = 1, green = 0, blue = 0, alpha = 1 }
+    -- pcall around blendPixel: a non-normal blend with another operator must throw, and the test
+    -- records the message.
+    local ok, message = pcall(color.blendPixel, 'multiply', 'src-in', pixel, pixel, 1)
+
+    expect(ok).toBe(false)
+    expect(string.find(tostring(message), 'blend modes composite with src-over only', 1, true) ~= nil).toBe(true)
+  end)
+end)
+
 suite.describe('legacy inputs the RFC rules out for new APIs', function()
   suite.it('fills the rows of a rectangle with a NaN corner across the whole image, silently', function()
     -- Legacy Image:rect clamps with math.min and math.max, which pass NaN through, so the rows
@@ -91,15 +321,29 @@ suite.describe('legacy inputs the RFC rules out for new APIs', function()
     expect({ image:get(0, 3) }).toEqual { 0, 0, 0, 255 }
   end)
 
-  suite.it('fails a path with a NaN coordinate instead of returning a mask', function()
+  suite.it('fails a path with a NaN coordinate with the buffer error, not a magick message', function()
     local nan = 0 / 0
-    -- pcall around path:mask(): a NaN corner makes the legacy path throw, and this pins that it
-    -- throws rather than returning a mask.
-    local ok = pcall(function()
+    -- pcall around path:mask(): a NaN corner makes the legacy path throw, and this pins the message
+    -- the RFC quotes (L3).
+    local ok, message = pcall(function()
       path.new():rect(0, 0, nan, 4):mask()
     end)
 
     expect(ok).toBe(false)
+    expect(string.find(tostring(message), 'buffer access out of bounds', 1, true) ~= nil).toBe(true)
+  end)
+
+  suite.it('reads a negative legacy noise seed as its floored remainder, and 0 as 1', function()
+    -- Legacy seeded(): floored modulo of 2^31-1, and 0 or the modulus itself becomes 1 (L4, D2).
+    local modulus = 2147483647
+    local function bytesOf(seed: number): string
+      return buffer.tostring(magick.noise(4, 4, '#808080', seed).data)
+    end
+
+    expect(bytesOf(-1)).toBe(bytesOf(modulus - 1))
+    expect(bytesOf(0)).toBe(bytesOf(1))
+    expect(bytesOf(modulus)).toBe(bytesOf(1))
+    expect(bytesOf(-1) == bytesOf(1)).toBe(false)
   end)
 end)
 
