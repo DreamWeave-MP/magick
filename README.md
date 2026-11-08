@@ -17,7 +17,8 @@ of a fraction of a pixel moves an area by less than a quarter pixel. The exact p
 fingerprints are what catch a small shift. `jess package test .` writes nothing.
 
 `tools/gallery.jsl` renders the same scenes to PNG and compares them with recorded checksums and
-baseline files, reporting the first differing pixel. It needs both filesystem capabilities, and
+baseline files. Where the sizes match it reports the first differing pixel; where they do not, it reports
+the geometry and the first differing byte. It needs both filesystem capabilities, and
 re-baselining is an explicit `rebaseline` run whose output is reviewed. The commands are in
 [BENCHMARKS.md](BENCHMARKS.md#gates).
 
