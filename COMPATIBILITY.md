@@ -7,7 +7,7 @@ suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and 
 
 Measured against: `jess` 0.3.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
-- `jess package test .`: 376 passed, 0 failed (each test counted once per provider; 274 before `tests/rfc.jsl`, which adds 102).
+- `jess package test .`: 500 passed, 0 failed (each test counted once per provider; 274 before `tests/rfc.jsl` and `tests/rfc_contracts.jsl`, which add 226 counted items, 113 tests).
 - `jess package check .`: no errors, strict types over every `.jsl`.
 - `jess run --package . bench/bench.jsl`: all 91 workloads ran and held their fingerprints.
 
@@ -218,6 +218,25 @@ Each of these would break a consumer, so none happens inside 0.1.x:
 A change that needs any of these goes into a new minor version as an opt-in, with the old
 behavior kept under its old name.
 
+## Owner-approved changes
+
+These are the changes to a 0.1.x name that the owner approved, each stated against the rule it overrides. Each is
+announced in the release notes of the release that ships it, and is not a silent break.
+
+- **`Path:transformed(scale, dx, dy)`: keeps its curves (approved 2026-11-07, implemented by MAG-004 for 0.2.0).** The
+  0.1.x bullet above says the result is "a **new** `Path` whose closed contours are copied with each point moved to
+  `point * scale + offset`". The 0.1.3 implementation reads the points as the flattened curve points: it flattened the
+  curves at the source tolerance and then moved those points, so a curved shape's result was a path of lines. The change:
+  the result keeps the path's commands, the transform is applied to the control points, and the curves are flattened at
+  rasterization with the device tolerance. Scope: curved paths under a transform that is not the identity change;
+  paths with no curves, and the identity transform, do not change by construction. The translation-only curve case is
+  expected to be byte-identical on the MAG-004 fixtures, and that is to be tested, not assumed. The device error of the
+  old bake was 2 device pixels at scale 4 with source tolerance 0.25 (0.5 source pixels, the chord error at that
+  tolerance, times 4); the retained curve's error is 0.5 device pixels. The rule it overrides is the policy line
+  "**Quirks are contract too.** ... A fix goes in as a clearly versioned opt-in, never as a silent change", which this
+  entry records as an owner-approved exception rather than an opt-in. Golden and benchmark files do not call
+  `transformed` on a curve, so no golden moves. Release notes for 0.2.0 must carry this entry.
+
 ## Where the proof lives
 
 - `tests/basic.jsl`: every operation on seeded fixtures, held to the goldens in
@@ -225,5 +244,6 @@ behavior kept under its old name.
 - `tests/png.jsl`, `tests/path.jsl`, `tests/resample.jsl`: the codecs, paths and resampling.
 - `tests/compat.jsl`: the examples in this document, and the consumer call shapes.
 - `tests/style.jsl`: `@jess/style` over the payload.
+- `tests/rfc.jsl`, `tests/rfc_contracts.jsl`: the renderer RFC's pinned legacy facts and its computable contracts (`docs/RFC-0001-renderer.md`).
 - `bench/bench.jsl`: every workload, held to its fingerprint; methodology and the reference table
   are in `BENCHMARKS.md`.
