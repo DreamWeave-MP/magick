@@ -1,6 +1,7 @@
 --!strict
 -- RFC-0001 section 8 (W5): straight RGBA8 -> premultiplied f32 -> straight RGBA8 is exact for every
--- channel at every nonzero alpha (the same stored value is checked in each of the three color slots), and a zero alpha stores RGB 0.
+-- channel at every nonzero alpha. Red and blue get the same stored value, green gets 255 - channel, so a copy between
+-- slots would fail. A zero alpha stores RGB 0.
 -- Run: jess run --package . docs/rfc/sketches/examples/premultiplied_round_trip.jsl
 local color = require '../color'
 
