@@ -1,6 +1,6 @@
 --!strict
 --[[
-@magick/render: 0.3.0+ SKETCH (RFC-0001 sections 9 and 10). NOT part of 0.2.0. Every function is
+@magick/render: 0.3.0+ SKETCH (RFC-0001 sections 10 and 11). NOT part of 0.2.0. Every function is
 a STUB.
 
 Rendering compiles a scene to operations, then runs them tile by tile in a fixed order. Tile
@@ -18,16 +18,16 @@ export type Image = { width: number, height: number, data: buffer }
 
 --- The options a render takes, each with the default RFC-0001 gives it.
 export type Options = {
-  tileSize: number?,
-  workers: number | 'auto'?,
-  memoryBudgetBytes: number?,
+  tileSize: number?,      -- 128 by default, at most 256 (B1)
+  workers: number | 'auto'?, -- an integer 1..8, or 'auto' for the host count capped at 8 (B3)
+  memoryBudgetBytes: number?, -- refused before any tile runs when the plan's bound exceeds it (B3)
 }
 
 Render.DefaultTileSize = 128
 Render.MaxTileSize = 256
 
 --- Stub: renders a document to a straight RGBA8 image, tile by tile in row-major tile order.
---- Result is independent of tile size and worker count (RFC-0001 section 10), a property the
+--- Result is independent of tile size and worker count (RFC-0001 section 11, D3), a property the
 --- 0.3.0 parity tests check rather than assume.
 function Render.image(document: Document, options: Options?): Image
   error('magick: sketch stub, not implemented before 0.3.0', 2)

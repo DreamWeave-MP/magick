@@ -1,10 +1,10 @@
 --!strict
 --[[
-@magick/scene: 0.3.0+ SKETCH (RFC-0001 section 11). NOT part of 0.2.0. Every function is a STUB.
+@magick/scene: 0.3.0+ SKETCH (RFC-0001 section 12). NOT part of 0.2.0. Every function is a STUB.
 
-The scene is a TREE: each node has one parent, and nodes are never shared. A shared paint or
+Scene structure is a TREE: each node has one parent, and nodes are never shared. A shared paint or
 pattern is a value, shared freely, because paints are immutable. A DAG of node references is
-deferred (section 11 says why, and what would have to exist before it is added).
+deferred (section 12 says why, and what would have to exist before it is added).
 ]]
 
 local color = require './color'
@@ -16,7 +16,7 @@ local Scene = {}
 export type Matrix = transform.Matrix
 export type Paint = paint.Paint
 
---- Limits of a scene, fixed by RFC-0001 section 9 and checked when a node is added.
+--- Limits of a scene, fixed by RFC-0001 section 11 and checked when a node is added.
 Scene.MaxDepth = 32
 Scene.MaxNodes = 65536
 

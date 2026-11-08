@@ -10,8 +10,8 @@ multiply(first, second) is first o second: second is applied to a point first.
 So T*S*R in the RFC means: rotate, then scale, then translate.
 
 The arithmetic below is a REFERENCE for checking the convention and is small enough to be
-read in full. It is not the 0.2.0 module. The bounds and singular-handling rules are stated in
-the RFC and are the contract; the stub at the bottom is not implemented.
+read in full. It is not the 0.2.0 module. The tests in tests/rfc.jsl run it; the bounds stub at
+the bottom is not implemented.
 ]]
 
 local Transform = {}
@@ -68,8 +68,18 @@ function Transform.determinant(matrix: Matrix): number
   return matrix.scaleX * matrix.scaleY - matrix.skewY * matrix.skewX
 end
 
+--- Refuses a matrix with a NaN or infinite field (RFC-0001 T6). Every other function here
+--- assumes its input has passed this check.
+function Transform.assertFinite(matrix: Matrix): ()
+  local fields = { matrix.scaleX, matrix.skewY, matrix.skewX, matrix.scaleY, matrix.offsetX, matrix.offsetY }
+
+  for _, value in fields do
+    if value ~= value or math.abs(value) == math.huge then error('magick: transform must be finite', 2) end
+  end
+end
+
 --- Singular when the determinant is zero, or small against the square of the linear part's
---- largest entry (1e-12 relative). Nonfinite entries are rejected before this is asked.
+--- largest entry (1e-12 relative).
 function Transform.isSingular(matrix: Matrix): boolean
   local largest = math.max(
     math.abs(matrix.scaleX),
@@ -97,9 +107,10 @@ function Transform.sigmaMax(matrix: Matrix): number
   return math.sqrt((sumOfSquares + spread) / 2)
 end
 
---- The inverse. Errors on a singular matrix rather than returning one that maps everything to
---- a line, so a caller can never raster through a degenerate transform by accident.
+--- The inverse. Refuses a nonfinite matrix, and errors on a singular one rather than returning one
+--- that maps everything to a line.
 function Transform.inverse(matrix: Matrix): Matrix
+  Transform.assertFinite(matrix)
   if Transform.isSingular(matrix) then error('magick: transform is singular', 2) end
 
   local determinant = Transform.determinant(matrix)
@@ -114,10 +125,90 @@ function Transform.inverse(matrix: Matrix): Matrix
   }
 end
 
---- Stub: the conservative device bounds of a point set, the box of the control points that the
---- curves in a path lie inside (convex hull property), inflated by a stroke half width times
---- sigmaMax. Not implemented in the sketch.
-function Transform.bounds(matrix: Matrix, points: { number }, strokeHalfWidth: number): (number, number, number, number)
+--- One coordinate of a cubic Bezier with control values `start, first, second, finish`, at `along`.
+local function bezierAt(start: number, first: number, second: number, finish: number, along: number): number
+  local rest = 1 - along
+
+  return rest * rest * rest * start
+    + 3 * rest * rest * along * first
+    + 3 * rest * along * along * second
+    + along * along * along * finish
+end
+
+--- The parameters in (0, 1) where one coordinate of a cubic Bezier has zero slope. Its derivative
+--- is 3 * (A t^2 + B t + C) with A = u - 2v + w, B = 2(v - u), C = u, for u, v, w the differences
+--- of the control values.
+local function turningPoints(start: number, first: number, second: number, finish: number): { number }
+  local early, middle, late = first - start, second - first, finish - second
+  local quadratic = early - 2 * middle + late
+  local linear = 2 * (middle - early)
+  local constant = early
+  local candidates: { number } = {}
+
+  if math.abs(quadratic) < 1e-12 then
+    if math.abs(linear) >= 1e-12 then table.insert(candidates, -constant / linear) end
+  else
+    local discriminant = linear * linear - 4 * quadratic * constant
+
+    if discriminant >= 0 then
+      local root = math.sqrt(discriminant)
+
+      table.insert(candidates, (-linear + root) / (2 * quadratic))
+      table.insert(candidates, (-linear - root) / (2 * quadratic))
+    end
+  end
+
+  local inside: { number } = {}
+
+  for _, along in candidates do
+    if along > 0 and along < 1 then table.insert(inside, along) end
+  end
+
+  return inside
+end
+
+--- The exact device box of a cubic Bezier: its control points are transformed first (an affine
+--- map carries a Bezier to the Bezier of its transformed control points), then the box is taken
+--- over the endpoints and the turning points of each coordinate. Returns left, top, right, bottom.
+--- This is MAG-005's "cubic extrema" rule; the stroke inflation of RFC-0001 T8 is added by the caller.
+function Transform.cubicBox(
+  matrix: Matrix,
+  startX: number,
+  startY: number,
+  firstX: number,
+  firstY: number,
+  secondX: number,
+  secondY: number,
+  finishX: number,
+  finishY: number
+): (number, number, number, number)
+  local transformedStartX, transformedStartY = Transform.apply(matrix, startX, startY)
+  local transformedFirstX, transformedFirstY = Transform.apply(matrix, firstX, firstY)
+  local transformedSecondX, transformedSecondY = Transform.apply(matrix, secondX, secondY)
+  local transformedFinishX, transformedFinishY = Transform.apply(matrix, finishX, finishY)
+
+  local left = math.min(transformedStartX, transformedFinishX)
+  local right = math.max(transformedStartX, transformedFinishX)
+  local top = math.min(transformedStartY, transformedFinishY)
+  local bottom = math.max(transformedStartY, transformedFinishY)
+
+  for _, along in turningPoints(transformedStartX, transformedFirstX, transformedSecondX, transformedFinishX) do
+    left = math.min(left, bezierAt(transformedStartX, transformedFirstX, transformedSecondX, transformedFinishX, along))
+    right = math.max(right, bezierAt(transformedStartX, transformedFirstX, transformedSecondX, transformedFinishX, along))
+  end
+
+  for _, along in turningPoints(transformedStartY, transformedFirstY, transformedSecondY, transformedFinishY) do
+    top = math.min(top, bezierAt(transformedStartY, transformedFirstY, transformedSecondY, transformedFinishY, along))
+    bottom = math.max(bottom, bezierAt(transformedStartY, transformedFirstY, transformedSecondY, transformedFinishY, along))
+  end
+
+  return left, top, right, bottom
+end
+
+--- Stub: the conservative device bounds of a whole path, with stroke inflation by a half width
+--- times sigmaMax and rounding out to whole pixel edges. Not implemented in the sketch; the
+--- per-curve box above is the part the RFC fixes.
+function Transform.bounds(matrix: Matrix, strokeHalfWidth: number): (number, number, number, number)
   error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
 end
 

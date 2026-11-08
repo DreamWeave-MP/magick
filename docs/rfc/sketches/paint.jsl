@@ -1,6 +1,6 @@
 --!strict
 --[[
-@magick/paint (0.2.0), SKETCH of RFC-0001 section 8. Declarations only: every constructor and
+@magick/paint (0.2.0), SKETCH of RFC-0001 section 9. Declarations only: every constructor and
 span function is a STUB. The types are the contract the 0.2.0 module must meet.
 
 A paint is an immutable value. It has no mutation API, so one paint can be used by many shapes
@@ -56,7 +56,7 @@ function Paint.linear(x0: number, y0: number, x1: number, y1: number, stops: { S
   error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
 end
 
---- Stub: a radial gradient. radius 0 gives the last stop's color (RFC section 10).
+--- Stub: a radial gradient. radius 0 gives the last stop's color (RFC-0001 section 9, M8).
 function Paint.radial(cx: number, cy: number, radius: number, stops: { Stop }, options: { spread: Spread?, space: Space?, transform: Matrix? }?): Paint
   error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
 end

@@ -21,17 +21,18 @@ local left, top = path.new():rect(1, 1, 2, 2):transformed(2, 10, 20):bounds()
 assert(left == legacyX and top == legacyY, 'legacy transformed is not T*S')
 print('legacy transformed (1,1) =', left, top)
 
--- Reflection flips the sign of the determinant. Coverage uses |sum| for nonzero and the
--- triangle wave for evenodd, so a whole path reflected covers the same pixels.
+-- The reflection claim (coverage invariant under a sign flip) is checked on real masks in
+-- tests/rfc.jsl; this example checks the determinant that the claim depends on.
 local reflected = transform.scale(-1, 1)
 assert(transform.determinant(reflected) < 0, 'reflection has a negative determinant')
-local mask = path.new():rect(0, 0, 4, 4):mask()
-assert(mask.width == 5 and mask.height == 4, 'pixel-corner geometry changed')
-print('reflected determinant', transform.determinant(reflected), 'mask', mask.width, mask.height)
+print('reflected determinant', transform.determinant(reflected))
 
--- Singular matrices are refused, never inverted into garbage.
--- pcall around transform.inverse: a singular matrix must make it throw, and the example carries on
--- to report that it did.
+-- Cubic extrema (RFC-0001 T8): the cubic (0,0),(0,100),(100,100),(100,0) reaches y = 75 at t = 1/2.
+local cubicLeft, cubicTop, cubicRight, cubicBottom = transform.cubicBox(transform.identity(), 0, 0, 0, 100, 100, 100, 100, 0)
+assert(cubicLeft == 0 and cubicTop == 0 and cubicRight == 100 and math.abs(cubicBottom - 75) < 1e-9, 'cubic extrema')
+print('cubic box', cubicLeft, cubicTop, cubicRight, cubicBottom)
+
+-- Singular and nonfinite matrices are refused, never inverted into garbage.
 local refused = not pcall(transform.inverse, transform.scale(0, 1))
 assert(refused, 'singular inverse must fail')
 print('singular inverse refused')

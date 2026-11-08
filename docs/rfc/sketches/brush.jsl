@@ -5,7 +5,7 @@ a STUB. It is here so the 0.2.0 paint and color types are checked against a brus
 
 A brush is a stamp: a dab is a coverage tile at a position with a paint. Dab randomness is not a
 mutable generator. Each value comes from the stable hash of (seed, node, stroke, dab, sample)
-(RFC-0001 section 10), so a dab's pixels do not depend on the order or the worker that drew it.
+(RFC-0001 section 11, D2), so a dab's pixels do not depend on the order or the worker that drew it.
 ]]
 
 local paint = require './paint'

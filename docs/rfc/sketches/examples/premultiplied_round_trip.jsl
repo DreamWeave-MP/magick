@@ -1,6 +1,6 @@
 --!strict
--- RFC-0001 section 7: straight RGBA8 -> premultiplied f32 -> straight RGBA8 is exact for every
--- channel at every nonzero alpha, and a zero alpha stores RGB 0.
+-- RFC-0001 section 8 (W5): straight RGBA8 -> premultiplied f32 -> straight RGBA8 is exact for every
+-- channel at every nonzero alpha (the same stored value is checked in each of the three color slots), and a zero alpha stores RGB 0.
 -- Run: jess run --package . docs/rfc/sketches/examples/premultiplied_round_trip.jsl
 local color = require '../color'
 
@@ -10,10 +10,10 @@ local checked, failures = 0, 0
 for alpha = 1, 255 do
   for channel = 0, 255 do
     local premultipliedChannel, storedAlpha = color.premultiply(channel, alpha, scratch)
-    local red = color.straight(premultipliedChannel, 0, 0, storedAlpha)
+    local red, green, blue = color.straight(premultipliedChannel, premultipliedChannel, premultipliedChannel, storedAlpha)
 
     checked += 1
-    if red ~= channel then failures += 1 end
+    if red ~= channel or green ~= channel or blue ~= channel then failures += 1 end
   end
 end
 
@@ -22,10 +22,5 @@ assert(failures == 0, `round trip failed for {failures} channel values`)
 local zeroRed, zeroGreen, zeroBlue, zeroAlpha = color.straight(0.5, 0.5, 0.5, 0)
 assert(zeroRed == 0 and zeroGreen == 0 and zeroBlue == 0 and zeroAlpha == 0, 'alpha 0 stores RGB 0')
 
--- Porter-Duff: source-over of a half-covered red onto opaque white.
-local fromSource, fromBackdrop = color.factors('src-over', 0.5, 1)
-local over = 0.5 * fromSource + 1 * fromBackdrop
-assert(math.abs(over - 1) < 1e-12, 'opaque backdrop stays opaque under source-over')
-
-print('round trip exact for', checked, 'channel values with alpha 1..255')
+print('round trip exact for', checked, 'premultiplied values with alpha 1..255, each in the red, green and blue slots')
 print('alpha 0 stores', zeroRed, zeroGreen, zeroBlue, zeroAlpha)

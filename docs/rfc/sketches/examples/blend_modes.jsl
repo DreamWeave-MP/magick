@@ -1,0 +1,34 @@
+--!strict
+-- RFC-0001 section 8 (W9): one worked value per 0.2.0 blend mode, on opaque pixels, backdrop 0.5 and
+-- source 0.25 in straight channels. Then one off-center value per branch of overlap and soft-light.
+-- Run: jess run --package . docs/rfc/sketches/examples/blend_modes.jsl
+local color = require '../color'
+
+local function near(actual: number, expected: number): boolean
+  return math.abs(actual - expected) < 1e-12
+end
+
+local expectations: { { mode: color.BlendMode, backdrop: number, source: number, value: number } } = {
+  { mode = 'normal', backdrop = 0.5, source = 0.25, value = 0.25 },
+  { mode = 'multiply', backdrop = 0.5, source = 0.25, value = 0.125 },
+  { mode = 'screen', backdrop = 0.5, source = 0.25, value = 0.625 },
+  { mode = 'overlay', backdrop = 0.5, source = 0.25, value = 0.25 },
+  { mode = 'darken', backdrop = 0.5, source = 0.25, value = 0.25 },
+  { mode = 'lighten', backdrop = 0.5, source = 0.25, value = 0.5 },
+  { mode = 'soft-light', backdrop = 0.5, source = 0.25, value = 0.375 },
+  { mode = 'overlay', backdrop = 0.75, source = 0.25, value = 0.625 },
+  { mode = 'soft-light', backdrop = 0.5, source = 0.75, value = 0.5 + 0.5 * (math.sqrt(0.5) - 0.5) },
+}
+
+for _, case in expectations do
+  local got = color.separable(case.mode, case.backdrop, case.source)
+  assert(near(got, case.value), `{case.mode} B({case.backdrop}, {case.source}) = {got}, expected {case.value}`)
+  print(case.mode, case.backdrop, case.source, got)
+end
+
+-- The same modes through the premultiplied compositing path, opaque on opaque: result is B.
+local opaqueSource = { red = 0.25, green = 0.25, blue = 0.25, alpha = 1 }
+local opaqueBackdrop = { red = 0.5, green = 0.5, blue = 0.5, alpha = 1 }
+local multiplied = color.blendPixel('multiply', 'src-over', opaqueSource, opaqueBackdrop, 1)
+assert(near(multiplied.red, 0.125) and near(multiplied.alpha, 1), 'opaque multiply composites to B')
+print('multiply through blendPixel', multiplied.red, multiplied.alpha)
