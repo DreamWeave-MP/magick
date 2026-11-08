@@ -1,0 +1,40 @@
+--!strict
+-- RFC-0001 section 3, worked example: T*S*R applied to (1, 0) gives (10, 22).
+-- Run: jess run --package . docs/rfc/sketches/examples/transform_order.jsl
+local path = require '@magick/path'
+local transform = require '../transform'
+
+local rotate = transform.rotate(math.pi / 2)
+local scaleBy = transform.scale(2, 2)
+local moveBy = transform.translate(10, 20)
+local composed = transform.multiply(moveBy, transform.multiply(scaleBy, rotate))
+
+local pointX, pointY = transform.apply(composed, 1, 0)
+assert(math.abs(pointX - 10) < 1e-9 and math.abs(pointY - 22) < 1e-9, 'T*S*R order changed')
+print('T*S*R (1,0) =', pointX, pointY)
+
+-- The legacy Path:transformed(scale, dx, dy) is matrix(s, 0, 0, s, dx, dy), that is T*S: scale
+-- first, then offset. The corner (1, 1) through it, and through the path:
+local legacy = transform.multiply(transform.translate(10, 20), transform.scale(2, 2))
+local legacyX, legacyY = transform.apply(legacy, 1, 1)
+local left, top = path.new():rect(1, 1, 2, 2):transformed(2, 10, 20):bounds()
+assert(left == legacyX and top == legacyY, 'legacy transformed is not T*S')
+print('legacy transformed (1,1) =', left, top)
+
+-- The reflection claim (coverage invariant under a sign flip) is checked on real masks in
+-- tests/rfc.jsl; this example checks the determinant that the claim depends on.
+local reflected = transform.scale(-1, 1)
+assert(transform.determinant(reflected) < 0, 'reflection has a negative determinant')
+print('reflected determinant', transform.determinant(reflected))
+
+-- Cubic extrema (RFC-0001 T8): the cubic (0,0),(0,100),(100,100),(100,0) reaches y = 75 at t = 1/2.
+local cubicLeft, cubicTop, cubicRight, cubicBottom = transform.cubicBox(transform.identity(), 0, 0, 0, 100, 100, 100, 100, 0)
+assert(cubicLeft == 0 and cubicTop == 0 and cubicRight == 100 and math.abs(cubicBottom - 75) < 1e-9, 'cubic extrema')
+print('cubic box', cubicLeft, cubicTop, cubicRight, cubicBottom)
+
+-- Singular and nonfinite matrices are refused, never inverted into garbage.
+local refused = not pcall(transform.inverse, transform.scale(0, 1))
+assert(refused, 'singular inverse must fail')
+print('singular inverse refused')
+
+return true
