@@ -5,7 +5,7 @@ alter inside 0.1.x. It was written from the package as imported (commit `6206925
 suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and the goldens in
 `tests/goldens.jsl` hold every operation to the bytes it gave at import.
 
-Measured against: `jess` 0.3.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
+Measured against: `jess` 0.4.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
 - `jess package test .`: 438 passed, 0 failed. That is 219 tests counted twice: each suite runs once from
   the source folder and once from the packed `.jpk`, so every count is doubled. Per provider, 49 are

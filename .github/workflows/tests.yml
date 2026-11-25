@@ -3,15 +3,15 @@ name: Tests
 # This package's own gates, run on every push and pull request. Nothing here publishes or builds
 # the site: build_site.yml does that, through StroggForge, and runs none of these steps.
 #
-# jess is pinned to v0.3.0, the DreamWeave-MP/jess release, and installed from its GitHub release
+# jess is pinned to v0.4.0, the DreamWeave-MP/jess release, and installed from its GitHub release
 # asset by StroggForge's jess-setup action at v70, the action the site build uses. The steps are the
 # gates of this package as its README and BENCHMARKS.md describe them: the package suites, the
 # strict check, and the gallery run twice against the committed baselines with the baseline
 # folder refused. Benchmarks are not run here: a timing from a shared runner says nothing about
 # this package, and BENCHMARKS.md says how to measure one.
 #
-# UNEXECUTED until its first run on GitHub. Nothing in this file has run yet; the first run is
-# the check that its install and its commands work on the runner.
+# First run on GitHub: run 42444476485, green against v0.3.0. Moved to v0.4.0, whose strict check
+# caught a nil the gallery tool did not handle.
 
 on:
   push:
@@ -30,7 +30,7 @@ jobs:
       - name: Install jess
         uses: DreamWeave-MP/StroggForge/.github/actions/jess-setup@v70
         with:
-          jess-version: v0.3.0
+          jess-version: v0.4.0
 
       - name: Package suites
         run: jess package test .
@@ -51,7 +51,7 @@ jobs:
       - name: Gallery reports the verified build it ran on
         run: |
           grep -q '"verified": true' target/gallery-a/report.json
-          grep -q '"jess": "0.3.0"' target/gallery-a/report.json
+          grep -q '"jess": "0.4.0"' target/gallery-a/report.json
 
       - name: Gallery runs are byte-identical
         run: |

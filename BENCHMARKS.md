@@ -64,8 +64,7 @@ lock, and read as the median of the runs' medians:
 ### Gates
 
 The gates run in continuous integration by `.github/workflows/tests.yml`, which this package owns.
-That workflow is UNEXECUTED until its first run on GitHub: nothing in it has run, and it is not green
-until a run shows it is. It installs jess `v0.3.0`, the DreamWeave-MP/jess release, from its Linux
+It first ran green on GitHub in run 42444476485, against jess `v0.3.0`. It installs jess `v0.4.0`, the DreamWeave-MP/jess release, from its Linux
 asset through StroggForge's `jess-setup` action at `v70`, and runs `jess package test .`,
 `jess package check .`, the gallery twice with a byte comparison of its reports and PNGs, and a
 check that the gallery refuses `tests/gallery`. The site build in `build_site.yml` runs none of these:
