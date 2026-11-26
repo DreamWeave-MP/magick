@@ -242,8 +242,8 @@ suite.describe('refusals', function()
     end).toThrow 'magick: opacity must be in 0..1'
 
     expect(function()
-      color.composite(first, first, { blend = 'multiply' } :: any)
-    end).toThrow 'magick: unknown option blend'
+      color.composite(first, first, { mode = 'multiply' } :: any)
+    end).toThrow 'magick: unknown option mode'
 
     expect(function()
       color.tile(1, 1, { space = 'cmyk' :: any })
