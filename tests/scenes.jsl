@@ -19,6 +19,7 @@ local path = require '@magick/path'
 local render = require '@magick/render'
 local sceneModule = require '@magick/scene'
 local transform = require '@magick/transform'
+local text = require '@magick/text'
 local support = require './support'
 
 type Image = support.Image
@@ -369,6 +370,19 @@ scene('materials', function()
   return color.toImage(tile)
 end)
 
+-- MAG-035: the monoline face at three weights, capitals, small capitals, digits and punctuation,
+-- filled with a gradient.
+scene('monoline specimen', function()
+  local tile = color.tile(220, 92)
+
+  paint.fillMask(tile, paint.solid '#14161c')
+  paint.fillPath(tile, text.path(text.monoline(12), 'MAGICK', 110, 30, 30, { align = 'center' }), paint.linear(0, 8, 0, 30, paint.stops(0, '#ffe0a0', 1, '#e06040')))
+  paint.fillPath(tile, text.path(text.monoline(), 'Atelier & Canvas 0.4', 8, 56, 16), paint.solid '#e8e4dc')
+  paint.fillPath(tile, text.path(text.monoline(4), '"QUICK, BROWN FOX?" (1/2+3)!', 8, 80, 13), paint.solid '#a0c8ff')
+
+  return color.toImage(tile)
+end)
+
 --- The scenes, in the order the gallery renders and the gate suite checks them.
 local Scenes: { Scene } = scenes
 
@@ -424,6 +438,8 @@ local Recorded: { [string]: string } = {
   ['brush media png'] = '16365:ecf64b5a',
   ['materials pixels'] = '150x96:6bf684c7',
   ['materials png'] = '15156:229435a7',
+  ['monoline specimen pixels'] = '220x92:a4989d4f',
+  ['monoline specimen png'] = '7452:9fd950d9',
 }
 
 return table.freeze {

@@ -1,0 +1,119 @@
+--!strict
+-- `@magick/text` (MAG-035): the monoline face measured and set at a size, aligned, in small
+-- capitals for lowercase, refusing what it cannot set; and an outline font adapted through a pen,
+-- with no font file and no dependency.
+local color = require '@magick/color'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local test = require '@jess/test'
+local text = require '@magick/text'
+
+local expect = test.expect
+local suite = test.new()
+
+local function near(actual: number, expected: number, within: number): boolean
+  return math.abs(actual - expected) <= within
+end
+
+suite.describe('monoline', function()
+  local face = text.monoline()
+
+  suite.it('sets capitals a cap height of 0.7 em above the baseline, stroked to its weight', function()
+    local left, top, _, bottom = text.path(face, 'H', 10, 100, 100):deviceBounds()
+
+    -- Cap height 70 from the baseline at 100, widened by half the 7.5 stroke each way; the round
+    -- caps are flattened circles whose points sit a little outside them, hence 0.15.
+    expect(near(top, 100 - 70 - 3.75, 0.15) and near(bottom, 100 + 3.75, 0.15)).toBe(true)
+    expect(near(left, 10 - 3.75, 0.15)).toBe(true)
+  end)
+
+  suite.it('measures a line by its advances, and aligns it to the point given', function()
+    local width = text.measure(face, 'HI', 100)
+
+    -- H 6.8 and I 1.6 units, tracking 1.6 between them, 7 pixels a unit at 100.
+    expect(near(width, (6.8 + 1.6 + 1.6) * 7, 1e-9)).toBe(true)
+
+    local leftEdge = text.path(face, 'HI', 200, 100, 100, { align = 'right' }):deviceBounds()
+
+    expect(near(leftEdge, 200 - width - 3.75, 0.15)).toBe(true)
+
+    local centered = text.path(face, 'HI', 200, 100, 100, { align = 'center' }):deviceBounds()
+
+    expect(near(centered, 200 - width / 2 - 3.75, 0.15)).toBe(true)
+  end)
+
+  suite.it('sets lowercase as small capitals on the same baseline', function()
+    local _, capTop = text.path(face, 'A', 0, 100, 100):deviceBounds()
+    local _, smallTop, _, smallBottom = text.path(face, 'a', 0, 100, 100):deviceBounds()
+
+    expect(near(smallBottom, 100 + 3.75, 0.15)).toBe(true)
+    expect(near(smallTop, 100 - 70 * 0.74 - 3.75, 0.15)).toBe(true)
+    expect(smallTop > capTop).toBe(true)
+  end)
+
+  suite.it('fills glyphs with any paint through public APIs', function()
+    local tile = color.tile(120, 40)
+
+    paint.fillPath(tile, text.path(face, 'OK', 4, 34, 40), paint.linear(0, 0, 120, 0, paint.stops(0, '#ff0000', 1, '#0000ff')))
+
+    local covered = 0
+
+    for row = 0, 39 do
+      for column = 0, 119 do
+        if select(4, color.pixel(tile, column, row)) > 0.5 then covered += 1 end
+      end
+    end
+
+    expect(covered > 200).toBe(true)
+  end)
+
+  suite.it('refuses characters it has no glyph for, and bad sizes and weights', function()
+    expect(function()
+      text.path(face, 'Ω', 0, 0, 10)
+    end).toThrow 'magick: the monoline face has no glyph for'
+
+    expect(function()
+      text.path(face, 'A', 0, 0, 0)
+    end).toThrow 'magick: a text size must be in (0, 100000]'
+
+    expect(function()
+      text.monoline(0)
+    end).toThrow 'magick: a monoline weight must be in (0, 40]'
+
+    expect(function()
+      text.path(face, 'A', 0, 0, 10, { align = 'justify' :: any })
+    end).toThrow 'magick: unknown alignment justify'
+  end)
+end)
+
+suite.describe('outline fonts', function()
+  suite.it('takes a font that draws through a pen: a square glyph a size wide', function()
+    local square = text.outline {
+      outline = function(pen: path.Pen, content: string, size: number, originX: number, originY: number): unknown
+        for index = 0, #content - 1 do
+          local left = originX + index * size
+
+          pen.moveTo(left, originY - size)
+          pen.lineTo(left + size * 0.8, originY - size)
+          pen.lineTo(left + size * 0.8, originY)
+          pen.lineTo(left, originY)
+          pen.close()
+        end
+
+        return nil
+      end,
+      measure = function(content: string, size: number): { width: number }
+        return { width = #content * size }
+      end,
+    }
+
+    expect(text.measure(square, 'ab', 10)).toBe(20)
+
+    local outline = text.path(square, 'ab', 50, 30, 10, { align = 'center' })
+    local left, top, right, bottom = outline:deviceBounds()
+
+    expect({ left, top, right, bottom }).toEqual { 40, 20, 58, 30 }
+  end)
+end)
+
+return suite
