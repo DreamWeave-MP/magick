@@ -21,6 +21,14 @@ part of a row left of the window is carried in as one integer sum. Integer sums 
 their order, so a window's bytes are the bytes a single larger window gives at the same pixels.
 
 Scratch is one row of cells as wide as the window, plus the edges themselves.
+
+Cost. A cluster of k edges in one strip with c crossings costs about k^2 / 2 pair tests and
+(c + 2k) bands of k edges each. Exactness needs every crossing, so densely crossing geometry is
+refused rather than approximated: a cluster with more than MaxStripCrossings crossings, or whose
+pair tests and band work would pass MaxStripWork, raises before that work is done. A cluster is a
+function of the outline and the strip alone, never of the window, so whether an outline is refused
+does not depend on how the canvas is tiled: every tiling of a canvas processes every cluster that
+reaches it.
 ]]
 
 local dataPlane = require '@dream/data'
@@ -48,6 +56,10 @@ export type Prepared = {
 
 --- The most edges one prepared outline may hold.
 Module.MaxSegmentsPerCoverage = 1048576
+--- The most crossings of edges one cluster may have inside one pixel row.
+Module.MaxStripCrossings = 65536
+--- The most work units (pair tests, then band edges) one cluster may take in one pixel row.
+Module.MaxStripWork = 4194304
 
 local Scale = 1073741824
 
@@ -153,22 +165,6 @@ local function sortBy(items: { number }, keys: { number }, count: number)
     end
 
     items[at + 1] = item
-  end
-end
-
---- Sorts numbers ascending in place over `values[1..count]`.
-@native
-local function sortNumbers(values: { number }, count: number)
-  for index = 2, count do
-    local value = values[index]
-    local at = index - 1
-
-    while at >= 1 and values[at] > value do
-      values[at + 1] = values[at]
-      at -= 1
-    end
-
-    values[at + 1] = value
   end
 end
 
@@ -300,6 +296,9 @@ local function cover(prepared: Prepared, rule: FillRule, left: number, top: numb
   local spanTop: { number }, spanBottom: { number }, startX: { number }, endX: { number } = {}, {}, {}, {}
   local lowX: { number }, highX: { number }, key: { number } = {}, {}, {}
   local band: { number }, byLow: { number } = {}, {}
+  -- Which band an edge was last put in, by a mark that grows band by band.
+  local member: { number } = {}
+  local mark = 0
   local events: { number } = {}
 
   for rowIndex = 0, height - 1 do
@@ -391,7 +390,11 @@ local function cover(prepared: Prepared, rule: FillRule, left: number, top: numb
       end
 
       -- The heights where this cluster's strip must be cut: its edges' ends, and their crossings.
+      -- Pair tests and crossings are counted as they are made and refused at their caps, so a
+      -- densely crossing cluster costs at most the caps before it raises.
       local eventCount = 2
+      local crossings, work = 0, 0
+      local size = last - first + 1
 
       events[1], events[2] = stripTop, stripBottom
 
@@ -415,6 +418,9 @@ local function cover(prepared: Prepared, rule: FillRule, left: number, top: numb
 
           if lowX[second] > edgeReach then break end
 
+          work += 1
+          if work > Module.MaxStripWork then error(`magick: MaxStripWork {Module.MaxStripWork} exceeded`, 0) end
+
           local from, to = math.max(spanTop[edge], spanTop[second]), math.min(spanBottom[edge], spanBottom[second])
 
           if to <= from then continue end
@@ -426,6 +432,9 @@ local function cover(prepared: Prepared, rule: FillRule, left: number, top: numb
             local crossing = from + (to - from) * (before / (before - after))
 
             if crossing > from and crossing < to then
+              crossings += 1
+              if crossings > Module.MaxStripCrossings then error(`magick: MaxStripCrossings {Module.MaxStripCrossings} exceeded`, 0) end
+
               eventCount += 1
               events[eventCount] = crossing
             end
@@ -433,11 +442,24 @@ local function cover(prepared: Prepared, rule: FillRule, left: number, top: numb
         end
       end
 
-      sortNumbers(events, eventCount)
+      -- Each band visits every edge of the cluster, so the bands' work is known before any is cut.
+      if work + (eventCount - 1) * size > Module.MaxStripWork then error(`magick: MaxStripWork {Module.MaxStripWork} exceeded`, 0) end
+
+      -- The events past this cluster's are a longer cluster's leftovers: drop them so the sort
+      -- sees only these. Numbers sort to one order whatever the algorithm.
+      for index = eventCount + 1, #events do
+        events[index] = nil
+      end
+
+      table.sort(events)
 
       -- Band heights are whole units of 2^-30 of the strip, so the bands of a strip add up to it
       -- exactly, however it is cut.
       local bandTop, bandUnits = events[1], 0
+      -- The band before keeps its left-to-right order for the next, less the edges that ended and
+      -- with the ones that began, so sorting it again moves only the edges that crossed in between.
+      -- The order (by key, ties by edge) is total, so it is the same however the list came in.
+      local bandCount = 0
 
       for eventIndex = 2, eventCount do
         local bandBottom = events[eventIndex]
@@ -450,15 +472,35 @@ local function cover(prepared: Prepared, rule: FillRule, left: number, top: numb
           continue
         end
 
-        local bandCount = 0
+        local kept = 0
+
+        mark += 1
+
+        for position = 1, bandCount do
+          local edge = band[position]
+
+          if spanBottom[edge] < bandBottom then continue end
+
+          kept += 1
+          band[kept] = edge
+          member[edge] = mark
+        end
 
         for position = first, last do
           local edge = byLow[position]
 
-          if spanTop[edge] > bandTop or spanBottom[edge] < bandBottom then continue end
+          if member[edge] == mark or spanTop[edge] > bandTop or spanBottom[edge] < bandBottom then continue end
 
-          bandCount += 1
-          band[bandCount] = edge
+          kept += 1
+          band[kept] = edge
+          member[edge] = mark
+        end
+
+        bandCount = kept
+
+        for position = 1, bandCount do
+          local edge = band[position]
+
           startX[edge], endX[edge] = edgeX(prepared, edge, bandTop), edgeX(prepared, edge, bandBottom)
           key[edge] = startX[edge] + endX[edge]
         end

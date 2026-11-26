@@ -96,6 +96,11 @@ Module.MaxCommandsPerPath = 1048576
 Module.MaxImageEdge = 8192
 --- The most clips one coverage call multiplies by.
 Module.MaxClipDepth = 16
+--- The most edges one prepared outline may hold, and the most crossings and work one cluster of
+--- edges may take inside one pixel row (see the coverage notes in the RFC amendment A1).
+Module.MaxSegmentsPerCoverage = raster.MaxSegmentsPerCoverage
+Module.MaxStripCrossings = raster.MaxStripCrossings
+Module.MaxStripWork = raster.MaxStripWork
 
 --- A piece count, refused past the cap. NaN passes through, as 0.1.3 let it.
 local function capped(pieces: number): number

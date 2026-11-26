@@ -359,4 +359,65 @@ suite.describe('degenerate outlines', function()
   end)
 end)
 
+--- A closed zigzag of `count` edges inside the first pixel row, every edge reaching across most of
+--- `span` pixels, so nearly every pair of edges crosses in that one strip.
+local function zigzag(count: number, span: number): path.Path
+  local state = 7
+  local shape = path.new():moveTo(0, 0.1)
+
+  for index = 1, count do
+    state = state * 48271 % 2147483647
+    shape:lineTo(state / 2147483647 * span, if index % 2 == 0 then 0.1 else 0.9)
+  end
+
+  return shape:close()
+end
+
+suite.describe('pathological geometry', function()
+  suite.it('covers a densely crossing strip exactly, the same bytes in any windows', function()
+    local prepared = path.prepare(zigzag(120, 24))
+
+    for _, rule in { 'nonzero', 'evenodd' } :: { path.FillRule } do
+      local whole = path.coverOf(prepared, rule, 0, 0, 24, 1)
+      local pieces: { number } = {}
+
+      for column = 0, 23 do
+        table.insert(pieces, buffer.readu8(path.coverOf(prepared, rule, column, 0, 1, 1).data, 0))
+      end
+
+      expect(pieces).toEqual(rows(whole)[1])
+    end
+  end)
+
+  suite.it('refuses a strip past its crossing or work cap before doing that work', function()
+    local started = os.clock()
+
+    expect(function()
+      path.coverOf(path.prepare(zigzag(400, 100)), 'evenodd', 0, 0, 100, 1)
+    end).toThrow 'magick: MaxStrip'
+
+    expect(function()
+      path.coverOf(path.prepare(zigzag(3000, 100)), 'nonzero', 0, 0, 100, 1)
+    end).toThrow(`magick: MaxStripCrossings {path.MaxStripCrossings} exceeded`)
+
+    -- Before the caps, the 400-edge strip alone took 11.6 s.
+    expect(os.clock() - started < 5).toBe(true)
+  end)
+
+  suite.it('refuses the same strip in every tiling that reaches it', function()
+    local prepared = path.prepare(zigzag(3000, 100))
+
+    for _, size in { 100, 37, 8 } do
+      expect(function()
+        for left = 0, 99, size do
+          path.coverOf(prepared, 'nonzero', left, 0, math.min(size, 100 - left), 1)
+        end
+      end).toThrow 'magick: MaxStripCrossings'
+    end
+
+    -- A window that the cluster never reaches does no work for it, and covers nothing.
+    expect(area(path.coverOf(prepared, 'nonzero', 0, 2, 100, 4))).toBe(0)
+  end)
+end)
+
 return suite
