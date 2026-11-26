@@ -11,9 +11,18 @@ local records = require '../demos/records'
 
 type Demo = { name: string, render: () -> magick.Image }
 
+local render = require '@magick/render'
+local valley = require '../demos/valley'
+
 local Demos: { Demo } = {
   require '../demos/lighthouse',
   require '../demos/rosette',
+  {
+    name = 'valley',
+    render = function(): magick.Image
+      return (render.image(valley.build(960, 540)))
+    end,
+  },
 }
 
 local folder: string?, mode: string? = ...

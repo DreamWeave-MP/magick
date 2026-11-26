@@ -15,7 +15,7 @@ Two demos drawn only through the public API, rendered and checked byte for byte 
 
 | [Lighthouse at Dusk](demos/lighthouse.jsl) | [Rosette](demos/rosette.jsl) |
 |---|---|
-| ![Lighthouse at Dusk](demos/renders/lighthouse.png) | ![Rosette](demos/renders/rosette.png) |
+| ![Lighthouse at Dusk](gallery/lighthouse.png) | ![Rosette](gallery/rosette.png) |
 
 Everything below is opt-in. A caller who uses only 0.1.x names gets the bytes 0.1.3 gave, except for the owner-approved
 `Path:transformed` change recorded in [COMPATIBILITY.md](COMPATIBILITY.md#owner-approved-changes).
