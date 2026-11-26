@@ -1,0 +1,27 @@
+--!strict
+-- The 8K stress run (MAG-044): Valley at First Light compiled once and rendered at 7680 by 4320
+-- (8K UHD) on four workers, its time and bytes reported, and a canvas past MaxImageEdge refused
+-- before anything is made. An application target, run by hand or in a long CI job:
+--
+--   jess package run --capability worker.spawn --target stress .
+local application = require '@jess/application'
+local bytes = require '@dream/bytes'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local valley = require '../demos/valley'
+
+local began = os.clock()
+local plan = render.compile(valley.build(7680, 4320))
+local compiled = os.clock() - began
+local started = os.clock()
+local image, stats = render.image(plan, { tileSize = 128, workers = 4, memoryBudgetBytes = 1024 * 1024 * 1024 })
+local seconds = os.clock() - started
+
+print(`stress: {image.width}x{image.height}, {plan.nodes} nodes, compiled {string.format('%.2f', compiled)} s, rendered {string.format('%.2f', seconds)} s on 4 workers, {stats.tiles} tiles`)
+print(`stress: {string.format('%08x', bytes.crc32(image.data))}`)
+
+-- pcall only around a document that must be refused: a canvas past MaxImageEdge.
+local refused = not pcall(scene.new, 8193, 4320, nil)
+
+print(`stress: 8193 wide refused: {refused}`)
+application.exit(if refused then 0 else 1)
