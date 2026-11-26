@@ -176,6 +176,115 @@ suite.describe('plans', function()
     expect(same(render.image(render.compile(document)), before)).toBe(false)
   end)
 
+  suite.it('is an opaque frozen handle: no operation, paint or buffer of a plan is reachable', function()
+    local plan = render.compile(busy(32, 24))
+    local fields = (plan :: unknown) :: { [string]: unknown }
+
+    expect(table.isfrozen(fields)).toBe(true)
+    expect(fields.ops).toBe(nil)
+    expect(fields.background).toBe(nil)
+
+    for _, value in fields do
+      expect(type(value) == 'number' or type(value) == 'string').toBe(true)
+    end
+
+    expect(plan.operations > 0).toBe(true)
+    expect(function()
+      fields.width = 1
+    end).toThrow()
+
+    local forged = (table.freeze { width = 32, height = 24, space = 'linear', nodes = 1, operations = 0, bytes = 0 } :: unknown) :: render.Plan
+
+    expect(function()
+      render.image(forged)
+    end).toThrow 'magick: not a plan render.compile made'
+  end)
+
+  suite.it('owns the pixels it reads: images and pattern sources written after a compile change nothing', function()
+    local source = magick.new(4, 4)
+
+    source:fill '#c82828'
+
+    local document = scene.new(16, 16)
+
+    document:add(document:image(source, { transform = transform.translate(1, 1) }))
+    document:add(document:shape(path.new():rect(8, 8, 16, 16), { fill = paint.pattern(source, { edge = 'repeat' }) }))
+
+    local plan = render.compile(document)
+    local before = render.image(plan)
+
+    source:fill '#00ff00'
+    expect(same(render.image(plan), before)).toBe(true)
+    expect(same(render.image(render.compile(document)), before)).toBe(false)
+  end)
+
+  suite.it('copies a source once however many nodes and paints read it', function()
+    local source = magick.new(256, 256)
+
+    local function document(uses: number): scene.Document
+      local made = scene.new(16, 16)
+
+      for index = 1, uses do
+        made:add(made:image(source, { transform = transform.translate(index, 0) }))
+        made:add(made:shape(path.new():rect(0, 0, 4, 4), { fill = paint.pattern(source) }))
+      end
+
+      return made
+    end
+
+    local once, many = render.compile(document(1)), render.compile(document(20))
+    local pixels = 256 * 256 * 4
+
+    expect(once.bytes >= pixels).toBe(true)
+    -- Nineteen more pairs of operations, but not one more copy of the source.
+    expect(many.bytes - once.bytes < pixels).toBe(true)
+  end)
+
+  suite.it('copies group filters: changing them after a compile changes nothing', function()
+    local document = scene.new(24, 24)
+    local filters: { scene.Filter } = { { kind = 'shadow', radius = 1, offsetX = 2, offsetY = 2, color = '#000000' } }
+    local group = document:add(document:group { filters = filters })
+
+    group:add(document:shape(path.new():rect(4, 4, 12, 12), { fill = paint.solid '#ffffff' }))
+
+    local plan = render.compile(document)
+    local before = render.image(plan)
+    local kept = (group.filters[1] :: unknown) :: { [string]: unknown }
+
+    kept.offsetX, kept.radius = 9, 6
+    expect(same(render.image(plan), before)).toBe(true)
+  end)
+
+  suite.it('works out tiles as it goes: a canvas of a million one-pixel tiles starts at once', function()
+    local plan = render.compile(scene.new(1024, 1024))
+    local asked = 0
+    local started = os.clock()
+
+    expect(function()
+      render.image(plan, {
+        tileSize = 1,
+        cancel = function(): boolean
+          asked += 1
+
+          return asked > 3
+        end,
+      })
+    end).toThrow 'magick: render cancelled'
+    -- A list of every tile first took seconds and hundreds of megabytes here.
+    expect(os.clock() - started < 0.5).toBe(true)
+    expect(asked).toBe(4)
+  end)
+
+  suite.it('refuses a region that is not four finite numbers', function()
+    local plan = render.compile(scene.new(8, 8))
+
+    for _, region in { { 0, 0, 8 }, { 0, 0 / 0, 8, 8 }, { 0, 0, math.huge, 8 } } do
+      expect(function()
+        render.image(plan, { region = region })
+      end).toThrow 'magick: a region is four finite numbers'
+    end
+  end)
+
   suite.it('compiles the same document to the same plan, and lists it for inspection', function()
     local first, second = render.compile(busy(64, 48)), render.compile(busy(64, 48))
 
@@ -192,7 +301,7 @@ suite.describe('plans', function()
     local group = document:add(document:group { filters = { { kind = 'blur', radius = 3 } } })
 
     group:add(document:group())
-    expect(#render.compile(document).ops).toBe(0)
+    expect(render.compile(document).operations).toBe(0)
   end)
 
   suite.it('refuses a group whose filters read past MaxHaloPx', function()
