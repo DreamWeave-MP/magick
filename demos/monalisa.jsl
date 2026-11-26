@@ -6,9 +6,11 @@
 --   * the canvas is toned one flat umber, as Leonardo's panels were primed;
 --   * every part is laid in with large, loaded oil strokes, then refined at half and a quarter of the
 --     size where the canvas still differs from the reference;
---   * the face and the hands go on past that, to strokes a pixel wide, with a soft, thin brush whose
---     dabs melt into each other (sfumato, the smoke Leonardo blended his flesh with), and they hold
---     a tighter threshold, so the detail lands where a viewer looks;
+--   * the face and the hands go on past that, through radius 3, 2, 1.5 and 1, in glazes: very soft,
+--     translucent strokes that never pile up past their own coverage (`constant` accumulation), and
+--     a threshold near nothing (0.008), so every part of the flesh is refined and its tones turn
+--     continuously instead of stepping from one plateau to the next (sfumato, the smoke Leonardo
+--     blended his flesh with). An opaque brush and a coarser threshold banded the face;
 --   * the bust is softer than the robe but not as fine as the face;
 --   * every stroke stays inside the region it started in, so the background's brush never smears
 --     across the face.
@@ -24,15 +26,17 @@ local Module = {}
 Module.Width = 500
 Module.Height = 745
 
---- Soft, thin, low-flow flesh strokes: dabs that blur into each other rather than sit on top.
+--- Flesh glazes: very soft, translucent dabs whose stroke never covers past its own tip (`constant`),
+--- so passes lay veil on veil rather than plateau on plateau.
 local Sfumato: { [string]: unknown } = {
-  spacing = 0.12,
-  tip = { kind = 'round', hardness = 0.25 },
-  aspect = 0.85,
-  flow = 0.55,
-  minimumSize = 0.7,
-  grainStrength = 0.08,
-  jitter = { lightness = 0.04, size = 0.06 },
+  spacing = 0.15,
+  tip = { kind = 'round', hardness = 0.08 },
+  aspect = 0.9,
+  flow = 0.42,
+  minimumSize = 0.75,
+  accumulation = 'constant',
+  grainStrength = 0.05,
+  jitter = { lightness = 0.03, size = 0.05 },
 }
 
 --- The regions, in reference pixels, read off the reference by eye.
@@ -41,8 +45,8 @@ function Module.regions(): { painter.Region }
     {
       name = 'face',
       shape = path.new():circle(228, 176, 50, 74),
-      radii = { 8, 4, 2, 1 },
-      threshold = 0.03,
+      radii = { 8, 4, 3, 2, 1.5, 1 },
+      threshold = 0.008,
       curvature = 0.6,
       maximumLength = 8,
       overrides = Sfumato,
@@ -51,8 +55,8 @@ function Module.regions(): { painter.Region }
       name = 'hands',
       -- The two hands only, not the dark sleeve above them, whose fine strokes would read as noise.
       shape = path.new():circle(186, 622, 78, 40):circle(228, 584, 74, 40),
-      radii = { 8, 4, 2, 1 },
-      threshold = 0.035,
+      radii = { 8, 4, 3, 2, 1.5, 1 },
+      threshold = 0.008,
       curvature = 0.55,
       maximumLength = 8,
       overrides = Sfumato,
@@ -60,8 +64,8 @@ function Module.regions(): { painter.Region }
     {
       name = 'bust',
       shape = path.new():circle(250, 382, 78, 58),
-      radii = { 8, 4, 2 },
-      threshold = 0.04,
+      radii = { 8, 4, 3, 2 },
+      threshold = 0.02,
       curvature = 0.5,
       maximumLength = 10,
       overrides = Sfumato,

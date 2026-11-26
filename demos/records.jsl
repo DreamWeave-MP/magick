@@ -9,7 +9,8 @@ local Records: { [string]: string } = {
   ['heron'] = '800x1000:7b868098',
   ['oil'] = '960x540:bdf08d8b',
   ['portrait'] = '540x675:a0c7bfe1',
-  ['monalisa'] = '1000x1490:744d89ac',
+  ['valley-painted'] = '960x540:83b83d01',
+  ['monalisa'] = '1000x1490:b93b6b93',
 }
 
 return table.freeze(Records)
