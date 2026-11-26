@@ -96,6 +96,9 @@ suite.describe('solid', function()
       solid = paint.solid '#336699',
       linear = paint.linear(0, 0, 10, 0, stops),
       radial = paint.radial(5, 5, 5, stops, { focusX = 4 }),
+      conic = paint.conic(5, 5, stops, { startAngle = 1 }),
+      image = paint.pattern(magick.new(2, 2), { edge = 'repeat' }),
+      tile = paint.pattern(color.tile(2, 2), { sampling = 'bilinear' }),
     }
 
     for name, value in paints do

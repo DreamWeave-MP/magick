@@ -349,17 +349,19 @@ function Module.pattern(source: magick.Image | Tile, options: PatternOptions?): 
 
   local matrix, inverse = checkMatrix(if options then options.transform else nil, 2)
 
+  table.freeze((described :: unknown) :: { [string]: unknown })
+
   return table.freeze {
     kind = 'pattern',
     opacity = checkOpacity(if options then options.opacity else nil, 2),
     transform = matrix,
     inverse = inverse,
-    channels = {},
-    offsets = {},
-    colors = {},
+    channels = Nothing,
+    offsets = Nothing,
+    colors = Nothing,
     spread = 'pad',
     interpolation = 'srgb',
-    geometry = {},
+    geometry = Nothing,
     source = described,
     sampling = sampling,
     edge = edge,
