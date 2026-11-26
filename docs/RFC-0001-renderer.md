@@ -314,8 +314,9 @@ bytes.
 
 **L3 (NaN, recorded).** Legacy NaN handling stays where it is. In 0.1.3, `Image:rect(0, 0, 0/0, 2, c)` fills rows
 0..2 across the whole image, silently, because `math.min` and `math.max` pass NaN through. `path:rect(0, 0, 0/0, 4):mask()`
-raises a Lua error whose message contains `buffer access out of bounds`. It is not a `magick:` message. Pinned by
-`tests/rfc.jsl`, so a fix is a recorded change.
+reaches an integer conversion whose result the platform decides: on x86-64 it raises a Lua error whose message
+contains `buffer access out of bounds`; on ARM64 (macOS CI, 2026-11-26) it raises nothing and returns a mask. Neither
+is a `magick:` message. `tests/rfc.jsl` holds both, so a fix is a recorded change; new APIs refuse NaN (E5).
 
 **L4 (legacy seeds, recorded).** Legacy seeded functions (`magick.noise`, `magick.randomNoise`,
 `magick.addGaussianNoise`) take the seed as `math.floor(seed) % 2147483647`, using Luau's floored modulo, and a

@@ -325,16 +325,21 @@ suite.describe('legacy inputs the RFC rules out for new APIs', function()
     expect({ image:get(0, 3) }).toEqual { 0, 0, 0, 255 }
   end)
 
-  suite.it('fails a path with a NaN coordinate with the buffer error, not a magick message', function()
+  suite.it('leaves a path with a NaN coordinate to the platform: the buffer error on x86-64, a mask on ARM64', function()
     local nan = 0 / 0
-    -- pcall around path:mask(): a NaN corner makes the legacy path throw, and this pins the message
-    -- the RFC quotes (L3).
-    local ok, message = pcall(function()
-      path.new():rect(0, 0, nan, 4):mask()
+    -- pcall around path:mask(): a NaN corner reaches an integer conversion whose result the
+    -- platform decides. On x86-64 it lands out of bounds and the legacy path raises the buffer
+    -- error; on ARM64 (macOS CI) it does not, and a mask comes back. Neither is a magick: message,
+    -- and the RFC (L3) records both rather than one platform's answer.
+    local ok, result = pcall(function()
+      return path.new():rect(0, 0, nan, 4):mask()
     end)
 
-    expect(ok).toBe(false)
-    expect(string.find(tostring(message), 'buffer access out of bounds', 1, true) ~= nil).toBe(true)
+    if ok then
+      expect(type((result :: magick.Mask).width)).toBe 'number'
+    else
+      expect(string.find(tostring(result), 'buffer access out of bounds', 1, true) ~= nil).toBe(true)
+    end
   end)
 
   suite.it('reads a negative legacy noise seed as its floored remainder, and 0 as 1', function()
