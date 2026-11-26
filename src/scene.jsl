@@ -40,7 +40,8 @@ export type StrokeStyle = {
 }
 
 --- A filter on a group, applied to what its children drew before the group's clip, mask and opacity.
---- `blur` is a gaussian of standard deviation `radius`; `shadow` lays a blurred, offset, colored copy
+--- `blur` approximates a gaussian of standard deviation `radius` by three box passes; `shadow` lays a
+--- blurred, offset (to whole pixels), colored copy
 --- of the group's alpha under it.
 export type Filter =
   { kind: 'blur', radius: number }
