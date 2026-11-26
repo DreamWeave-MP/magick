@@ -1313,12 +1313,16 @@ function Module.prepare(self: Path, options: CoverageOptions?): Prepared
   return raster.prepare(Module.flatten(self, deviceTolerance(self, tolerance), matrix))
 end
 
---- Coverage bytes of a prepared path over a window, by a fill rule.
-function Module.coverOf(prepared: Prepared, rule: FillRule, left: number, top: number, width: number, height: number): magick.Mask
+--- Coverage bytes of a prepared path over a window, by a fill rule, multiplied by any clips.
+function Module.coverOf(prepared: Prepared, rule: FillRule, left: number, top: number, width: number, height: number, clips: { Clip }?): magick.Mask
   checkWindow(left, top, width, height)
   if rule ~= 'nonzero' and rule ~= 'evenodd' then error(`magick: unknown fill rule {rule}`, 2) end
 
-  return magick.mask(width, height, raster.coverage(prepared, rule, left, top, width, height))
+  local data = raster.coverage(prepared, rule, left, top, width, height)
+
+  applyClips(data, left, top, width, height, clips)
+
+  return magick.mask(width, height, data)
 end
 
 --- The path's coverage over the window `width` by `height` pixels whose top left pixel is

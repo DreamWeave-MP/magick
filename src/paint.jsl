@@ -657,6 +657,7 @@ end
 @native
 local function composeRow(
   data: buffer,
+  dataBase: number,
   coverage: buffer,
   base: number,
   from: number,
@@ -675,7 +676,7 @@ local function composeRow(
   for column = from, to do
     local covered = buffer.readu8(coverage, base + column)
     local weight = covered / 255
-    local at = (base + column) * 16
+    local at = (dataBase + column) * 16
 
     if not solid then
       local span = (column - from) * 32
@@ -699,13 +700,22 @@ end
 
 --- Composites one row's run by a blend mode, src-over: the span's premultiplied source scaled by
 --- the coverage, mixed with the backdrop by `color.mixPixel`.
-local function blendRow(data: buffer, coverage: buffer, base: number, from: number, to: number, scratch: buffer, mode: color.BlendMode)
+local function blendRow(
+  data: buffer,
+  dataBase: number,
+  coverage: buffer,
+  base: number,
+  from: number,
+  to: number,
+  scratch: buffer,
+  mode: color.BlendMode
+)
   for column = from, to do
     local weight = buffer.readu8(coverage, base + column) / 255
 
     if weight == 0 then continue end
 
-    local span, at = (column - from) * 32, (base + column) * 16
+    local span, at = (column - from) * 32, (dataBase + column) * 16
     local red, green, blue, alpha = color.mixPixel(
       mode,
       buffer.readf64(scratch, span) * weight,
@@ -729,7 +739,26 @@ end
 --- Composites a paint through coverage bytes over a tile: the paint at each pixel, its alpha scaled
 --- by the coverage, by an operator. Where coverage is 0 the source is transparent, so an operator
 --- that clears under transparency clears there.
-local function paintThrough(tile: Tile, coverage: buffer, value: Paint, operator: color.Operator, mode: color.BlendMode, opacity: number)
+--- Whether an operator and blend leave the backdrop alone under a transparent source, so only the
+--- covered pixels need visiting.
+local function bounded(operator: color.Operator, mode: color.BlendMode): boolean
+  local _, second = color.factors(operator, 0, 0)
+  local _, secondAtOne = color.factors(operator, 1, 1)
+
+  return mode ~= 'normal' or (second == 1 and secondAtOne <= second)
+end
+
+--- `window` is where the coverage lies in the tile: its left, top, width and height in tile pixels,
+--- the whole tile when left out.
+local function paintThrough(
+  tile: Tile,
+  coverage: buffer,
+  value: Paint,
+  operator: color.Operator,
+  mode: color.BlendMode,
+  opacity: number,
+  window: { number }?
+)
   local source = value.source
 
   if source and source.data == tile.data then error('magick: pattern reads its own destination', 3) end
@@ -752,9 +781,14 @@ local function paintThrough(tile: Tile, coverage: buffer, value: Paint, operator
   -- Operators that leave the backdrop under a transparent source need only the covered run.
   local skipsClear = blending or (second == 1 and bySource <= 0)
 
-  for row = 0, tile.height - 1 do
-    local base = row * tile.width
-    local from, to = 0, tile.width - 1
+  local windowLeft, windowTop, windowWidth, windowHeight = 0, 0, tile.width, tile.height
+
+  if window then windowLeft, windowTop, windowWidth, windowHeight = window[1], window[2], window[3], window[4] end
+
+  for line = 0, windowHeight - 1 do
+    local row = windowTop + line
+    local base, dataBase = line * windowWidth, row * tile.width + windowLeft
+    local from, to = 0, windowWidth - 1
 
     if skipsClear then
       while from <= to and buffer.readu8(coverage, base + from) == 0 do
@@ -768,14 +802,14 @@ local function paintThrough(tile: Tile, coverage: buffer, value: Paint, operator
       if from > to then continue end
     end
 
-    if not solid then Module.span(value, tile, row, from, to - from + 1, scratch, opacity) end
+    if not solid then Module.span(value, tile, row, windowLeft + from, to - from + 1, scratch, opacity) end
 
     if blending then
-      blendRow(tile.data, coverage, base, from, to, scratch, mode)
+      blendRow(tile.data, dataBase, coverage, base, from, to, scratch, mode)
       continue
     end
 
-    composeRow(tile.data, coverage, base, from, to, scratch, solid, first, byBackdrop, second, bySource)
+    composeRow(tile.data, dataBase, coverage, base, from, to, scratch, solid, first, byBackdrop, second, bySource)
   end
 end
 
@@ -785,14 +819,30 @@ function Module.fillPath(tile: Tile, shape: path.Path, value: Paint, options: Fi
   checkKeys(options, FillKeys, 2)
 
   local operator, mode, opacity = settings(options)
-  local coverage = shape:coverageIn(tile.left, tile.top, tile.width, tile.height, {
-    fillRule = if options then options.fillRule else nil,
+  local prepared = path.prepare(shape, {
     transform = if options then options.transform else nil,
     tolerance = if options then options.tolerance else nil,
-    clips = if options then options.clips else nil,
   })
+  local rule: path.FillRule = if options and options.fillRule then options.fillRule else 'nonzero'
+  local clips = if options then options.clips else nil
+  local window = { 0, 0, tile.width, tile.height }
 
-  paintThrough(tile, coverage.data, value, operator, mode, opacity)
+  -- Where the operator leaves the backdrop alone outside the coverage, only the path's box is
+  -- covered and visited, so a small shape on a large tile costs its own size.
+  if bounded(operator, mode) then
+    local left = math.max(tile.left, math.floor(prepared.left))
+    local top = math.max(tile.top, math.floor(prepared.top))
+    local right = math.min(tile.left + tile.width, math.ceil(prepared.right))
+    local bottom = math.min(tile.top + tile.height, math.ceil(prepared.bottom))
+
+    if prepared.count == 0 or right <= left or bottom <= top then return tile end
+
+    window = { left - tile.left, top - tile.top, right - left, bottom - top }
+  end
+
+  local coverage = path.coverOf(prepared, rule, tile.left + window[1], tile.top + window[2], window[3], window[4], clips)
+
+  paintThrough(tile, coverage.data, value, operator, mode, opacity, window)
 
   return tile
 end

@@ -257,6 +257,28 @@ suite.describe('filling', function()
   end)
 end)
 
+suite.describe('bounded fills', function()
+  suite.it('covers only the box of a small shape on a large tile', function()
+    local tile = color.tile(2048, 2048)
+    local before = gcinfo()
+
+    for index = 0, 99 do
+      paint.fillPath(tile, path.new():circle(20 * index + 10, 1000, 3), paint.solid '#ffffff')
+    end
+
+    -- A hundred 7 by 7 windows; one whole-tile window would be 4 MiB.
+    expect(gcinfo() - before < 1024).toBe(true)
+    expect(color.pixel(tile, 10, 1000)).toBe(1)
+  end)
+
+  suite.it('still clears the whole tile for an operator that clears outside its coverage', function()
+    local tile = color.fromImage(magick.new(8, 8, '#ffffff'))
+
+    paint.fillPath(tile, path.new():rect(2, 2, 4, 4), paint.solid '#ff0000', { operator = 'src-in' })
+    expect({ color.toImage(tile):get(7, 7) }).toEqual { 0, 0, 0, 0 }
+  end)
+end)
+
 suite.describe('refusals', function()
   suite.it('refuses bad stops, spreads, spaces, options and transforms by name', function()
     expect(function()
