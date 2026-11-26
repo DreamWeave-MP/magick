@@ -114,4 +114,60 @@ suite.describe('plans', function()
   end)
 end)
 
+suite.describe('bounds and metrics', function()
+  suite.it('builds strokes only for the starts its budget takes', function()
+    local noisy = magick.new(256, 256)
+    local state = 11
+
+    for index = 0, 256 * 256 * 4 - 1 do
+      state = state * 48271 % 2147483647
+      buffer.writeu8(noisy.data, index, if index % 4 == 3 then 255 else state % 256)
+    end
+
+    -- At half the radius, a 1-pixel brush has a start in every pixel: 65,536 candidates, one stroke.
+    local plan = painter.plan(noisy, { radii = { 2, 1 }, grid = 0.5, budget = 1, threshold = 0 })
+
+    expect(#plan.strokes).toBe(1)
+    expect({ plan.levels[1].strokes, plan.levels[2].strokes }).toEqual { 1, 0 }
+  end)
+
+  suite.it('lays the same strokes whatever the budget, up to it', function()
+    local full = painter.plan(reference(), { seed = 4 })
+    local cut = painter.plan(reference(), { seed = 4, budget = 25 })
+
+    for index = 1, 25 do
+      expect(cut.strokes[index].points).toEqual(full.strokes[index].points)
+    end
+  end)
+
+  suite.it('measures error premultiplied, so transparency counts and hidden color does not', function()
+    local clear, hidden, red = magick.new(2, 1), magick.new(2, 1), magick.new(2, 1)
+
+    hidden:fill '#ff000000'
+    red:fill '#ff0000'
+
+    -- Color under no coverage is no difference; coverage is.
+    expect(painter.error(clear, hidden)).toBe(0)
+    expect(painter.error(clear, red)).toBe(1 / 3 + 1)
+
+    -- Opaque images: the mean absolute difference of the color channels.
+    local black = magick.new(2, 1)
+
+    black:fill '#000000'
+    expect(painter.error(black, red)).toBe(1 / 3)
+  end)
+
+  suite.it('refuses images with no pixels, and options that are not whole or finite', function()
+    expect(function()
+      painter.error(magick.new(0, 0), magick.new(0, 0))
+    end).toThrow 'magick: error compares images with pixels'
+
+    for _, options in { { budget = 1.5 }, { seed = -1 }, { minimumLength = 0 / 0 }, { threshold = math.huge }, { grid = 0 }, { radii = { 0 / 0 } } } :: { painter.Options } do
+      expect(function()
+        painter.plan(reference(), options)
+      end).toThrow 'magick:'
+    end
+  end)
+end)
+
 return suite
