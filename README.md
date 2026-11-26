@@ -60,7 +60,11 @@ document always gives the same, diffable text. Paths save their retained command
 as `#rrggbbaa`, and images as base64 assets with a CRC-32, each saved once. `scene.load(text)` reads it as untrusted
 input and refuses, by name: another format, a later version, unknown fields or kinds, invalid JSON, out-of-range
 numbers, unknown path commands, mismatched assets, duplicate ids, depth past `MaxDepth`, and text past `MaxSceneBytes`
-(64 MiB). `tests/replay.jsl` is a committed saved scene held to its rendered bytes.
+(64 MiB). A checksum says only that bytes arrived as saved, so an asset must also name `straight8` (sRGB) or
+`premultiplied32` (sRGB or linear), and every premultiplied pixel must hold finite values with alpha in 0..1 and each
+color in 0..alpha (within 2^-20 for f32 rounding). The root is a group like any other: its name, clip, mask and
+filters load back, and `save(load(save(document)))` is the same text (forty seeded documents hold this).
+`tests/replay.jsl` is a committed saved scene held to its rendered bytes.
 
 ### Measured (this machine: i7-10870H, 16 threads, jess 0.4.0 verified release)
 

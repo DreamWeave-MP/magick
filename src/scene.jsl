@@ -288,6 +288,32 @@ local function checkFilters(filters: { Filter }): { Filter }
   return table.clone(filters)
 end
 
+--- Gives a group its clip, mask and filters, checked: what `group` takes beyond every node's options,
+--- and what `load` restores on the root.
+local function applyGroup(document: Document, node: Node, options: GroupOptions)
+  local clip = options.clip
+
+  if clip and clip.fillRule and clip.fillRule ~= 'nonzero' and clip.fillRule ~= 'evenodd' then
+    error(`magick: unknown fill rule {clip.fillRule}`, 3)
+  end
+
+  node.clip = clip
+  node.filters = checkFilters(options.filters or {})
+
+  local mask = options.mask
+
+  if mask then
+    local kind = mask.kind or 'alpha'
+
+    if kind ~= 'alpha' and kind ~= 'luminance' then error(`magick: unknown mask kind {kind}`, 3) end
+    if not rawequal(mask.node.document, document) then error('magick: a mask node must belong to the same document', 3) end
+    if mask.node.parent or mask.node.isMask then error('magick: a mask node must not be in the tree or another mask', 3) end
+
+    mask.node.isMask = true
+    node.mask = { node = mask.node, kind = kind }
+  end
+end
+
 --- A new group, not yet in the tree. Its children draw into an isolated transparent tile, which is
 --- then filtered, clipped, masked, faded by its opacity once, and laid on by its blend.
 function Document.group(self: Document, options: GroupOptions?): Node
@@ -295,23 +321,7 @@ function Document.group(self: Document, options: GroupOptions?): Node
 
   local node = makeNode(self, 'group', options)
 
-  if options then
-    node.clip = options.clip
-    node.filters = checkFilters(options.filters or {})
-
-    local mask = options.mask
-
-    if mask then
-      local kind = mask.kind or 'alpha'
-
-      if kind ~= 'alpha' and kind ~= 'luminance' then error(`magick: unknown mask kind {kind}`, 2) end
-      if not rawequal(mask.node.document, self) then error('magick: a mask node must belong to the same document', 2) end
-      if mask.node.parent or mask.node.isMask then error('magick: a mask node must not be in the tree or another mask', 2) end
-
-      mask.node.isMask = true
-      node.mask = { node = mask.node, kind = kind }
-    end
-  end
+  if options then applyGroup(self, node, options) end
 
   return node
 end
@@ -572,9 +582,36 @@ local function field(record: { [string]: unknown }, name: string, kind: string):
   return value
 end
 
+--- How far a premultiplied color may pass its alpha and still be read: f32 rounding of a product,
+--- never a color brighter than its coverage.
+local PremultipliedSlack = 2 ^ -20
+
+--- Refuses a premultiplied asset that breaks the working-color contract (@magick/color): every
+--- value finite, alpha in 0..1, and each color in 0..alpha. A checksum only says the bytes arrived
+--- as saved, not that they are colors.
+local function checkPremultiplied(data: buffer, index: number)
+  for at = 0, buffer.len(data) - 16, 16 do
+    local alpha = buffer.readf32(data, at + 12)
+
+    if not finite(alpha) or alpha < 0 or alpha > 1 then
+      error(`magick: asset {index} pixel {at // 16} has alpha {alpha}, not in 0..1`, 3)
+    end
+
+    for channel = 0, 8, 4 do
+      local value = buffer.readf32(data, at + channel)
+
+      if not finite(value) or value < 0 or value > alpha + PremultipliedSlack then
+        error(`magick: asset {index} pixel {at // 16} has a premultiplied color {value} outside 0..alpha {alpha}`, 3)
+      end
+    end
+  end
+end
+
 type Loading = { document: Document, assets: { magick.Image | color.Tile }, seen: { [number]: boolean } }
 
-local function loadNode(record: { [string]: unknown }, loading: Loading): Node
+--- A node from its saved record. With `into` (the root, which every document already has) the
+--- record's settings, clip, mask, filters and children are given to that group instead of a new one.
+local function loadNode(record: { [string]: unknown }, loading: Loading, into: Node?): Node
   for name in record do
     if not NodeKeys[name] then error(`magick: unknown scene field {name}`, 3) end
   end
@@ -599,6 +636,8 @@ local function loadNode(record: { [string]: unknown }, loading: Loading): Node
     return found
   end
   local node: Node
+
+  if into and kind ~= 'group' then error('magick: a saved root is a group', 3) end
 
   if kind == 'shape' then
     local shapeOptions = options :: ShapeOptions
@@ -641,7 +680,13 @@ local function loadNode(record: { [string]: unknown }, loading: Loading): Node
 
     if record.filters ~= nil then groupOptions.filters = field(record, 'filters', 'table') :: { Filter } end
 
-    node = document:group(groupOptions)
+    if into then
+      applyGroup(document, into, groupOptions)
+      into:set { transform = options.transform, opacity = options.opacity, blend = options.blend, name = options.name }
+      node = into
+    else
+      node = document:group(groupOptions)
+    end
 
     for _, child in (if record.children ~= nil then field(record, 'children', 'table') else {}) :: { { [string]: unknown } } do
       node:add(loadNode(child, loading))
@@ -702,15 +747,23 @@ function Module.load(text: string): Document
     pixels += width * height
     if pixels > Module.MaxAssetPixels then error(`magick: MaxAssetPixels {Module.MaxAssetPixels} exceeded`, 2) end
 
-    local data = bytes.fromBase64(field(asset, 'data', 'string') :: string)
     local format = field(asset, 'format', 'string')
+    local space = field(asset, 'space', 'string')
+
+    if format ~= 'premultiplied32' and format ~= 'straight8' then error(`magick: asset {index} has unknown format {format}`, 2) end
+    if space ~= 'srgb' and space ~= 'linear' then error(`magick: asset {index} has unknown color space {space}`, 2) end
+    if format == 'straight8' and space ~= 'srgb' then error(`magick: asset {index} is straight8, which is always srgb`, 2) end
+
+    local data = bytes.fromBase64(field(asset, 'data', 'string') :: string)
     local size = width * height * (if format == 'premultiplied32' then 16 else 4)
 
     if buffer.len(data) ~= size then error(`magick: asset {index} holds {buffer.len(data)} bytes, not {size}`, 2) end
     if string.format('%08x', bytes.crc32(data)) ~= asset.crc32 then error(`magick: asset {index} does not match its checksum`, 2) end
 
     if format == 'premultiplied32' then
-      local tile = color.tile(width, height, { space = field(asset, 'space', 'string') :: color.Space })
+      checkPremultiplied(data, index)
+
+      local tile = color.tile(width, height, { space = space :: color.Space })
 
       buffer.copy(tile.data, 0, data)
       loading.assets[index] = tile
@@ -721,18 +774,8 @@ function Module.load(text: string): Document
 
   local root = field(record, 'root', 'table') :: { [string]: unknown }
 
-  for _, child in (if root.children ~= nil then field(root, 'children', 'table') else {}) :: { { [string]: unknown } } do
-    document.root:add(loadNode(child, loading))
-  end
-
-  -- The root's own settings, as saved.
-  local fields = field(root, 'transform', 'table') :: { number }
-
-  document.root:set {
-    transform = transform.matrix(fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]),
-    opacity = field(root, 'opacity', 'number') :: number,
-    blend = field(root, 'blend', 'string') :: color.BlendMode,
-  }
+  -- The root is a group like any other: its settings, clip, mask, filters and children, as saved.
+  loadNode(root, loading, document.root)
 
   return document
 end

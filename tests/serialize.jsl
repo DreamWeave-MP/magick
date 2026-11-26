@@ -3,13 +3,16 @@
 -- text, a committed replay file renders to its recorded bytes, and untrusted payloads are refused
 -- with a message naming what is wrong, before anything is drawn.
 local bytes = require '@dream/bytes'
+local color = require '@magick/color'
 local documents = require './documents'
 local json = require '@jess/json'
+local magick = require '@magick'
 local paint = require '@magick/paint'
 local path = require '@magick/path'
 local render = require '@magick/render'
 local scene = require '@magick/scene'
 local test = require '@jess/test'
+local transform = require '@magick/transform'
 
 local expect = test.expect
 local suite = test.new()
@@ -124,6 +127,197 @@ suite.describe('untrusted payloads', function()
     expect(function()
       scene.load(string.rep(' ', scene.MaxSceneBytes + 1))
     end).toThrow 'magick: MaxSceneBytes 67108864 exceeded'
+  end)
+end)
+
+suite.describe('the root', function()
+  suite.it('keeps its name, clip, mask and filters through a load, and draws them', function()
+    local document = small()
+
+    document.root:set { name = 'canvas', opacity = 0.9 }
+
+    local described = scene.describe(document)
+    local root = described.root :: { [string]: unknown }
+    local plain = scene.load(json.encodeTable(described))
+
+    root.clip = { path = path.describe(path.new():circle(12, 8, 6)), fillRule = 'evenodd' }
+    root.filters = { { kind = 'blur', radius = 1 } }
+    root.mask = {
+      kind = 'luminance',
+      node = { kind = 'shape', id = 90, transform = { 1, 0, 0, 1, 0, 0 }, opacity = 1, blend = 'normal', fillRule = 'nonzero', path = path.describe(path.new():rect(0, 0, 18, 16)), fill = paint.describe(paint.solid '#ffffff') },
+    }
+
+    local text = json.encodeTable(described, { indent = 2 })
+    local loaded = scene.load(text)
+
+    expect(loaded.root.name).toBe 'canvas'
+    expect(loaded.root.clip ~= nil).toBe(true)
+    expect(#loaded.root.filters).toBe(1)
+    expect((loaded.root.mask :: scene.Mask).kind).toBe 'luminance'
+    expect(scene.save(loaded)).toBe(text)
+    expect(scene.save(scene.load(scene.save(loaded)))).toBe(text)
+    -- The clip, mask and blur are drawn, not just kept.
+    expect(pixels(loaded) ~= pixels(plain)).toBe(true)
+  end)
+
+  suite.it('refuses a saved root that is not a group, or an unknown clip rule', function()
+    local described = scene.describe(small())
+    local root = described.root :: { [string]: unknown }
+
+    root.kind = 'shape'
+    expect(function()
+      scene.load(json.encodeTable(described))
+    end).toThrow 'magick: a saved root is a group'
+
+    root.kind = 'group'
+    root.clip = { path = path.describe(path.new():rect(0, 0, 4, 4)), fillRule = 'winding' }
+    expect(function()
+      scene.load(json.encodeTable(described))
+    end).toThrow 'magick: unknown fill rule winding'
+  end)
+end)
+
+--- A seeded document built from every field a save keeps: nested groups with clips, masks and
+--- filters, shapes with every paint kind, fill rule, stroke style and dash, and images.
+local function random(seed: number): scene.Document
+  local state = seed
+
+  local function next(): number
+    state = state * 48271 % 2147483647
+
+    return state / 2147483647
+  end
+
+  local function pick<T>(choices: { T }): T
+    return choices[math.floor(next() * #choices) + 1]
+  end
+
+  local document = scene.new(48, 40, { background = if next() < 0.5 then '#203040' else nil, space = pick { 'srgb', 'linear' } :: color.Space, seed = seed })
+  local swatch = magick.new(3, 2)
+
+  swatch:fill '#80c040'
+
+  local function shape(): scene.Node
+    local left, top = next() * 40, next() * 30
+    local outline = if next() < 0.5 then path.new():rect(left, top, left + 4 + next() * 12, top + 4 + next() * 12) else path.new():circle(left, top, 2 + next() * 8)
+    local stops = paint.stops(0, '#ff000080', next(), '#00ff00', 1, '#0000ffc0')
+    local fill = pick {
+      paint.solid '#ffcc00a0',
+      paint.linear(0, 0, 40, 10, stops, { spread = pick { 'pad', 'repeat', 'reflect' } :: paint.Spread }),
+      paint.radial(20, 20, 15, stops, { interpolation = 'linear' }),
+      paint.conic(24, 20, stops, { startAngle = next() }),
+      paint.pattern(swatch, { edge = 'repeat', sampling = 'bilinear' }),
+    }
+
+    return document:shape(outline, {
+      fill = fill,
+      fillRule = pick { 'nonzero', 'evenodd' } :: path.FillRule,
+      stroke = if next() < 0.5 then paint.solid '#000000' else nil,
+      strokeStyle = { width = 0.5 + next() * 2, join = pick { 'miter', 'round', 'bevel' } :: path.Join, cap = pick { 'butt', 'round', 'square' } :: path.Cap, dashes = if next() < 0.3 then { 2, 1 } else nil },
+      opacity = 0.5 + next() * 0.5,
+      blend = pick { 'normal', 'multiply', 'screen', 'overlay' } :: color.BlendMode,
+      name = if next() < 0.3 then `shape {seed}` else nil,
+    })
+  end
+
+  local function fill(group: scene.Node, depth: number)
+    for _ = 1, 2 + math.floor(next() * 3) do
+      local roll = next()
+
+      if roll < 0.2 and depth < 3 then
+        local child = group:add(document:group {
+          transform = transform.compose(transform.translate(next() * 4, next() * 4), transform.rotate(next() * 0.3)),
+          opacity = 0.6 + next() * 0.4,
+          clip = if next() < 0.4 then { path = path.new():circle(24, 20, 14), fillRule = 'evenodd' } else nil,
+          mask = if next() < 0.3 then { node = shape(), kind = pick { 'alpha', 'luminance' } :: 'alpha' | 'luminance' } else nil,
+          filters = if next() < 0.3 then { { kind = 'shadow', radius = 1, offsetX = 1, offsetY = 2, color = '#00000080' } } else nil,
+        })
+
+        fill(child, depth + 1)
+      elseif roll < 0.3 then
+        group:add(document:image(swatch, { transform = transform.scale(4), sampling = pick { 'nearest', 'bilinear' } :: paint.Sampling }))
+      else
+        group:add(shape())
+      end
+    end
+  end
+
+  fill(document.root, 0)
+
+  return document
+end
+
+suite.describe('canonical round trips', function()
+  suite.it('saves, loads and saves forty seeded documents to the same text and the same pixels', function()
+    for seed = 1, 40 do
+      local document = random(seed)
+      local text = scene.save(document)
+      local loaded = scene.load(text)
+
+      expect(scene.save(loaded)).toBe(text)
+      expect(pixels(loaded)).toBe(pixels(document))
+    end
+  end)
+end)
+
+suite.describe('premultiplied assets', function()
+  --- A saved document whose one pattern reads a 2 by 1 premultiplied tile, with its first pixel
+  --- replaced by `values` and its checksum made to match, so only the numbers are wrong.
+  local function withPixel(values: { number }, change: ((asset: { [string]: unknown }) -> ())?): string
+    local tile = color.tile(2, 1)
+    local document = scene.new(4, 4)
+
+    document:add(document:shape(path.new():rect(0, 0, 4, 4), { fill = paint.pattern(tile) }))
+
+    local described = scene.describe(document)
+    local asset = (described.assets :: { { [string]: unknown } })[1]
+    local data = buffer.create(32)
+
+    for index, value in values do
+      buffer.writef32(data, (index - 1) * 4, value)
+    end
+
+    asset.data = bytes.toBase64(data)
+    asset.crc32 = string.format('%08x', bytes.crc32(data))
+
+    if change then change(asset) end
+
+    return json.encodeTable(described)
+  end
+
+  suite.it('reads a valid tile', function()
+    expect(scene.load(withPixel { 0.25, 0.5, 0, 0.5 }).count).toBe(2)
+  end)
+
+  suite.it('refuses nonfinite values, alpha outside 0..1 and colors brighter than their alpha, checksum and all', function()
+    local cases: { { values: { number }, message: string } } = {
+      { values = { 0 / 0, 0, 0, 1 }, message = 'has a premultiplied color' },
+      { values = { 0, 0, 0, math.huge }, message = 'has alpha' },
+      { values = { 0, 0, 0, -0.5 }, message = 'has alpha' },
+      { values = { 0, 0, 0, 1.5 }, message = 'has alpha' },
+      { values = { 0.75, 0, 0, 0.5 }, message = 'outside 0..alpha' },
+      { values = { -0.1, 0, 0, 0.5 }, message = 'outside 0..alpha' },
+    }
+
+    for _, case in cases do
+      expect(function()
+        scene.load(withPixel(case.values))
+      end).toThrow(case.message)
+    end
+  end)
+
+  suite.it('refuses unknown formats and spaces rather than reading them as bytes', function()
+    expect(function()
+      scene.load(withPixel({ 0, 0, 0, 0 }, function(asset)
+        asset.format = 'rgba16'
+      end))
+    end).toThrow 'magick: asset 1 has unknown format rgba16'
+
+    expect(function()
+      scene.load(withPixel({ 0, 0, 0, 0 }, function(asset)
+        asset.space = 'cmyk'
+      end))
+    end).toThrow 'magick: asset 1 has unknown color space cmyk'
   end)
 end)
 
