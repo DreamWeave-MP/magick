@@ -268,7 +268,7 @@ suite.describe('bounded fills', function()
 
     -- A hundred 7 by 7 windows; one whole-tile window would be 4 MiB.
     expect(gcinfo() - before < 1024).toBe(true)
-    expect(color.pixel(tile, 10, 1000)).toBe(1)
+    expect((color.pixel(tile, 10, 1000))).toBe(1)
   end)
 
   suite.it('still clears the whole tile for an operator that clears outside its coverage', function()

@@ -1,0 +1,171 @@
+--!strict
+-- "Rosette", an intricate gradient illustration in the manner of engraved guilloche: hypotrochoid
+-- bands stroked through turning conic gradients, cubic petals in radial gradients under rotations,
+-- dashed and beaded rings, blend modes, and a starburst border, all through @magick's public 0.2.0
+-- API in linear light. Rendered, written and checked by tools/demos.jsl, from the package folder:
+--
+--   jess run --package . --capability filesystem.read --capability filesystem.write tools/demos.jsl
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local transform = require '@magick/transform'
+
+local Size = 1000
+local Center = Size / 2
+local Tau = 2 * math.pi
+
+--- The demo, drawn: the same bytes every time.
+local function render(): magick.Image
+  local canvas = color.tile(Size, Size, { space = 'linear' })
+  local whole = path.new():rect(0, 0, Size, Size)
+
+  --- A turn about the rosette's center.
+  local function around(radians: number): transform.Matrix
+    return transform.compose(transform.translate(Center, Center), transform.rotate(radians), transform.translate(-Center, -Center))
+  end
+
+  --- A hypotrochoid about the center: a point `reach` from the middle of a circle of radius `small`
+  --- rolling inside one of radius `large`, sampled `steps` times over `turns` turns, as a closed path.
+  local function hypotrochoid(large: number, small: number, reach: number, turns: number, steps: number, scale: number): path.Path
+    local curve = path.new()
+
+    for step = 0, steps do
+      local angle = step / steps * turns * Tau
+      local across = (large - small) * math.cos(angle) + reach * math.cos((large - small) / small * angle)
+      local down = (large - small) * math.sin(angle) - reach * math.sin((large - small) / small * angle)
+
+      if step == 0 then
+        curve:moveTo(Center + across * scale, Center + down * scale)
+      else
+        curve:lineTo(Center + across * scale, Center + down * scale)
+      end
+    end
+
+    return curve:close()
+  end
+
+  -- Ground: deep ink, lifted toward the middle.
+  paint.fillPath(canvas, whole, paint.radial(Center, Center, Size * 0.72, paint.stops(0, '#1a1f3a', 0.55, '#0c0f22', 1, '#04050c')))
+
+  -- A soft halo behind the rosette, laid on by screen.
+  paint.fillPath(canvas, path.new():circle(Center, Center, 470), paint.radial(Center, Center, 470, paint.stops(
+    0, '#3a2a6080',
+    0.6, '#20306040',
+    1, '#20306000'
+  )), { blend = 'screen' })
+
+  local spectrum = paint.stops(
+    0, '#f2c14e',
+    0.17, '#f78154',
+    0.33, '#d1495b',
+    0.5, '#7b5ea7',
+    0.67, '#4d9de0',
+    0.83, '#3bb273',
+    1, '#f2c14e'
+  )
+
+  -- Guilloche bands: hypotrochoids of slightly different rolling circles, each stroked thin through
+  -- a conic gradient turned a little further than the last, laid on by screen so crossings glow.
+  -- Each band is fitted inside `radius` by its greatest reach, (large - small) + reach, and engraved
+  -- as nine copies turned by a fraction of one lobe, so its lines run close and parallel.
+  local bands = {
+    { large = 13, small = 5, reach = 7.4, turns = 5, radius = 428, width = 0.7 },
+    { large = 17, small = 7, reach = 9.1, turns = 7, radius = 360, width = 0.6 },
+    { large = 11, small = 4, reach = 6.2, turns = 4, radius = 300, width = 0.6 },
+    { large = 19, small = 6, reach = 4.8, turns = 3, radius = 226, width = 0.7 },
+  }
+
+  for index, band in bands do
+    local scale = band.radius / (band.large - band.small + band.reach)
+    local curve = hypotrochoid(band.large, band.small, band.reach, band.turns, 2400, scale)
+    local lobe = Tau * band.small / band.large
+    local outline = curve:stroked { width = band.width, join = 'round' }
+
+    for copy = 0, 8 do
+      local hue = paint.conic(Center, Center, spectrum, { startAngle = index * 0.9 + copy * 0.05 })
+
+      paint.fillPath(canvas, outline, hue, { transform = around(copy * lobe / 18), blend = 'screen', opacity = 0.5 })
+    end
+  end
+
+  -- Engraved rings: two dashed circles and a ring of beads, drawn in gold and laid on by exclusion,
+  -- which inverts where they cross the bands.
+  local function ring(radius: number): path.Path
+    return path.new():moveTo(Center + radius, Center):lineTo(Center + radius, Center):circle(Center, Center, radius)
+  end
+
+  local gold = paint.linear(0, 200, 0, 800, paint.stops(0, '#fff0c0', 0.5, '#e0b060', 1, '#a07030'))
+
+  paint.fillPath(canvas, ring(452):stroked { width = 2.2, dashes = { 14, 6, 2, 6 } }, gold)
+  paint.fillPath(canvas, ring(438):stroked { width = 1 }, gold, { opacity = 0.7 })
+
+  for bead = 0, 143 do
+    local angle = bead / 144 * Tau
+    local size = if bead % 6 == 0 then 3.4 else 1.6
+
+    paint.fillPath(canvas, path.new():circle(Center + math.cos(angle) * 468, Center + math.sin(angle) * 468, size), gold)
+  end
+
+  paint.fillPath(canvas, ring(232):stroked { width = 6, dashes = { 1, 9 }, cap = 'round' }, gold, { blend = 'exclusion' })
+
+  -- petalCount: a cubic leaf, turned 24 ways, filled with a radial gradient that follows it round (the
+  -- paint turns with the petal), outlined in a darker line.
+  local petal = path.new()
+    :moveTo(Center, Center - 40)
+    :cubicTo(Center + 36, Center - 90, Center + 30, Center - 170, Center, Center - 214)
+    :cubicTo(Center - 30, Center - 170, Center - 36, Center - 90, Center, Center - 40)
+    :close()
+  local petalCount = 24
+
+  for index = 0, petalCount - 1 do
+    local turn = around(index / petalCount * Tau)
+    local shade = paint.radial(Center, Center - 120, 110, paint.stops(
+      0, if index % 2 == 0 then '#ffd8a0d8' else '#b8c8ffd8',
+      0.7, if index % 2 == 0 then '#d0604080' else '#5060c080',
+      1, '#20104000'
+    ), { transform = turn, focusX = Center, focusY = Center - 170 })
+
+    paint.fillPath(canvas, petal, shade, { transform = turn, blend = 'screen' })
+    paint.fillPath(canvas, petal:stroked { width = 1.2, join = 'round' }, paint.solid('#1a1030', { opacity = 0.6 }), { transform = turn })
+  end
+
+  -- Inner rosette: a smaller hypotrochoid filled under evenodd, so its crossings alternate, through
+  -- a conic spectrum, and a jewel at the heart.
+  local heart = hypotrochoid(10, 3, 5.5, 3, 1200, 9.5)
+
+  paint.fillPath(canvas, heart, paint.conic(Center, Center, spectrum, { startAngle = -math.pi / 2 }), { fillRule = 'evenodd', opacity = 0.9 })
+  paint.fillPath(canvas, heart:stroked { width = 0.8, join = 'round' }, paint.solid '#fff4d8', { opacity = 0.7 })
+  paint.fillPath(canvas, path.new():circle(Center, Center, 22), paint.radial(Center - 6, Center - 7, 26, paint.stops(
+    0, '#ffffff',
+    0.3, '#a0e0ff',
+    0.8, '#2050a0',
+    1, '#102040'
+  )))
+
+  -- Starburst border: thin rays from the center, faded by distance, kept outside the ring of beads
+  -- by an evenodd clip of the square with the circle taken out.
+  local outside = path.new():rect(0, 0, Size, Size):circle(Center, Center, 480):coverageIn(0, 0, Size, Size, { fillRule = 'evenodd' })
+  local rays = path.new()
+
+  for ray = 0, 359 do
+    local angle = ray / 360 * Tau
+    local reach = if ray % 5 == 0 then 760 else 650
+
+    rays:moveTo(Center + math.cos(angle) * 486, Center + math.sin(angle) * 486)
+    rays:lineTo(Center + math.cos(angle) * reach, Center + math.sin(angle) * reach)
+  end
+
+  paint.fillPath(canvas, rays:stroked { width = 0.9 }, paint.radial(Center, Center, 720, paint.stops(
+    0.65, '#e0b060a0',
+    1, '#e0b06000'
+  )), { clips = { { mask = outside, left = 0, top = 0 } } })
+
+  -- Corner frame: a double rule with mitered corners.
+  paint.fillPath(canvas, path.new():moveTo(24, 24):lineTo(976, 24):lineTo(976, 976):lineTo(24, 976):close():stroked { width = 3 }, gold)
+  paint.fillPath(canvas, path.new():moveTo(34, 34):lineTo(966, 34):lineTo(966, 966):lineTo(34, 966):close():stroked { width = 1 }, gold, { opacity = 0.6 })
+
+  return color.toImage(canvas)
+end
+
+return { name = 'rosette', render = render }
