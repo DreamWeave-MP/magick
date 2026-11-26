@@ -170,4 +170,82 @@ suite.describe('bounds and metrics', function()
   end)
 end)
 
+suite.describe('painting against the rendered canvas', function()
+  suite.it('reports each pass as the real render, measured against the reference itself', function()
+    local target = reference()
+    local painting = painter.paint(target, { radii = { 6, 3 }, threshold = 0.05, seed = 2 })
+
+    expect(#painting.passes).toBe(2)
+    expect(painting.ground.error).toBe(painter.error(painting.ground.image, target))
+
+    for _, pass in painting.passes do
+      expect(pass.error).toBe(painter.error(pass.image, target))
+    end
+
+    expect(buffer.tostring(painting.image.data)).toBe(buffer.tostring(painting.passes[2].image.data))
+    -- Strokes bring the canvas toward the reference from its flat ground.
+    expect(painting.passes[2].error < painting.ground.error).toBe(true)
+  end)
+
+  suite.it('paints the same bytes for the same call', function()
+    local first = painter.paint(reference(), { radii = { 6, 3 }, seed = 7 })
+    local second = painter.paint(reference(), { radii = { 6, 3 }, seed = 7 })
+
+    expect(buffer.tostring(first.image.data)).toBe(buffer.tostring(second.image.data))
+  end)
+
+  suite.it('covers the whole ground in its first pass', function()
+    local painting = painter.paint(reference(), { radii = { 6 }, seed = 3, ground = '#ff00ff' })
+    local image, bare = painting.passes[1].image, 0
+
+    for pixel = 0, image.width * image.height - 1 do
+      if buffer.readu8(image.data, pixel * 4) == 255 and buffer.readu8(image.data, pixel * 4 + 1) == 0 and buffer.readu8(image.data, pixel * 4 + 2) == 255 then bare += 1 end
+    end
+
+    expect(bare).toBe(0)
+  end)
+
+  suite.it('paints a region\'s own passes only inside it', function()
+    local painting = painter.paint(reference(), {
+      radii = { 6 },
+      seed = 5,
+      regions = { { name = 'left', shape = path.new():rect(0, 0, 24, 40), radii = { 6, 2 }, threshold = 0 } },
+    })
+    local before, after = painting.passes[1].image, painting.passes[2].image
+
+    expect(painting.passes[2].radius).toBe(2)
+    expect(painting.passes[2].strokes > 0).toBe(true)
+
+    -- Every fine stroke's line stays in the region; its dabs reach no further past the edge than the
+    -- brush's length, here at most 2.5 times its radius of 2.
+    for row = 0, 39 do
+      for column = 30, 63 do
+        local at = (row * 64 + column) * 4
+
+        expect(buffer.readu32(after.data, at)).toBe(buffer.readu32(before.data, at))
+      end
+    end
+  end)
+
+  suite.it('refuses references with transparency, bad scales and unknown options', function()
+    local clear = magick.new(8, 8)
+
+    expect(function()
+      painter.paint(clear)
+    end).toThrow 'magick: paint takes an opaque reference'
+
+    expect(function()
+      painter.paint(reference(), { scale = 1.5 })
+    end).toThrow 'magick: paint scale must be a whole number in 1..4'
+
+    expect(function()
+      painter.paint(reference(), ({ widen = 2 } :: unknown) :: painter.PaintOptions)
+    end).toThrow 'magick: unknown option widen'
+
+    expect(function()
+      painter.paint(reference(), { regions = { { name = 'bad', shape = path.new():rect(0, 0, 4, 4), radii = { 2, 4 } } } })
+    end).toThrow 'magick: region bad brush radii go from large to small'
+  end)
+end)
+
 return suite
