@@ -20,3 +20,8 @@ tests = ["tests/basic.jsl", "tests/compat.jsl", "tests/gate.jsl", "tests/propert
 id = "org.dreamweave.magick"
 requires = []
 exports = ["@magick", "@magick/path", "@magick/transform", "@magick/color", "@magick/paint", "@magick/scene", "@magick/render"]
+
+[targets.workers-check]
+kind = "application"
+entry = "tests/workers.jsl"
+capabilities = ["worker.spawn"]

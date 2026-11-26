@@ -1,0 +1,81 @@
+--!strict
+-- The worker check (MAG-024): renders one busy scene on 1, 2, 4 and 8 workers and holds every
+-- result to the 1-worker bytes, then checks that a cancel stops the render. Workers need a
+-- ScriptDomain, so this runs as the package's application target, not under `jess package test`:
+--
+--   jess package run --capability worker.spawn --target workers-check .
+local application = require '@jess/application'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+
+--- A 1024 by 768 scene of 600 overlapping, transformed, gradient-filled and stroked shapes in
+--- groups, some blurred, so every tile has work in it.
+local function busy(): scene.Document
+  local document = scene.new(1024, 768, { background = '#101420', space = 'linear' })
+  local petal = path.new():moveTo(0, 0):cubicTo(30, -40, 60, -10, 70, 0):cubicTo(60, 10, 30, 40, 0, 0):close()
+
+  for layer = 0, 5 do
+    local group = document:add(document:group {
+      opacity = 0.6 + layer * 0.06,
+      filters = if layer % 2 == 0 then { { kind = 'blur', radius = 1 + layer * 0.5 } } else nil,
+    })
+
+    for index = 0, 99 do
+      local angle = index * 2.39996 + layer
+      local radius = 30 + index * 3.6
+
+      group:add(document:shape(petal, {
+        transform = transform.compose(transform.translate(512 + math.cos(angle) * radius, 384 + math.sin(angle) * radius * 0.75), transform.rotate(angle), transform.scale(0.6 + layer * 0.1)),
+        fill = paint.linear(0, 0, 70, 0, paint.stops(0, '#ffd08080', 1, '#6040c0d0')),
+        stroke = paint.solid '#ffffff60',
+        strokeStyle = { width = 1 },
+        blend = if index % 3 == 0 then 'screen' else 'normal',
+      }))
+    end
+  end
+
+  return document
+end
+
+local plan = render.compile(busy())
+local started = os.clock()
+local single = render.image(plan, { tileSize = 128 })
+local base = os.clock() - started
+local failures = 0
+
+print(`workers 1: {string.format('%.3f', base)} s`)
+
+for _, count in { 2, 4, 8 } do
+  local began = os.clock()
+  local image = render.image(plan, { tileSize = 128, workers = count })
+  local seconds = os.clock() - began
+  local matches = buffer.tostring(image.data) == buffer.tostring(single.data)
+
+  print(`workers {count}: {string.format('%.3f', seconds)} s, {if matches then 'same bytes' else 'DIFFERENT BYTES'}`)
+
+  if not matches then failures += 1 end
+end
+
+local auto = render.image(plan, { tileSize = 128, workers = 'auto' })
+
+print(`workers auto: {if buffer.tostring(auto.data) == buffer.tostring(single.data) then 'same bytes' else 'DIFFERENT BYTES'}`)
+
+local stopping: render.RenderOptions = {
+  tileSize = 128,
+  workers = 2,
+  cancel = function(): boolean
+    return true
+  end,
+}
+
+-- pcall only around a render that must raise: a cancel asked between tiles stops it.
+local cancelled, message = pcall(render.image, plan, stopping)
+
+print(`cancel: {if not cancelled and string.find(tostring(message), 'render cancelled', 1, true) then 'stops the render' else 'DID NOT STOP'}`)
+
+if cancelled then failures += 1 end
+
+application.exit(if failures == 0 then 0 else 1)

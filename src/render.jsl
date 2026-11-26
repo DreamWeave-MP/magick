@@ -85,6 +85,10 @@ export type RenderOptions = {
   into: magick.Image?,
   --- Refuse before any tile runs when the working set would pass this many bytes.
   memoryBudgetBytes: number?,
+  --- How many workers render tiles: 1 (the default), up to MaxWorkers, or `auto`.
+  workers: (number | 'auto')?,
+  --- Asked between tiles; true stops the render with `magick: render cancelled`.
+  cancel: (() -> boolean)?,
 }
 
 --- What a render did, for finding overdraw and waste.
@@ -613,6 +617,157 @@ runOps = function(plan: Plan, ops: { Op }, base: Tile, pool: Pool, depth: number
   end
 end
 
+--- Renders one tile of a plan onto its base working tile: the background, then every operation.
+local function renderTile(plan: Plan, pool: Pool, left: number, top: number, width: number, height: number): Tile
+  local base = borrow(pool, 1, left, top, width, height, plan.space)
+  local backdrop = plan.background
+
+  if backdrop then
+    for at = 0, width * height * 16 - 16, 16 do
+      buffer.writef32(base.data, at, backdrop[1])
+      buffer.writef32(base.data, at + 4, backdrop[2])
+      buffer.writef32(base.data, at + 8, backdrop[3])
+      buffer.writef32(base.data, at + 12, backdrop[4])
+    end
+  end
+
+  runOps(plan, plan.ops, base, pool, 1)
+  pool.stats.tiles += 1
+
+  return base
+end
+
+local workerPools = (setmetatable({}, { __mode = 'k' }) :: unknown) :: { [Plan]: Pool }
+
+--- One tile of a plan as straight RGBA8 bytes, rows from the top: what a render worker returns.
+--- The same arithmetic as a tile of `image`, so the bytes are the same wherever it runs.
+function Module.tileBytes(plan: Plan, left: number, top: number, width: number, height: number): buffer
+  local pool = workerPools[plan]
+
+  if not pool then
+    pool = { tiles = {}, stats = { tiles = 0, candidates = 0, rendered = 0, skipped = 0, groups = 0, peakTileBytes = 0 }, held = 0 }
+    workerPools[plan] = pool
+  end
+
+  local image = magick.new(width, height)
+  local base = renderTile(plan, pool :: Pool, left, top, width, height)
+
+  base.left, base.top = 0, 0
+  color.toImage(base, image)
+
+  return image.data
+end
+
+--- The source of a render worker: it keeps the plan it is sent, and answers each batch of tiles
+--- with their bytes.
+local WorkerSource = [[
+local render = require('@magick/render')
+local plan = nil
+
+return function(message)
+  if message.plan then
+    plan = message.plan
+
+    return { ready = true }
+  end
+
+  local out = {}
+
+  for _, job in message.tiles do
+    table.insert(out, render.tileBytes(plan, job[1], job[2], job[3], job[4]))
+  end
+
+  return { batch = message.batch, tiles = out }
+end
+]]
+
+--- The tiles a region of a plan covers, row-major: left, top, width, height each.
+local function tilesOf(plan: Plan, region: { number }, tileSize: number): { { number } }
+  local jobs: { { number } } = {}
+
+  for tileTop = math.max(0, region[2] // tileSize * tileSize), math.min(plan.height, region[4]) - 1, tileSize do
+    for tileLeft = math.max(0, region[1] // tileSize * tileSize), math.min(plan.width, region[3]) - 1, tileSize do
+      table.insert(jobs, { tileLeft, tileTop, math.min(tileSize, plan.width - tileLeft), math.min(tileSize, plan.height - tileTop) })
+    end
+  end
+
+  return jobs
+end
+
+--- Copies a tile's straight bytes into the output image at its place.
+local function stitch(output: magick.Image, job: { number }, bytes: buffer)
+  for row = 0, job[4] - 1 do
+    buffer.copy(output.data, ((job[2] + row) * output.width + job[1]) * 4, bytes, row * job[3] * 4, job[3] * 4)
+  end
+end
+
+--- Renders tiles on `workers` workers: the plan is sent to each once, the tiles dealt out in
+--- batches by turns, and every reply stitched into its own place, so the order replies arrive in
+--- changes nothing. A worker that fails, or a cancel, stops the render with no image.
+local function renderParallel(plan: Plan, jobs: { { number } }, output: magick.Image, workers: number, cancel: (() -> boolean)?)
+  local worker = require '@jess/worker'
+  local spawned = {}
+
+  for index = 1, workers do
+    local handle = worker.spawn { name = `magick render {index}`, capabilities = {}, source = WorkerSource }
+
+    handle:send { plan = plan }
+    table.insert(spawned, handle)
+  end
+
+  local function stopAll()
+    for _, handle in spawned do
+      handle:close()
+    end
+  end
+
+  local batches: { { { number } } } = {}
+  local batchSize = 8
+
+  for index, job in jobs do
+    local batch = (index - 1) // batchSize + 1
+
+    batches[batch] = batches[batch] or {}
+    table.insert(batches[batch], job)
+  end
+
+  for index, batch in batches do
+    spawned[(index - 1) % workers + 1]:send { batch = index, tiles = batch }
+  end
+
+  for index, handle in spawned do
+    local ready = handle:receive(600)
+
+    if not ready or not ready.ready then
+      stopAll()
+      error(`magick: render worker {index} failed: {handle:join(5)}`, 3)
+    end
+  end
+
+  for index, batch in batches do
+    if cancel and cancel() then
+      stopAll()
+      error('magick: render cancelled', 3)
+    end
+
+    local handle = spawned[(index - 1) % workers + 1]
+    local reply = handle:receive(600)
+
+    if not reply or reply.batch ~= index then
+      stopAll()
+      error(`magick: render worker {(index - 1) % workers + 1} failed: {handle:join(5)}`, 3)
+    end
+
+    for position, job in batch do
+      stitch(output, job, reply.tiles[position])
+    end
+  end
+
+  for _, handle in spawned do
+    handle:join(60)
+  end
+end
+
 --- The bytes a render's working set needs at most: a tile for the base and one for each group level
 --- (each widened by the largest halo), a tile of filter scratch, and the output image.
 function Module.workingBytes(plan: Plan, tileSize: number): number
@@ -633,7 +788,39 @@ function Module.workingBytes(plan: Plan, tileSize: number): number
   return (1 + deepest + 2) * wide * wide * 16 + plan.width * plan.height * 4
 end
 
-local RenderKeys = { tileSize = true, reference = true, region = true, into = true, memoryBudgetBytes = true }
+local RenderKeys = {
+  tileSize = true,
+  reference = true,
+  region = true,
+  into = true,
+  memoryBudgetBytes = true,
+  workers = true,
+  cancel = true,
+}
+
+--- The most render workers, and the fewest pixels worth starting them for.
+Module.MaxWorkers = 8
+Module.ParallelPixels = 512 * 512
+
+--- How many workers a render runs on: 1 unless asked for more, `auto` taking 4 for a render of at
+--- least ParallelPixels when this runtime may spawn workers (a ScriptDomain with `worker.spawn`), and
+--- never more than the tiles.
+local function chooseWorkers(plan: Plan, asked: (number | 'auto')?, tiles: number): number
+  if not asked or asked == 1 then return 1 end
+
+  if asked == 'auto' then
+    if plan.width * plan.height < Module.ParallelPixels or not jess.granted('worker.spawn') then return 1 end
+
+    return math.min(4, tiles)
+  end
+
+  local count = asked :: number
+
+  if count ~= math.floor(count) or count < 1 then error('magick: workers must be a whole number of at least 1, or auto', 3) end
+  if count > Module.MaxWorkers then error(`magick: MaxWorkers {Module.MaxWorkers} exceeded`, 3) end
+
+  return math.min(count, tiles)
+end
 
 --- Renders a plan (or a document, compiled first) into a straight RGBA8 image, tile by tile in
 --- row-major order. Returns the image and what the render did.
@@ -662,28 +849,22 @@ function Module.image(source: Plan | scene.Document, options: RenderOptions?): (
 
   local region = if options and options.region then options.region else { 0, 0, plan.width, plan.height }
   local stats: Stats = { tiles = 0, candidates = 0, rendered = 0, skipped = 0, groups = 0, peakTileBytes = 0 }
+  local jobs = tilesOf(plan, region, tileSize)
+  local workers = chooseWorkers(plan, if options then options.workers else nil, #jobs)
+
+  if workers > 1 then
+    renderParallel(plan, jobs, output, workers, if options then options.cancel else nil)
+    stats.tiles = #jobs
+
+    return output, stats
+  end
+
   local pool: Pool = { tiles = {}, stats = stats, held = 0 }
-  local backdrop = plan.background
-  local solid = if backdrop then paint.solid({ 0, 0, 0, 0 }) else nil
 
-  for tileTop = math.max(0, region[2] // tileSize * tileSize), math.min(plan.height, region[4]) - 1, tileSize do
-    for tileLeft = math.max(0, region[1] // tileSize * tileSize), math.min(plan.width, region[3]) - 1, tileSize do
-      local width, height = math.min(tileSize, plan.width - tileLeft), math.min(tileSize, plan.height - tileTop)
-      local base = borrow(pool, 1, tileLeft, tileTop, width, height, plan.space)
+  for _, job in jobs do
+    if options and options.cancel and options.cancel() then error('magick: render cancelled', 2) end
 
-      if backdrop and solid then
-        for at = 0, width * height * 16 - 16, 16 do
-          buffer.writef32(base.data, at, backdrop[1])
-          buffer.writef32(base.data, at + 4, backdrop[2])
-          buffer.writef32(base.data, at + 8, backdrop[3])
-          buffer.writef32(base.data, at + 12, backdrop[4])
-        end
-      end
-
-      runOps(plan, plan.ops, base, pool, 1)
-      color.toImage(base, output)
-      stats.tiles += 1
-    end
+    color.toImage(renderTile(plan, pool, job[1], job[2], job[3], job[4]), output)
   end
 
   return output, stats
