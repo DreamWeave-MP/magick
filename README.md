@@ -1,4 +1,4 @@
-# @magick 0.1.3
+# @magick 0.2.0
 
 Pure-Luau raster toolkit for Jess. Backward-compatible with the 0.1.0 Morrowind generator surface while adding PNG/BMP/TGA I/O, atlas operations, image-processing math, gradients, masking, blur/shadow, grayscale/threshold/colorize, and the H3/H3UI dependency cone.
 
@@ -8,7 +8,14 @@ What 0.1.x promises consumers, and what it keeps as it always did, is in [COMPAT
 
 The renderer design for 0.2.0 (coordinates, transforms, premultiplied working tiles, compositing and the API boundaries) is proposed for ratification by review in [RFC-0001](docs/RFC-0001-renderer.md), with its checked sketches in `docs/rfc/sketches/`.
 
-## 0.2.0, in development
+## 0.2.0 changes
+
+Two demos drawn only through the public API, rendered and checked byte for byte by `tools/demos.jsl` (records in
+`demos/records.jsl`):
+
+| [Lighthouse at Dusk](demos/lighthouse.jsl) | [Rosette](demos/rosette.jsl) |
+|---|---|
+| ![Lighthouse at Dusk](demos/renders/lighthouse.png) | ![Rosette](demos/renders/rosette.png) |
 
 Everything below is opt-in. A caller who uses only 0.1.x names gets the bytes 0.1.3 gave, except for the owner-approved
 `Path:transformed` change recorded in [COMPATIBILITY.md](COMPATIBILITY.md#owner-approved-changes).

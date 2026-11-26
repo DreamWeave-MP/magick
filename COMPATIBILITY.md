@@ -7,10 +7,10 @@ suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and 
 
 Measured against: `jess` 0.4.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
-- `jess package test .`: 664 passed, 0 failed. That is 332 tests counted twice: each suite runs once from
-  the source folder and once from the packed `.jpk`, so every count is doubled. Per provider, 49 are
-  `tests/basic.jsl`, 46 `tests/compat.jsl`, 78 `tests/gate.jsl`, 4 `tests/property.jsl`, 15
-  `tests/png.jsl`, 16 `tests/path.jsl`, 10 `tests/resample.jsl`, 56 `tests/rfc.jsl`, 57 `tests/rfc_contracts.jsl` and 1 `tests/style.jsl`.
+- `jess package test .`: 916 passed, 0 failed: 458 tests, each run once from the source folder and once from
+  the packed `.jpk`. The 0.1.x suites (`basic`, `compat`, `gate`, `property`, `png`, `path`, `resample`, `rfc`,
+  `rfc_contracts`, `style`) are unchanged; 0.2.0 adds `transform`, `coverage`, `stroke`, `color`, `paint`,
+  `pattern` and `blend`.
 - `jess package check .`: no errors, strict types over every `.jsl`.
 - `jess run --package . bench/bench.jsl`: all 98 workloads ran and held their fingerprints (91 of them before the gate rows).
 
