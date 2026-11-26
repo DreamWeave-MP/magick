@@ -265,8 +265,10 @@ end
 --- is held at a time.
 type PlaneLevel = { radius: number, red: Plane, green: Plane, blue: Plane, gradientX: Plane, gradientY: Plane }
 
-local function planeLevel(red: Plane, green: Plane, blue: Plane, width: number, height: number, radius: number, spare: Plane): PlaneLevel
-  local size = math.max(0, math.floor(radius / 2))
+--- `least` is the smallest blur a level gets: `plan` takes none, as it always has; `paint` takes a
+--- pixel, so its finest brush follows the picture rather than the photograph's grain and cracks.
+local function planeLevel(red: Plane, green: Plane, blue: Plane, width: number, height: number, radius: number, spare: Plane, least: number?): PlaneLevel
+  local size = math.max(least or 0, math.floor(radius / 2))
   local level: PlaneLevel = {
     radius = radius,
     red = blurPlane(red, width, height, size, spare),
@@ -808,7 +810,7 @@ function Module.paint(reference: magick.Image, options: PaintOptions?): Painting
   -- The ground: the canvas toned one flat color before any stroke, the reference's mean unless one
   -- is given, as a painter lays an imprimatura. A blurred copy of the reference would already match
   -- the coarse passes' targets and leave them nothing to paint.
-  local first = planeLevel(red, green, blue, width, height, radii[1], spare)
+  local first = planeLevel(red, green, blue, width, height, radii[1], spare, 1)
   local tone = if options and options.ground then options.ground else nil
 
   if not tone then
@@ -839,7 +841,7 @@ function Module.paint(reference: magick.Image, options: PaintOptions?): Painting
   end
 
   for passIndex, radius in radii do
-    local level = if passIndex == 1 then first else planeLevel(red, green, blue, width, height, radius, spare)
+    local level = if passIndex == 1 then first else planeLevel(red, green, blue, width, height, radius, spare, 1)
     local seen = reduce(canvas, scale)
     local step = math.max(1, math.floor(radius * gridFactor + 0.5))
 
