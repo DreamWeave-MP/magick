@@ -1097,14 +1097,15 @@ local function renderParallel(plan: Compiled, grid: Grid, output: magick.Image, 
 end
 
 --- The bytes a render needs at most (RFC-0001 B3): each working set, which is a tile for the base
---- and one for each group level (each widened by the largest halo) and a tile of shadow scratch;
+--- and one for each group level (each widened by the largest halo), a tile of shadow scratch and
+--- the coverage cells;
 --- and the output image. A parallel render adds, per worker, its copy of the plan and the tile
 --- bytes that may wait in its queues.
 function Module.workingBytes(handle: Plan, tileSize: number, workers: number?): number
   local plan = open(handle, 1)
   local deepest, halo = nesting(plan.ops, 0)
   local wide = tileSize + 2 * halo * math.max(1, deepest)
-  local perWorker = (1 + deepest + 2) * wide * wide * 16
+  local perWorker = (1 + deepest + 2) * wide * wide * 16 + (wide + 1) * wide * 8
   local count = workers or 1
   local output = plan.width * plan.height * 4
 

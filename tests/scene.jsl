@@ -417,7 +417,14 @@ suite.describe('redraw and budgets', function()
     local plain, blurred = render.compile(masked(0)), render.compile(masked(21))
 
     -- The base, the group, its mask tile and the mask's two groups: four levels below the base.
-    expect(render.workingBytes(plain, 64)).toBe((1 + 4 + 2) * 64 * 64 * 16 + 64 * 64 * 4)
+    local perWorker = (1 + 4 + 2) * 64 * 64 * 16 + 65 * 64 * 8
+
+    expect(render.workingBytes(plain, 64)).toBe(perWorker + 64 * 64 * 4)
+    -- Each worker holds a working set of its own, its copy of the plan, and the tiles that may wait
+    -- in its queues.
+    local queued = (render.InFlightBatches + 1) * render.BatchTiles * 64 * 64 * 4
+
+    expect(render.workingBytes(plain, 64, 4)).toBe(4 * (perWorker + plain.bytes + queued) + 64 * 64 * 4)
     expect(render.workingBytes(blurred, 64) > render.workingBytes(plain, 64)).toBe(true)
   end)
 
