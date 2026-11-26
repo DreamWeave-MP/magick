@@ -145,6 +145,14 @@ It does not count the document the caller built, the caller's own copy of the pl
 reached yet. It is a ceiling on the render, not on the process: the serial 100,000-node run peaks at 1.39 GB resident
 with the document in hand. Budget a process with that in mind.
 
+`processBudgetBytes` (opt-in) adds what the process already holds: it refuses, before any tile runs, when the Luau
+heap in use now plus what the render needs would pass it. For the 100,000-node scene that check sees 741 MiB held plus
+32 MiB needed, where the serial render peaks at 1.30 GB resident. The rest is churn during the render, allocator
+overhead and the binary itself. The heap depends on how far the collector has got, so near the bound a call may pass
+once and be refused the next time. A hard ceiling on the process needs the allocator to enforce it: l3i can cap a
+runtime's heap, and jess does not yet let a host set that cap for a package target, which is where such a guarantee
+belongs.
+
 ### Downstream integration (MAG-045)
 
 The DreamWeave Mod Template uses Magick as its site generator's image backend: `read`, `Image:resize`, `write`.
