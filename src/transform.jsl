@@ -1,0 +1,241 @@
+--!strict
+--[[
+@magick/transform: 2D affine matrices (RFC-0001 section 3).
+
+Column vectors. A matrix maps a point (x, y) to (a * x + c * y + e, b * x + d * y + f), and its six
+fields are SVG's matrix(a b c d e f) in that order: scaleX = a, skewY = b, skewX = c, scaleY = d,
+offsetX = e, offsetY = f. `multiply(first, second)` is first o second: the point goes through
+`second` first, so `multiply(translate, multiply(scale, rotate))` rotates, then scales, then moves.
+
+Matrices are plain immutable tables; every function here returns a new one. A matrix with a NaN or
+infinite field is refused wherever one enters (`magick: transform must be finite`), and an inverse
+of a singular matrix is refused rather than made up (`magick: transform is singular`).
+]]
+
+local Module = {}
+
+--- A 2x3 affine matrix, SVG's matrix(a b c d e f) by field name.
+export type Matrix = {
+  scaleX: number,
+  skewY: number,
+  skewX: number,
+  scaleY: number,
+  offsetX: number,
+  offsetY: number,
+}
+
+--- The largest absolute coordinate, offset or width a new API takes: 2^22.
+Module.MaxCoordinate = 4194304
+
+local function finite(value: number): boolean
+  return value == value and value > -math.huge and value < math.huge
+end
+
+--- Refuses a matrix with a NaN or infinite field, naming the caller's line.
+function Module.check(matrix: Matrix): Matrix
+  if
+    not finite(matrix.scaleX)
+    or not finite(matrix.skewY)
+    or not finite(matrix.skewX)
+    or not finite(matrix.scaleY)
+    or not finite(matrix.offsetX)
+    or not finite(matrix.offsetY)
+  then
+    error('magick: transform must be finite', 3)
+  end
+
+  return matrix
+end
+
+local function make(scaleX: number, skewY: number, skewX: number, scaleY: number, offsetX: number, offsetY: number): Matrix
+  return Module.check { scaleX = scaleX, skewY = skewY, skewX = skewX, scaleY = scaleY, offsetX = offsetX, offsetY = offsetY }
+end
+
+--- A matrix from SVG's six numbers in their order, `matrix(a b c d e f)`.
+function Module.matrix(scaleX: number, skewY: number, skewX: number, scaleY: number, offsetX: number, offsetY: number): Matrix
+  return make(scaleX, skewY, skewX, scaleY, offsetX, offsetY)
+end
+
+--- The matrix that leaves every point where it is.
+function Module.identity(): Matrix
+  return make(1, 0, 0, 1, 0, 0)
+end
+
+--- A move by an offset.
+function Module.translate(offsetX: number, offsetY: number): Matrix
+  return make(1, 0, 0, 1, offsetX, offsetY)
+end
+
+--- A scale about the origin, the same both ways when `scaleY` is left out. A negative scale is a
+--- reflection.
+function Module.scale(scaleX: number, scaleY: number?): Matrix
+  return make(scaleX, 0, 0, scaleY or scaleX, 0, 0)
+end
+
+--- A rotation about the origin by radians. A positive angle turns +x toward +y, which is clockwise
+--- on screen, since y grows down.
+function Module.rotate(radians: number): Matrix
+  local cosine, sine = math.cos(radians), math.sin(radians)
+
+  return make(cosine, sine, -sine, cosine, 0, 0)
+end
+
+--- A shear: x moves by `skewX` times y, and y by `skewY` times x. These are tangents, not angles.
+function Module.skew(skewX: number, skewY: number?): Matrix
+  return make(1, skewY or 0, skewX, 1, 0, 0)
+end
+
+--- `first` o `second`: the point goes through `second`, then `first`.
+function Module.multiply(first: Matrix, second: Matrix): Matrix
+  return make(
+    first.scaleX * second.scaleX + first.skewX * second.skewY,
+    first.skewY * second.scaleX + first.scaleY * second.skewY,
+    first.scaleX * second.skewX + first.skewX * second.scaleY,
+    first.skewY * second.skewX + first.scaleY * second.scaleY,
+    first.scaleX * second.offsetX + first.skewX * second.offsetY + first.offsetX,
+    first.skewY * second.offsetX + first.scaleY * second.offsetY + first.offsetY
+  )
+end
+
+--- The product of matrices written in order, applied right to left: `compose(T, S, R)` rotates,
+--- then scales, then moves. With none it is the identity.
+function Module.compose(...: Matrix): Matrix
+  local count = select('#', ...)
+  local out = Module.identity()
+
+  for index = 1, count do
+    out = Module.multiply(out, (select(index, ...)))
+  end
+
+  return out
+end
+
+--- Where a point goes.
+function Module.apply(matrix: Matrix, pointX: number, pointY: number): (number, number)
+  return matrix.scaleX * pointX + matrix.skewX * pointY + matrix.offsetX,
+    matrix.skewY * pointX + matrix.scaleY * pointY + matrix.offsetY
+end
+
+--- Where a direction goes: the linear part only, with no offset.
+function Module.applyVector(matrix: Matrix, vectorX: number, vectorY: number): (number, number)
+  return matrix.scaleX * vectorX + matrix.skewX * vectorY, matrix.skewY * vectorX + matrix.scaleY * vectorY
+end
+
+--- How the matrix scales signed area. Negative for a reflection.
+function Module.determinant(matrix: Matrix): number
+  return matrix.scaleX * matrix.scaleY - matrix.skewY * matrix.skewX
+end
+
+--- Whether the matrix is exactly the identity.
+function Module.isIdentity(matrix: Matrix): boolean
+  return matrix.scaleX == 1
+    and matrix.skewY == 0
+    and matrix.skewX == 0
+    and matrix.scaleY == 1
+    and matrix.offsetX == 0
+    and matrix.offsetY == 0
+end
+
+--- Singular when the determinant is zero, or no more than 1e-12 of the square of the linear part's
+--- largest entry.
+function Module.isSingular(matrix: Matrix): boolean
+  local largest = math.max(math.abs(matrix.scaleX), math.abs(matrix.skewY), math.abs(matrix.skewX), math.abs(matrix.scaleY))
+  local determinant = Module.determinant(matrix)
+
+  return determinant == 0 or math.abs(determinant) <= 1e-12 * largest * largest
+end
+
+--- The largest singular value of the linear part: the most the matrix stretches any direction.
+--- The identity gives exactly 1.
+function Module.sigmaMax(matrix: Matrix): number
+  local sumOfSquares = matrix.scaleX * matrix.scaleX
+    + matrix.skewY * matrix.skewY
+    + matrix.skewX * matrix.skewX
+    + matrix.scaleY * matrix.scaleY
+  local determinant = Module.determinant(matrix)
+  local spread = math.sqrt(math.max(0, sumOfSquares * sumOfSquares - 4 * determinant * determinant))
+
+  return math.sqrt((sumOfSquares + spread) / 2)
+end
+
+--- The matrix that undoes this one. A singular matrix has none, and is refused.
+function Module.inverse(matrix: Matrix): Matrix
+  Module.check(matrix)
+  if Module.isSingular(matrix) then error('magick: transform is singular', 2) end
+
+  local determinant = Module.determinant(matrix)
+
+  return make(
+    matrix.scaleY / determinant,
+    -matrix.skewY / determinant,
+    -matrix.skewX / determinant,
+    matrix.scaleX / determinant,
+    (matrix.skewX * matrix.offsetY - matrix.scaleY * matrix.offsetX) / determinant,
+    (matrix.skewY * matrix.offsetX - matrix.scaleX * matrix.offsetY) / determinant
+  )
+end
+
+--- One coordinate of a cubic Bezier at a parameter.
+local function bezierAt(start: number, first: number, second: number, finish: number, along: number): number
+  local rest = 1 - along
+
+  return rest * rest * rest * start + 3 * rest * rest * along * first + 3 * rest * along * along * second + along * along * along * finish
+end
+
+--- Widens `low, high` to hold one coordinate of a cubic Bezier over (0, 1): its derivative is
+--- 3 (A t^2 + B t + C) with A = u - 2v + w, B = 2 (v - u), C = u for the control differences u, v, w.
+local function extend(start: number, first: number, second: number, finish: number, low: number, high: number): (number, number)
+  low, high = math.min(low, start, finish), math.max(high, start, finish)
+
+  local early, middle, late = first - start, second - first, finish - second
+  local quadratic, linear = early - 2 * middle + late, 2 * (middle - early)
+  local roots: { number } = {}
+
+  if math.abs(quadratic) < 1e-12 then
+    if math.abs(linear) >= 1e-12 then table.insert(roots, -early / linear) end
+  else
+    local discriminant = linear * linear - 4 * quadratic * early
+
+    if discriminant >= 0 then
+      local root = math.sqrt(discriminant)
+
+      table.insert(roots, (-linear + root) / (2 * quadratic))
+      table.insert(roots, (-linear - root) / (2 * quadratic))
+    end
+  end
+
+  for _, along in roots do
+    if along > 0 and along < 1 then
+      local value = bezierAt(start, first, second, finish, along)
+
+      low, high = math.min(low, value), math.max(high, value)
+    end
+  end
+
+  return low, high
+end
+
+--- The exact device box of a cubic Bezier under a matrix: left, top, right, bottom. An affine map
+--- carries a Bezier to the Bezier of its moved control points, so the box is taken over those.
+function Module.cubicBox(
+  matrix: Matrix,
+  startX: number,
+  startY: number,
+  firstX: number,
+  firstY: number,
+  secondX: number,
+  secondY: number,
+  finishX: number,
+  finishY: number
+): (number, number, number, number)
+  local x0, y0 = Module.apply(matrix, startX, startY)
+  local x1, y1 = Module.apply(matrix, firstX, firstY)
+  local x2, y2 = Module.apply(matrix, secondX, secondY)
+  local x3, y3 = Module.apply(matrix, finishX, finishY)
+  local left, right = extend(x0, x1, x2, x3, math.huge, -math.huge)
+  local top, bottom = extend(y0, y1, y2, y3, math.huge, -math.huge)
+
+  return left, top, right, bottom
+end
+
+return Module
