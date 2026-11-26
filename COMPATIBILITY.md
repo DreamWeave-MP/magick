@@ -239,6 +239,27 @@ announced in the release notes of the release that ships it, and is not a silent
   "**Quirks are contract too.** ... A fix goes in as a clearly versioned opt-in, never as a silent change", which this
   entry records as an owner-approved exception rather than an opt-in. Golden and benchmark files do not call
   `transformed` on a curve, so no golden moves. Release notes for 0.2.0 must carry this entry.
+
+  *Implemented* on `feat/magick-MAG-004-retained-paths`. Arcs count as curves: `circle`, `ring`, `roundRect` and the
+  round caps and joins of `line` and `polyline` keep their arcs, which flatten again under the new scale at a tolerance
+  in their own space of the device tolerance over the matrix's largest stretch. Pinned by `tests/transform.jsl`: the
+  identity and whole-pixel translations give the 0.1.3 masks byte for byte on quadratic, cubic, circle, ring,
+  roundRect and round-capped polyline contours; a line-only path gives `point * scale + offset` exactly; the quadratic
+  `(0,0),(50,100),(100,0)` at scale 4 flattens to 20 pieces with area 53200, where the old bake gave 10 pieces and
+  52800.
+
+## Changes awaiting owner approval
+
+Made on the provisional 0.2.0 branches, each stated against what 0.1.3 did. None moves a golden or a benchmark
+fingerprint.
+
+- **Curves past `MaxPiecesPerCurve` (16384 pieces) are refused.** `quadTo`, `cubicTo`, and the arcs of `circle`,
+  `ring` and `roundRect` raise `magick: MaxPiecesPerCurve 16384 exceeded` where 0.1.3 would build that many points: an
+  infinite control point looped without end, and a control point 1e12 away tried to allocate billions of points. A
+  curve within the cap gives the 0.1.3 points; NaN still passes through as it did.
+- **`Path:transformed` refuses a NaN or infinite scale or offset** with `magick: transform must be finite`, where 0.1.3
+  produced NaN points. It is now `transformBy` of `matrix(scale, 0, 0, scale, dx, dy)`, which checks its matrix.
+
 ## Known legacy behaviour
 
 Two defects, pinned as they are and not endorsed:
