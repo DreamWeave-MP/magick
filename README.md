@@ -150,6 +150,20 @@ on whole pixels of opaque colors and is within one step elsewhere (premultiplied
   the source; an addition to RFC-0001 M10's three). The source is read where it is at each fill, nothing is copied,
   and a fill into the tile a pattern reads is refused (`magick: pattern reads its own destination`).
 
+### Blend modes and isolated groups
+
+`color.composite` and every paint fill take `blend`: one of the sixteen W3C modes, `normal` (default), `multiply`,
+`screen`, `overlay`, `darken`, `lighten`, `color-dodge`, `color-burn`, `hard-light`, `soft-light`, `difference`,
+`exclusion`, `hue`, `saturation`, `color`, `luminosity` (RFC-0001 amendment A2). A blend composites src-over:
+`cr = cs (1 - ab) + cb (1 - as) + as ab B(Cb, Cs)`; another operator with a non-normal blend is refused, as is any other
+name. `color.separable`, `color.blendColor` and `color.mixPixel` are the formulas themselves.
+
+An isolated group is a transparent tile its children draw into (`color.group(backdrop)` makes one in the backdrop's
+place and space), composited once with `color.compositeGroup(backdrop, group, { clip?, opacity?, blend?, operator? })`:
+the clip multiplies the group, then its opacity is applied once, then its blend and operator lay it on (G2). Two
+overlapping children at group opacity 0.6 show no darker overlap; the same children at 0.6 each do. Groups nest by the
+caller making one tile per level.
+
 ## Gates
 
 `tests/gate.jsl` holds the package to tiny exact fixtures (transparency, clipping, alpha, curves,
