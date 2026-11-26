@@ -238,8 +238,25 @@ end
 local owning: { [buffer]: buffer }? = nil
 
 --- A paint the plan owns: a pattern reads a copy of its source's pixels made now, so writing the
---- source afterwards never reaches the plan. Every other paint holds no buffer.
+--- source afterwards never reaches the plan. A mix or mask owns its inputs the same way; every
+--- other paint holds no buffer.
 local function own(value: paint.Paint): paint.Paint
+  local inputs = value.inputs
+
+  if inputs then
+    local owned: { paint.Paint } = {}
+
+    for _, inner in inputs do
+      table.insert(owned, own(inner))
+    end
+
+    local copy = table.clone(value) :: { [string]: unknown }
+
+    copy.inputs = table.freeze(owned)
+
+    return table.freeze(copy) :: paint.Paint
+  end
+
   local source = value.source
 
   if value.kind ~= 'pattern' or not source then return value end

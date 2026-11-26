@@ -396,7 +396,7 @@ function Module.moved(value: Paint, matrix: Matrix): Paint
       table.insert(moved, Module.moved(inner, matrix))
     end
 
-    copy.inputs = moved
+    copy.inputs = table.freeze(moved)
   end
 
   return table.freeze(copy) :: Paint
@@ -602,16 +602,16 @@ function Module.mix(first: Paint, second: Paint, weight: noise.Field, options: {
     opacity = checkOpacity(if options then options.opacity else nil, 2),
     transform = matrix,
     inverse = inverse,
-    channels = {},
-    offsets = {},
-    colors = {},
+    channels = Nothing,
+    offsets = Nothing,
+    colors = Nothing,
     spread = 'pad',
     interpolation = 'srgb',
-    geometry = {},
+    geometry = Nothing,
     sampling = 'nearest',
     edge = 'clamp',
     field = noise.field(weight),
-    inputs = { first, second },
+    inputs = table.freeze { first, second },
   } :: Paint
 end
 
@@ -620,7 +620,7 @@ function Module.masked(inner: Paint, mask: noise.Field, options: { transform: Ma
   local made = table.clone(Module.mix(inner, inner, mask, options)) :: { [string]: unknown }
 
   made.kind = 'masked'
-  made.inputs = { inner }
+  made.inputs = table.freeze { inner }
 
   return table.freeze(made) :: Paint
 end
@@ -642,12 +642,12 @@ function Module.shader(evaluate: Shader, options: { transform: Matrix?, opacity:
     opacity = checkOpacity(if options then options.opacity else nil, 2),
     transform = matrix,
     inverse = inverse,
-    channels = {},
-    offsets = {},
-    colors = {},
+    channels = Nothing,
+    offsets = Nothing,
+    colors = Nothing,
     spread = 'pad',
     interpolation = 'srgb',
-    geometry = {},
+    geometry = Nothing,
     sampling = 'nearest',
     edge = 'clamp',
     shader = evaluate,

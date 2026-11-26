@@ -4,6 +4,7 @@
 -- spread, degenerate gradients, focal points, transforms, operators and refusals.
 local color = require '@magick/color'
 local magick = require '@magick'
+local noise = require '@magick/noise'
 local paint = require '@magick/paint'
 local path = require '@magick/path'
 local test = require '@jess/test'
@@ -99,6 +100,12 @@ suite.describe('solid', function()
       conic = paint.conic(5, 5, stops, { startAngle = 1 }),
       image = paint.pattern(magick.new(2, 2), { edge = 'repeat' }),
       tile = paint.pattern(color.tile(2, 2), { sampling = 'bilinear' }),
+      field = paint.fieldPaint(noise.noiseField('perlin', 3, 0.1), stops),
+      mix = paint.mix(paint.solid '#ff0000', paint.pattern(magick.new(2, 2)), noise.coordinate 'x'),
+      masked = paint.masked(paint.linear(0, 0, 4, 0, stops), { op = 'add', input = { op = 'x' }, other = { op = 'y' } }),
+      shader = paint.shader(function(): (number, number, number, number)
+        return 0, 0, 0, 1
+      end),
     }
 
     for name, value in paints do

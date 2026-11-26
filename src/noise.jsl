@@ -307,13 +307,22 @@ local function checkField(field: Field, depth: number, budget: { number })
   end
 end
 
---- A field description checked and frozen, ready to compile or save.
+--- Freezes a table and every table inside it.
+local function freezeAll(value: { [unknown]: unknown })
+  for _, inner in value do
+    if type(inner) == 'table' and not table.isfrozen(inner :: { [unknown]: unknown }) then freezeAll(inner :: { [unknown]: unknown }) end
+  end
+
+  if not table.isfrozen(value) then table.freeze(value) end
+end
+
+--- A field description checked and frozen all the way down, ready to compile or save: its inputs
+--- given as plain tables are frozen too, so nothing a paint keeps can change after it is made.
 function Module.field(description: Field): Field
   checkField(description, 1, { 0 })
+  freezeAll((description :: unknown) :: { [unknown]: unknown })
 
-  if table.isfrozen(description) then return description end
-
-  return table.freeze(description)
+  return description
 end
 
 --- Constructors. Each returns a description; `frequency` scales the coordinates going in.
