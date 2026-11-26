@@ -13,6 +13,8 @@ type Demo = { name: string, render: () -> magick.Image }
 
 local render = require '@magick/render'
 local valley = require '../demos/valley'
+local oil = require '../demos/oil'
+local heron = require '../demos/heron'
 
 local Demos: { Demo } = {
   require '../demos/lighthouse',
@@ -21,6 +23,18 @@ local Demos: { Demo } = {
     name = 'valley',
     render = function(): magick.Image
       return (render.image(valley.build(960, 540)))
+    end,
+  },
+  {
+    name = 'heron',
+    render = function(): magick.Image
+      return (render.image(heron.build(800, 1000)))
+    end,
+  },
+  {
+    name = 'oil',
+    render = function(): magick.Image
+      return (render.image((oil.build())))
     end,
   },
 }

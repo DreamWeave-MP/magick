@@ -6,6 +6,8 @@ local Records: { [string]: string } = {
   ['lighthouse'] = '900x1200:a3d7845e',
   ['rosette'] = '1000x1000:4d1413ef',
   ['valley'] = '960x540:5f71731b',
+  ['heron'] = '800x1000:7b868098',
+  ['oil'] = '960x540:036937b3',
 }
 
 return table.freeze(Records)

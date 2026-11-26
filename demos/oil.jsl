@@ -1,0 +1,24 @@
+--!strict
+-- "The Valley, in Oil": Valley at First Light painted again by @magick/painter. The valley is
+-- rendered small as the reference (our own scene, so free to use); the painter plans strokes
+-- coarse to fine over it, and they are laid with the oil preset at three times the size over a
+-- blurred underpainting. Every stroke is a brush node in a scene, so the painting renders tile by
+-- tile and the same on any number of workers.
+local painter = require '@magick/painter'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+local valley = require './valley'
+
+--- Builds the painting at 960 by 540, and returns the plan's per-level stats with it.
+local function build(): (scene.Document, { painter.LevelStats })
+  local reference = render.image(valley.build(320, 180))
+  local plan = painter.plan(reference, { radii = { 8, 4, 2 }, threshold = 0.06, seed = 3 })
+  local document = scene.new(960, 540, { background = '#e8dcc0', space = 'linear' })
+
+  painter.apply(document, document.root, plan, { matrix = transform.scale(3), seed = 5, underpaint = reference })
+
+  return document, plan.levels
+end
+
+return { name = 'oil', build = build }
