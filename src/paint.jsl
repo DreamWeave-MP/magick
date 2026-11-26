@@ -42,6 +42,26 @@ export type GradientOptions = {
   focusY: number?,
 }
 
+--- How a pattern takes a pixel from its source: the nearest, or a premultiplied blend of four.
+export type Sampling = 'nearest' | 'bilinear'
+
+--- What a pattern reads past its source's edges: the edge pixel again, the source repeated, the
+--- source mirrored, or nothing.
+export type Edge = 'clamp' | 'repeat' | 'mirror' | 'transparent'
+
+--- A pattern's source: a legacy image (`straight8`, straight sRGB RGBA8) or a working tile
+--- (`premultiplied32`), read where it is when a fill reads it.
+export type PatternSource = {
+  width: number,
+  height: number,
+  data: buffer,
+  format: 'straight8' | 'premultiplied32',
+  space: Space,
+}
+
+--- What `pattern` takes.
+export type PatternOptions = { transform: Matrix?, sampling: Sampling?, edge: Edge?, opacity: number? }
+
 --- A paint. Its fields are read-only; `kind` says which of the rest it uses.
 export type Paint = {
   kind: 'solid' | 'linear' | 'radial' | 'conic' | 'pattern',
@@ -57,6 +77,10 @@ export type Paint = {
   interpolation: Space,
   --- Gradient geometry, in paint space.
   geometry: { number },
+  --- Pattern: what it reads, how it samples and what lies past its edges.
+  source: PatternSource?,
+  sampling: Sampling,
+  edge: Edge,
 }
 
 --- How a fill composites: its operator and opacity, and how its path is covered.
@@ -131,6 +155,8 @@ function Module.solid(fill: magick.Color, options: { opacity: number? }?): Paint
     spread = 'pad',
     interpolation = 'srgb',
     geometry = Nothing,
+    sampling = 'nearest',
+    edge = 'clamp',
   } :: Paint
 end
 
@@ -233,6 +259,8 @@ local function gradient(
     spread = spread,
     interpolation = interpolation,
     geometry = table.freeze(geometry),
+    sampling = 'nearest',
+    edge = 'clamp',
   } :: Paint
 end
 
@@ -264,6 +292,78 @@ function Module.radial(centerX: number, centerY: number, radius: number, stops: 
   end
 
   return gradient('radial', { centerX, centerY, radius, focusX, focusY }, stops, options)
+end
+
+--- A conic (angular) gradient about a center: offset 0 on the seam at `startAngle` radians from +x
+--- (0 by default) and rising clockwise on screen, since y grows down, to 1 a whole turn on, where it
+--- meets the seam again. The parameter is always in 0..1, so every spread gives the same paint.
+--- Turn it the other way with a reflecting transform.
+function Module.conic(centerX: number, centerY: number, stops: { Stop }, options: (GradientOptions & { startAngle: number? })?): Paint
+  local startAngle = 0
+  local rest: GradientOptions? = nil
+
+  if options then
+    startAngle = options.startAngle or 0
+
+    local copy = table.clone(options) :: { [string]: unknown }
+
+    copy.startAngle = nil
+    rest = copy :: GradientOptions
+
+    if options.focusX or options.focusY then error('magick: only a radial gradient has a focus', 2) end
+  end
+
+  return gradient('conic', { centerX, centerY, startAngle }, stops, rest)
+end
+
+local PatternKeys = { transform = true, sampling = true, edge = true, opacity = true }
+
+--- A paint of an image or a working tile, its pixels laid out in paint space from the origin, each
+--- the unit square it covers, so with the identity a source pixel lands on the device pixel of the
+--- same place, and repeated it aligns as a legacy tiled `Image` source does. The source is read
+--- where it is whenever a fill reads it: nothing is copied, and a fill into the very tile or image a
+--- pattern reads is refused.
+function Module.pattern(source: magick.Image | Tile, options: PatternOptions?): Paint
+  checkKeys(options, PatternKeys, 2)
+
+  local sampling: Sampling = if options then options.sampling or 'nearest' else 'nearest'
+  local edge: Edge = if options then options.edge or 'clamp' else 'clamp'
+
+  if sampling ~= 'nearest' and sampling ~= 'bilinear' then error(`magick: unknown sampling {sampling}`, 2) end
+  if edge ~= 'clamp' and edge ~= 'repeat' and edge ~= 'mirror' and edge ~= 'transparent' then error(`magick: unknown edge {edge}`, 2) end
+
+  local fields = source :: { [string]: unknown }
+  local described: PatternSource
+
+  if type(fields.space) == 'string' then
+    local tile = source :: Tile
+
+    described = { width = tile.width, height = tile.height, data = tile.data, format = 'premultiplied32', space = tile.space }
+  else
+    local image = source :: magick.Image
+
+    described = { width = image.width, height = image.height, data = image.data, format = 'straight8', space = 'srgb' }
+  end
+
+  if described.width <= 0 or described.height <= 0 then error('magick: a pattern needs a source with pixels', 2) end
+
+  local matrix, inverse = checkMatrix(if options then options.transform else nil, 2)
+
+  return table.freeze {
+    kind = 'pattern',
+    opacity = checkOpacity(if options then options.opacity else nil, 2),
+    transform = matrix,
+    inverse = inverse,
+    channels = {},
+    offsets = {},
+    colors = {},
+    spread = 'pad',
+    interpolation = 'srgb',
+    geometry = {},
+    source = described,
+    sampling = sampling,
+    edge = edge,
+  } :: Paint
 end
 
 --- `t` brought into 0..1 by a spread.
@@ -343,6 +443,12 @@ local function parameter(paint: Paint, pointX: number, pointY: number): number?
     return ((pointX - geometry[1]) * deltaX + (pointY - geometry[2]) * deltaY) / length
   end
 
+  if paint.kind == 'conic' then
+    local turn = (math.atan2(pointY - geometry[2], pointX - geometry[1]) - geometry[3]) / (2 * math.pi)
+
+    return turn - math.floor(turn)
+  end
+
   -- Radial: the point is `focus + t * (edge - focus)` for the edge on the circle along the ray
   -- from the focus, so t solves |w + u / t| = r with u = point - focus and w = focus - center.
   local radius = geometry[3]
@@ -362,6 +468,102 @@ local function parameter(paint: Paint, pointX: number, pointY: number): number?
   return 1 / inverse
 end
 
+--- A source index brought inside `0..size - 1` by an edge rule; nil past a transparent edge.
+local function edgeIndex(edge: Edge, index: number, size: number): number?
+  if index >= 0 and index < size then return index end
+  if edge == 'clamp' then return math.clamp(index, 0, size - 1) end
+  if edge == 'repeat' then return index % size end
+
+  if edge == 'mirror' then
+    local folded = index % (2 * size)
+
+    return if folded >= size then 2 * size - 1 - folded else folded
+  end
+
+  return nil
+end
+
+--- One source pixel, premultiplied in the target space: red, green, blue, alpha.
+@native
+local function texel(source: PatternSource, edge: Edge, linear: boolean, column: number, row: number): (number, number, number, number)
+  local inside, down = edgeIndex(edge, column, source.width), edgeIndex(edge, row, source.height)
+
+  if not inside or not down then return 0, 0, 0, 0 end
+
+  local data = source.data
+
+  if source.format == 'premultiplied32' then
+    local at = (down * source.width + inside) * 16
+
+    return buffer.readf32(data, at), buffer.readf32(data, at + 4), buffer.readf32(data, at + 8), buffer.readf32(data, at + 12)
+  end
+
+  local at = (down * source.width + inside) * 4
+  local alphaByte = buffer.readu8(data, at + 3)
+
+  if alphaByte == 0 then return 0, 0, 0, 0 end
+
+  local alpha = alphaByte / 255
+  local red, green, blue = buffer.readu8(data, at), buffer.readu8(data, at + 1), buffer.readu8(data, at + 2)
+
+  if linear then
+    local table = color.linearBytes
+
+    return table[red + 1] * alpha, table[green + 1] * alpha, table[blue + 1] * alpha, alpha
+  end
+
+  return red / 255 * alpha, green / 255 * alpha, blue / 255 * alpha, alpha
+end
+
+--- A pattern's span: each pixel center taken back to paint space and read from the source, the
+--- nearest pixel or a blend of the four around it, weighted on premultiplied values so a
+--- transparent neighbour lends no color.
+@native
+local function patternSpan(paint: Paint, tile: Tile, row: number, first: number, count: number, out: buffer, scale: number)
+  local source = paint.source :: PatternSource
+  local inverse = paint.inverse
+  local centerY = tile.top + row + 0.5
+  local linear = tile.space == 'linear'
+  local edge = paint.edge
+
+  if source.format == 'premultiplied32' and source.space ~= tile.space then
+    error('magick: a pattern tile must be in the space of the tile it fills', 3)
+  end
+
+  for index = 0, count - 1 do
+    local centerX = tile.left + first + index + 0.5
+    local pointX = inverse.scaleX * centerX + inverse.skewX * centerY + inverse.offsetX
+    local pointY = inverse.skewY * centerX + inverse.scaleY * centerY + inverse.offsetY
+    local red, green, blue, alpha
+
+    if paint.sampling == 'nearest' then
+      red, green, blue, alpha = texel(source, edge, linear, math.floor(pointX), math.floor(pointY))
+    else
+      local across, down = pointX - 0.5, pointY - 0.5
+      local column, line = math.floor(across), math.floor(down)
+      local right, lower = across - column, down - line
+      local topLeftRed, topLeftGreen, topLeftBlue, topLeftAlpha = texel(source, edge, linear, column, line)
+      local topRightRed, topRightGreen, topRightBlue, topRightAlpha = texel(source, edge, linear, column + 1, line)
+      local bottomLeftRed, bottomLeftGreen, bottomLeftBlue, bottomLeftAlpha = texel(source, edge, linear, column, line + 1)
+      local bottomRightRed, bottomRightGreen, bottomRightBlue, bottomRightAlpha = texel(source, edge, linear, column + 1, line + 1)
+      local topLeft, topRight = (1 - right) * (1 - lower), right * (1 - lower)
+      local bottomLeft, bottomRight = (1 - right) * lower, right * lower
+
+      red = topLeftRed * topLeft + topRightRed * topRight + bottomLeftRed * bottomLeft + bottomRightRed * bottomRight
+      green = topLeftGreen * topLeft + topRightGreen * topRight + bottomLeftGreen * bottomLeft + bottomRightGreen * bottomRight
+      blue = topLeftBlue * topLeft + topRightBlue * topRight + bottomLeftBlue * bottomLeft + bottomRightBlue * bottomRight
+      alpha = topLeftAlpha * topLeft + topRightAlpha * topRight + bottomLeftAlpha * bottomLeft + bottomRightAlpha * bottomRight
+    end
+
+    local at = index * 32
+
+    buffer.writef64(out, at, red * scale)
+    buffer.writef64(out, at + 8, green * scale)
+    buffer.writef64(out, at + 16, blue * scale)
+    buffer.writef64(out, at + 24, alpha * scale)
+  end
+end
+
 --- A gradient's span: each pixel center taken back to paint space, its parameter spread, and the
 --- stops' color there. A linear gradient's parameter is worked out inline, with the same arithmetic.
 @native
@@ -371,8 +573,12 @@ local function gradientSpan(paint: Paint, tile: Tile, row: number, first: number
   local lastOffset = #paint.offsets
   local geometry = paint.geometry
   local linear = paint.kind == 'linear'
-  local deltaX, deltaY = geometry[3] - geometry[1], geometry[4] - geometry[2]
-  local length = deltaX * deltaX + deltaY * deltaY
+  local deltaX, deltaY, length = 0, 0, 0
+
+  if linear then
+    deltaX, deltaY = geometry[3] - geometry[1], geometry[4] - geometry[2]
+    length = deltaX * deltaX + deltaY * deltaY
+  end
 
   for index = 0, count - 1 do
     local centerX = tile.left + first + index + 0.5
@@ -411,6 +617,12 @@ function Module.span(paint: Paint, tile: Tile, row: number, first: number, count
       buffer.writef64(out, at + 16, blue)
       buffer.writef64(out, at + 24, alpha)
     end
+
+    return
+  end
+
+  if paint.kind == 'pattern' then
+    patternSpan(paint, tile, row, first, count, out, scale)
 
     return
   end
@@ -470,6 +682,10 @@ end
 --- by the coverage, by an operator. Where coverage is 0 the source is transparent, so an operator
 --- that clears under transparency clears there.
 local function paintThrough(tile: Tile, coverage: buffer, value: Paint, operator: color.Operator, opacity: number)
+  local source = value.source
+
+  if source and source.data == tile.data then error('magick: pattern reads its own destination', 3) end
+
   -- The operator's factors are linear in the alphas: read their coefficients off two corners.
   local first, second = color.factors(operator, 0, 0)
   local firstAtOne, secondAtOne = color.factors(operator, 1, 1)
