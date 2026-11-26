@@ -125,17 +125,17 @@ suite.describe('render budget boundaries (B3)', function()
     end), 'magick: render needs 568344576 bytes')).toBe(true)
   end)
 
-  suite.it('counts the encode peak: 8192 square at tile 128 with encode is 1157761925 bytes, over 1 GiB', function()
-    -- 3.02 * 268435456 = 810675077 (floored), plus 347086848: 1157761925. It is over 1 GiB (1073741824), so a
+  suite.it('counts the encode peak: 8192 square at tile 128 with encode is 1157794693 bytes, over 1 GiB', function()
+    -- 3.02 * 268435456 = 810675077 (floored), plus 4 bytes a row (32768) and 347086848: 1157794693. It is over 1 GiB (1073741824), so a
     -- 1 GiB budget refuses it, and 1.25 GiB (1342177280) accepts it.
-    expect(render.plan(128, 8, 64, 8192, 8192, true, 1342177280)).toBe(1157761925)
+    expect(render.plan(128, 8, 64, 8192, 8192, true, 1342177280)).toBe(1157794693)
     expect(contains(refusal(function()
       render.plan(128, 8, 64, 8192, 8192, true, 1073741824)
-    end), 'magick: render needs 1157761925 bytes')).toBe(true)
+    end), 'magick: render needs 1157794693 bytes')).toBe(true)
 
     expect(contains(refusal(function()
       render.plan(128, 8, 64, 8192, 8192, true, 536870912)
-    end), 'magick: render needs 1157761925 bytes')).toBe(true)
+    end), 'magick: render needs 1157794693 bytes')).toBe(true)
   end)
 
   suite.it('refuses each option outside its cap with the E5 message', function()
@@ -295,13 +295,16 @@ suite.describe('every named cap follows the E5 rule (B3)', function()
   suite.it('pins the constants to the rules they state', function()
     -- The default tile is inside the maximum tile; the image pixel cap is the square of the edge cap; the
     -- working cap is a 4096 square; the coordinate cap is 2^22; a cubic at the coordinate limit needs
-    -- ceil(sqrt(0.75 * (4 * 2^22 * sqrt 2) / 0.25)) = 8431 pieces, under MaxPiecesPerCurve.
+    -- ceil(sqrt(0.75 * (4 * 2^22 * sqrt 2) / 0.25)) = 8437 pieces, under MaxPiecesPerCurve.
     expect(caps.DefaultTileEdge <= caps.values.MaxTileEdge).toBe(true)
     expect(caps.values.MaxImagePixels).toBe(caps.values.MaxImageEdge * caps.values.MaxImageEdge)
     expect(caps.values.MaxWorkingPixels).toBe(4096 * 4096)
     expect(caps.values.MaxCoordinate).toBe(2 ^ 22)
     expect(caps.values.MaxDecodedPixels).toBe(caps.values.MaxImagePixels)
-    expect(math.ceil(math.sqrt(0.75 * (4 * 2 ^ 22 * math.sqrt(2)) / 0.25)) <= caps.values.MaxPiecesPerCurve).toBe(true)
+    local pieces = math.ceil(math.sqrt(0.75 * (4 * 2 ^ 22 * math.sqrt(2)) / 0.25))
+
+    expect(pieces).toBe(8437)
+    expect(pieces <= caps.values.MaxPiecesPerCurve).toBe(true)
   end)
 
   suite.it('refuses clip depth 17 and accepts 16, the boundary of MaxClipDepth', function()

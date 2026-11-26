@@ -42,7 +42,8 @@ and no contour crosses itself**. Otherwise the 0.2.0 rule is the **summed signed
 and F2. That is an approximation, and it is the documented 0.2.0 result, not an exact area in general. Pinned by
 `tests/rfc.jsl`: two identical `rect(0.5, 0, 2, 1)` contours (overlap) give 255 in column 0, where the exact union is 128;
 the bowtie `(0,0) (3,3) (3,0) (0,3)` (self-crossing) gives 0 in pixel (1, 1), where the exact nonzero coverage is 0.5; a
-rectangle traced twice as one contour gives 255 in column 0 under nonzero, which is exact there. Paint is evaluated at
+rectangle traced twice as one contour gives 255 in column 0 under nonzero, where the rectangle covers half the column
+and the exact coverage is 128. Paint is evaluated at
 pixel centers (section 9).
 
 **C3 (two conventions).** The legacy `Image` cell methods (`rect`, `rectOver`, `circle`, `line`, ...) keep
@@ -260,7 +261,7 @@ a bevel at limit 1.4; a 20 degree join (ratio 5.7588) is a bevel at limit 4, a 3
 **SK5 (caps).** `cap` is `butt` (the default), `round` or `square`, as in 0.1.3.
 
 **SK6 (dashes).** `dashes` is an array of lengths in user space. It has at most `MaxDashEntries` (64) entries,
-each finite and `>= 0`, and its sum is `> 0`. An empty array, or a sum of 0, draws a solid stroke. Computable:
+each finite and `>= 0`. An empty array, or one whose lengths sum to 0, draws a solid stroke. Computable:
 `checkDashes` refuses 65 entries and a negative entry and sums `{1, 2, 3}` to 6. `dashOffset` is in user space
 and reduced into `[0, period)` by floored modulo: `-1` with period 5 gives 4, `12` gives 2, `10` gives 0.
 Dashes are generated along the flattened centerline. A stroke that would generate more than `MaxDashesPerStroke`
@@ -279,7 +280,7 @@ otherwise (C2, with the bowtie vector). A negative winding counts by magnitude: 
 **F2 (evenodd).** `evenodd` coverage is `w = |S| mod 2`, then `w` if `w <= 1`, else `2 - w`, on the same summed `S` as F1.
 It is exact only when no contour overlaps or crosses itself, and it is **not exact** for a rectangle traced twice as one
 contour: column 0 has `S = 1`, so the rule gives 1 (255 bytes), where the exact even-odd answer is 0. That outcome is
-pinned (`paint.coverage('evenodd', 1) = 1` in `tests/rfc_contracts.jsl`, and the legacy mask in `tests/rfc.jsl`).
+pinned by `paint.coverage('evenodd', 1) = 1` in `tests/rfc_contracts.jsl`. The legacy mask is nonzero only.
 **The 0.2.0 rule for evenodd is this approximation.** MAG-006 requires that both fill rules "produce the documented result"
 on self-crossing and overlapping contours (`issue-6.md`); these pinned vectors are that documented result. An exact parity
 rule needs the winding per contour, which the 0.2.0 rasterizer does not keep. Adding one is a new rule, and it requires an
@@ -554,15 +555,16 @@ the same rectangle. **Owned by MAG-008**: it is the tile test of that issue, on 
   - `tileBytes = E * E * 16` (one f32 RGBA working tile per group level, and the backdrop, at tile edge `E`);
   - `coverageBytes = (E + 1) * E * 8`: the coverage cells are f64, one per pixel plus one spare column a row, over `E`
     rows, the same layout `Path:mask` uses (`src/path.jsl`);
-  - `haloBytes = (E + 2H)^2 * 16`, one f32 RGBA halo tile at halo `H` per side (`H` is 0 for renders without a filter, and
+  - `haloBytes = (E + 2R)^2 * 16`, one f32 RGBA halo tile at halo `R` per side (`R` is 0 for renders without a filter, and
     at most `MaxHaloPx` = 64).
 - **Output:** `outputBytes = 4 * W * H` for the one straight RGBA8 `Image` the render writes tile by tile.
-- **Encode (when the caller will encode the result):** `encodeBytes = 3.02 * outputBytes`. This is the peak of
+- **Encode (when the caller will encode the result):** `encodeBytes = floor(3.02 * outputBytes) + 4 * H`. This bounds the peak of
   `Magick.png` (`src/init.jsl`), not a guess. The encoder holds `lines` (the output plus one filter byte a row) until it
   returns; `packed`, a zlib stream from `bytes.deflate` whose stored-block worst case is `lines` plus 5 bytes a 65,535-byte
   block plus framing, at most `1.0001 * lines`; and `out`, a copy of `packed` built while `packed` is still live. The peak
-  is therefore `lines + packed + out <= output * (1 + 2 * 1.0001) = 3.0002 * output`, and 3.02 covers it with margin.
-  Arithmetic for the 8192 square: `268,435,456 * 3.02 = 810,675,077.12`, floored to 810,675,077. MAG-025 replaces the bound
+  is therefore `lines + packed + out <= 3.0002 * lines`, where `lines = output + H`. The bound covers it at every width:
+  `3.0002 * (output + H) <= 3.02 * output + 4 * H` holds because `3.0002 * H < 4 * H`.
+  Arithmetic for the 8192 square: `268,435,456 * 3.02 = 810,675,077.12`, floored to 810,675,077, plus `4 * 8192`: 810,707,845. MAG-025 replaces the bound
   with a measured peak.
 
 The total is `workers * perWorker + outputBytes + encodeBytes`. `Render.plan` returns it, and refuses with
@@ -574,7 +576,7 @@ The total is `workers * perWorker + outputBytes + encodeBytes`. `Render.plan` re
 |---|---|---|---|---|---|
 | 8192 square, tile 256, halo 64, 8 workers, no encode | 37,488,640 (33 MiB + 0.5 MiB cells + 2.25 MiB halo) | 8 | 268,435,456 | 568,344,576 (542 MiB) | refused |
 | 8192 square, tile 128, halo 64, 8 workers, no encode | 9,831,424 (8.25 MiB + 0.13 MiB cells + 1 MiB halo) | 8 | 268,435,456 | 347,086,848 (331 MiB) | passes |
-| 8192 square, tile 128, halo 64, 8 workers, encode | as above | 8 | 268,435,456 + 810,675,077 | 1,157,761,925 (1104 MiB, rounded down) | refused; a 1 GiB budget refuses it, 1.25 GiB (1,342,177,280) accepts it |
+| 8192 square, tile 128, halo 64, 8 workers, encode | as above | 8 | 268,435,456 + 810,707,845 | 1,157,794,693 (1104 MiB, rounded down) | refused; a 1 GiB budget refuses it, 1.25 GiB (1,342,177,280) accepts it |
 | **Boundary:** tile 248, halo 1, 8 workers, 8091 by 8192, no encode | 33,968,128 | 8 | 265,125,888 | **536,870,912 (512 MiB exactly)** | accepted |
 | Boundary plus one column: 8092 by 8192 | as above | 8 | 265,158,656 | 536,903,680 | refused |
 | The exact boundary with budget one byte less | as above | 8 | as above | 536,870,912 | refused |
@@ -594,7 +596,7 @@ relations are tested, and their code is owned by the issue named in the row.
 |---|---|---|---|
 | `MaxCoordinate` | `2^22` (4,194,304) | `checkWidth`; E5 boundary tested | Any user or device coordinate or stroke width must be finite and within `±2^22`. |
 | `MaxCommandsPerPath` | `2^20` | constant; E5 rule tested; owned by MAG-004 | About a million commands is an outline far larger than any glyph or sprite set. |
-| `MaxPiecesPerCurve` | `16384` | constant; relation tested: the coordinate-limit cubic needs 8431 pieces; owned by MAG-004 | At 0.25 px, a cubic may have a control bend up to `16384^2 * 0.25 / 0.75`, about `8.9e7` px; the largest bend `MaxCoordinate` allows is about `2.4e7`. |
+| `MaxPiecesPerCurve` | `16384` | constant; relation tested: the coordinate-limit cubic needs 8437 pieces; owned by MAG-004 | At 0.25 px, a cubic may have a control bend up to `16384^2 * 0.25 / 0.75`, about `8.9e7` px; the largest bend `MaxCoordinate` allows is about `2.4e7`. |
 | `MaxSegmentsPerCoverage` | `2^20` | constant; E5 rule tested; owned by MAG-008 | Flattened segments one coverage call may produce. |
 | `MaxDashEntries` | `64` | `checkDashes`; E5 boundary tested | A dash pattern is a short list (SK6). |
 | `MaxDashesPerStroke` | `2^20` | constant; E5 rule tested; owned by MAG-007 | Generated dashes per stroke (SK6). |
@@ -985,7 +987,7 @@ including the negative-winding nonzero, the stroke width, miter and dash rules, 
 4. **B2, byte-identical tiles.** It is owned by MAG-008 and not proven here.
 5. **T6, singular means error.** A caller who wants a degenerate projection must work around it.
 6. **B3, the budget.** Output and encode are counted, and so are the coverage cells and the halo. The encode term is
-   3.02 output, the peak of `Magick.png` (arithmetic in section 11). MAG-025 replaces it with a measured peak. At tile 128
+   3.02 output plus 4 bytes a row, a bound on the peak of `Magick.png` (arithmetic in section 11). MAG-025 replaces it with a measured peak. At tile 128
    the 8192 square with encode needs more than 1 GiB; the advice is 1.25 GiB.
 7. **W3, sRGB as the default space.** ARCHITECTURE.md contract 5 says "selectable", and linear is selectable. The default is
    sRGB for legacy consistency. The linear transfer is text, owned by MAG-013.

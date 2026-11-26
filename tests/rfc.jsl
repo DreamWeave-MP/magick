@@ -573,7 +573,7 @@ suite.describe('memory budget arithmetic (RFC-0001 B3, render sketch)', function
     local withEncode = render.workingBytes(128, 8, 64, 8192, 8192, true)
 
     expect(withoutEncode).toBe(347086848)
-    expect(withEncode).toBe(1157761925)
+    expect(withEncode).toBe(1157794693)
     expect(withoutEncode < render.DefaultBudgetBytes).toBe(true)
     expect(withEncode > render.DefaultBudgetBytes).toBe(true)
   end)
@@ -623,7 +623,8 @@ suite.describe('self-crossing and retraced contours (C2, F1, F2)', function()
   end)
 
   suite.it('pins the retraced rectangle: one contour traced twice gives column 0 = 255 under nonzero', function()
-    -- Winding 2 everywhere inside, so nonzero is 1 (exact too): 255 at column 0, where half the pixel is covered.
+    -- Winding 2 everywhere inside, and column 0 is half covered: the summed rule adds two halves to 255, where the
+    -- exact nonzero coverage is 128. Amendment A1 makes the new APIs exact; the legacy mask keeps this.
     local mask = path.new()
       :moveTo(0.5, 0):lineTo(2.5, 0):lineTo(2.5, 1):lineTo(0.5, 1):lineTo(0.5, 0)
       :lineTo(2.5, 0):lineTo(2.5, 1):lineTo(0.5, 1):close()
