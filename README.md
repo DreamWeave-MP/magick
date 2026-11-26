@@ -1,4 +1,4 @@
-# @magick 0.3.0
+# @magick 0.5.0
 
 Pure-Luau raster toolkit for Jess. Backward-compatible with the 0.1.0 Morrowind generator surface while adding PNG/BMP/TGA I/O, atlas operations, image-processing math, gradients, masking, blur/shadow, grayscale/threshold/colorize, and the H3/H3UI dependency cone.
 
@@ -7,6 +7,105 @@ ImageMagick is used only as a development oracle; this package does not spawn it
 What 0.1.x promises consumers, and what it keeps as it always did, is in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 The renderer design for 0.2.0 (coordinates, transforms, premultiplied working tiles, compositing and the API boundaries) is proposed for ratification by review in [RFC-0001](docs/RFC-0001-renderer.md), with its checked sketches in `docs/rfc/sketches/`.
+
+## Gallery
+
+Every picture here is drawn by checked-in JSL source through the public modules, with no external
+media, no generative service and no retouching. `tools/demos.jsl` renders each one and holds its
+pixels to the CRC-32 in `demos/records.jsl`, so anyone can reproduce them byte for byte:
+
+```sh
+jess run --package . --capability filesystem.read --capability filesystem.write tools/demos.jsl target/demos
+```
+
+| | |
+|---|---|
+| ![Heron at Dusk](gallery/heron.png) [Heron at Dusk](demos/heron.jsl): ink and watercolor | ![Portrait of a Reader](gallery/portrait.png) [Portrait of a Reader](demos/portrait.jsl): an original vector reference ([reference](gallery/portrait-reference.png)) painted in oil |
+| ![The Valley, in Oil](gallery/oil.png) [The Valley, in Oil](demos/oil.jsl): the valley repainted by `@magick/painter` | ![Valley at First Light](gallery/valley.png) [Valley at First Light](demos/valley.jsl): 5,941 scene nodes, 4K and 8K targets |
+| ![Lighthouse at Dusk](gallery/lighthouse.png) [Lighthouse at Dusk](demos/lighthouse.jsl): a vector poster | ![Rosette](gallery/rosette.png) [Rosette](demos/rosette.jsl): engraved guilloche |
+
+## 0.5.0 changes: Masterpiece
+
+### `@magick/painter`
+
+Painting a reference coarse to fine, after Hertzmann's curved-stroke method (SIGGRAPH 1998; an implementation of the
+idea, not of his code). `painter.analyze(image, radii)` makes the pyramid: the reference blurred for each brush and the
+Sobel gradient of its luminance. `painter.plan(image, { radii?, threshold?, curvature?, minimumLength?, maximumLength?,
+grid?, seed?, budget? })` lays strokes largest brush first wherever a fast estimate of the canvas still differs from that
+level by more than `threshold`, each starting at its cell's worst pixel and running along the edge until the reference
+leaves its color, and reports the mean error left after each level (`plan.levels`), which falls level by level.
+`painter.apply(document, group, plan, { preset?, widen?, overrides?, seed?, matrix?, underpaint? })` turns the plan into
+brush strokes in a scene, over a blurred underpainting of the reference. `painter.error(image, reference)` is the
+metric. Caps: `MaxStrokesPerPlan` 16384, `MaxPlanLevels` 8, `MaxStrokeLength` 64, `MaxReferencePixels` 1024 by 1024.
+A reference must be one the caller may use; the gallery paints only its own renders.
+
+### `@magick/svg`
+
+`svg.export(document)` writes a bounded SVG subset: retained path commands (arcs as SVG arcs), solid, linear and radial
+paints with every stroke setting, embedded PNG images, and groups with transform, opacity, blend, clip, mask and blur or
+shadow filters. Conic, field, pattern, mix and shader paints and brush strokes are refused by name. Checked by hand
+against ImageMagick's SVG renderer: mean absolute error 0.11%. `svg.import(text)` reads `svg` (with `viewBox`), `g`,
+`path` (every command, arcs to cubics), `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`, `linearGradient`,
+`radialGradient` (either unit system) and `clipPath`, with presentation attributes, `style`, transforms and inheritance,
+and returns the warnings for what it skipped. Input is untrusted: `MaxSvgBytes` 16 MiB, `MaxElements` 65536, `MaxDepth`
+32, `MaxPathCommands` 2^20, finite numbers within `MaxCoordinate`.
+
+### Hardening
+
+`tests/fuzz.jsl` drives seeded random geometry (scales from 1/64 to 4096, repeated and collinear points, crossings)
+through coverage and strokes and holds tile parity under both rules, evenodd within nonzero, finite outlines and the cap
+refusals. `jess package run --capability worker.spawn --target stress .` renders the valley at 7680 by 4320: 35.0 s on
+4 workers, 808 MB peak resident for the whole run (the output image is 132 MB of it), and refuses a canvas 8193 wide.
+
+## 0.4.0 changes: Atelier
+
+### `@magick/noise`
+
+Pure functions of a seed (an integer in 1..2^31 - 2) and a point: `value`, `perlin`, `fbm`, `turbulence`, `ridged`
+(`MaxOctaves` 12) and `worley` (nearest and second distances), over a 1024-entry permutation made once a seed;
+`hash(seed, a, b?, c?)` and `random(...)` by the murmur3 finalizer, for per-dab and per-feature keys. No generator state,
+no `math.random`, so a texture never seams at a tile edge or differs between workers.
+
+**Fields** are descriptions, plain data: `constant`, `coordinate`, `noiseField`, `fbmField`, `turbulenceField`,
+`ridgedField`, `worleyField`, `checker`, `stripes`, `rings`, `combine`, `apply`, `scale`, `clamp`, `smoothstep`,
+`power`, `blend`, `warp` (domain warping) and `transform`, at most `MaxFieldNodes` 256 nested `MaxFieldDepth` 32.
+`noise.compile(field)` makes a closure where the field is used; descriptions save with scenes and cross to workers.
+
+### Procedural paints
+
+`paint.fieldPaint(field, stops, options?)` reads a field through stops as a gradient's parameter; `paint.mix(first,
+second, field)` blends two paints by a field; `paint.masked(inner, field)` cuts a paint's alpha by one;
+`paint.shader(function(x, y) return r, g, b, a end)` is the slow path for anything else, pure by contract, refused for
+workers and saving, and failing with the point and tile it was asked for.
+
+### `@magick/brush`
+
+`brush.stroke(samples, brush, seed?)` turns samples `{ x, y, pressure? }` into dabs: smoothed (`smoothing`), walked by arc
+length, a dab every `spacing` of its own pressure-sized diameter and one on the end, jitter (size, angle, scatter,
+opacity, hue, lightness) from `noise.hash(seed, dab, channel)`. Tips: `round` (hardness, never sharper than a pixel),
+`bristles` (tracks along the stroke) or an `image` mask; a canvas-fixed `grain` field and `dryness` for dry media.
+Accumulation: `buildup` (pigment piles up where dabs overlap, its color pure), `constant` (an even stroke at its flow,
+no seams) and `wet` (edges pooled darker, as watercolor). `blend` sets how the stroke lays on (`multiply` for glazes).
+Presets: `ink`, `oil`, `watercolor`, `graphite`, `airbrush` through `brush.preset(name, size, color, overrides?)`;
+`brush.paper(seed)` is a paper grain. Strokes are scene nodes (`document:stroke(samples, brush, { seed? })`), saved as
+their samples, brush and seed and replayed exactly; dabs are stamped only into the tiles they reach. Caps:
+`MaxSamplesPerStroke` and `MaxDabsPerStroke` 65536. These are stylized media, not simulations.
+
+### `@magick/material`
+
+Seeded recipes made of fields alone: `clouds`, `fog`, `wood`, `bark`, `rock`, `leaf`, `fabric`, `parchment`, `marble`,
+each `material.<name> { seed, scale?, detail?, colors?, transform?, opacity? }` and by name through `material.make`.
+`material.grain(paint)` gives the field for a brush's grain or a mask.
+
+### `@magick/text` and `@magick/art`
+
+`text.monoline(weight?)` is the built-in geometric face (capitals, small-capital lowercase, digits, punctuation), so text
+needs no font file. `text.outline { outline = ..., measure = ... }` adapts any font that draws through a pen, such as
+`@truetype`'s. `text.path(font, text, x, y, size, { tracking?, align?, kerning? })` sets one line as a path and
+`text.measure` its width; shaping is out of scope. Stroking a monoline path outlines each piece, since a union outline
+needs boolean path operations, which are not here. `@magick/art` adds `palette`, `scatter` (jittered, one point a cell),
+`samples` (brush samples along any path) and `symbol` (reusable motifs). `Path:finish()` ends an open contour without
+closing it.
 
 ## 0.3.0 changes
 
