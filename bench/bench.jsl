@@ -14,6 +14,7 @@ local fs = require '@dream/fs'
 local magick = require '@magick'
 local paint = require '@magick/paint'
 local path = require '@magick/path'
+local transform = require '@magick/transform'
 
 -- A build without the verified toolchain runs Luau slower than a release does, so a number from
 -- one says nothing about what ships.
@@ -115,6 +116,9 @@ local Expected: { [string]: string } = {
   ['paint solid circle'] = '256x256:8de2b1ed',
   ['paint linear circle'] = '256x256:787d88ac',
   ['paint radial circle'] = '256x256:171707ec',
+  ['paint conic circle'] = '256x256:b28ff5bc',
+  ['paint pattern nearest'] = '256x256:bc78a0be',
+  ['paint pattern bilinear'] = '256x256:75cde639',
   ['coverageIn ring nonzero'] = '512x512:a92f984b',
   ['coverageIn ring evenodd'] = '512x512:a92f984b',
   ['coverageIn ring tiles 128'] = '512x512:a92f984b',
@@ -463,6 +467,22 @@ end)
 
 workload('paint radial circle', function()
   return color.toImage(paint.fillPath(color.tile(256, 256), Disc, paint.radial(128, 128, 120, Sky, { focusX = 90, focusY = 80 })))
+end)
+
+workload('paint conic circle', function()
+  return color.toImage(paint.fillPath(color.tile(256, 256), Disc, paint.conic(128, 128, Sky)))
+end)
+
+local Turned = transform.compose(transform.translate(128, 128), transform.rotate(0.5), transform.scale(1.5))
+
+workload('paint pattern nearest', function()
+  return color.toImage(paint.fillPath(color.tile(256, 256), Disc, paint.pattern(tile, { transform = Turned, edge = 'repeat' })))
+end)
+
+workload('paint pattern bilinear', function()
+  local value = paint.pattern(tile, { transform = Turned, edge = 'mirror', sampling = 'bilinear' })
+
+  return color.toImage(paint.fillPath(color.tile(256, 256), Disc, value))
 end)
 
 -- The 0.2.0 coverage of the same ring, by each fill rule, single-shot and as 128-pixel tiles laid
