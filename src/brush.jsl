@@ -76,8 +76,25 @@ export type Brush = {
   blend: color.BlendMode?,
 }
 
---- One stamp: center, radius, angle, aspect, alpha, and straight color in 0..1.
-export type Dab = { centerX: number, centerY: number, radius: number, angle: number, aspect: number, alpha: number, red: number, green: number, blue: number }
+--- One stamp: center, radius, angle, aspect, alpha, and straight color in 0..1. A dab moved by a
+--- matrix that is not a rotation and uniform scale also carries `shape`, the inverse of its full
+--- frame: the four entries (row by row) taking an offset from its center to the tip's own along and
+--- across, in units of the tip's radius; and `extentX`, `extentY`, how far it reaches each way. Its
+--- `radius` is then the tip radius times the matrix's smaller stretch, which sets its edge softness.
+export type Dab = {
+  centerX: number,
+  centerY: number,
+  radius: number,
+  angle: number,
+  aspect: number,
+  alpha: number,
+  red: number,
+  green: number,
+  blue: number,
+  shape: { number }?,
+  extentX: number?,
+  extentY: number?,
+}
 
 --- A stroke ready to draw: its dabs, its brush, and the box they cover.
 export type Stroke = {
@@ -327,31 +344,89 @@ function Module.stroke(samples: { Sample }, brush: Brush, seed: number?): Stroke
   return made
 end
 
---- A stroke moved by a matrix: dab centers through it, radii by the square root of its area
---- scale, angles by its rotation. The brush and seed stay.
+--- Whether a matrix's linear part is a rotation and a uniform scale, which a dab's radius and angle
+--- carry exactly.
+local function isSimilarity(matrix: Matrix): boolean
+  return matrix.scaleX == matrix.scaleY and matrix.skewY == -matrix.skewX
+end
+
+--- A dab's frame: the 2x2 matrix (row by row) taking the tip's own along and across, in units of its
+--- radius, to an offset from its center.
+local function frameOf(dab: Dab): (number, number, number, number)
+  local shape = dab.shape
+
+  if shape then
+    local determinant = shape[1] * shape[4] - shape[2] * shape[3]
+
+    return shape[4] / determinant, -shape[2] / determinant, -shape[3] / determinant, shape[1] / determinant
+  end
+
+  local cosine, sine = math.cos(dab.angle), math.sin(dab.angle)
+  local along, across = dab.radius, dab.radius * dab.aspect
+
+  return cosine * along, -sine * across, sine * along, cosine * across
+end
+
+--- A stroke moved by a matrix: dab centers through it. Under a rotation and uniform scale a dab's
+--- radius scales and its angle turns; under any other matrix (a stretch, a shear, a reflection) its
+--- whole frame goes through the matrix, so a round dab stretched two to one is an ellipse two to one
+--- and a reflected image tip is drawn reflected. The brush and seed stay.
 function Module.moved(stroke: Stroke, matrix: Matrix): Stroke
   local scale = math.sqrt(math.abs(transform.determinant(matrix)))
   local turn = math.atan2(matrix.skewY, matrix.scaleX)
+  local similar = isSimilarity(matrix)
+  local least = scale * scale / math.max(transform.sigmaMax(matrix), 1e-300)
   local dabs: { Dab } = table.create(#stroke.dabs) :: { Dab }
   local left, top, right, bottom = math.huge, math.huge, -math.huge, -math.huge
 
   for _, dab in stroke.dabs do
     local centerX, centerY = transform.apply(matrix, dab.centerX, dab.centerY)
-    local radius = dab.radius * scale
+    local moved: Dab
 
-    table.insert(dabs, {
-      centerX = centerX,
-      centerY = centerY,
-      radius = radius,
-      angle = dab.angle + turn,
-      aspect = dab.aspect,
-      alpha = dab.alpha,
-      red = dab.red,
-      green = dab.green,
-      blue = dab.blue,
-    })
-    left, right = math.min(left, centerX - radius), (math.max(right, centerX + radius))
-    top, bottom = math.min(top, centerY - radius), (math.max(bottom, centerY + radius))
+    if similar and not dab.shape then
+      moved = ({
+        centerX = centerX,
+        centerY = centerY,
+        radius = dab.radius * scale,
+        angle = dab.angle + turn,
+        aspect = dab.aspect,
+        alpha = dab.alpha,
+        red = dab.red,
+        green = dab.green,
+        blue = dab.blue,
+      } :: Dab)
+    else
+      local first, second, third, fourth = frameOf(dab)
+      -- The matrix's linear part after the dab's frame.
+      local frameA = matrix.scaleX * first + matrix.skewX * third
+      local frameB = matrix.scaleX * second + matrix.skewX * fourth
+      local frameC = matrix.skewY * first + matrix.scaleY * third
+      local frameD = matrix.skewY * second + matrix.scaleY * fourth
+      local determinant = frameA * frameD - frameB * frameC
+
+      if determinant == 0 then error('magick: a stroke cannot be moved by a singular matrix', 2) end
+
+      moved = ({
+        centerX = centerX,
+        centerY = centerY,
+        radius = dab.radius * least,
+        angle = dab.angle + turn,
+        aspect = dab.aspect,
+        alpha = dab.alpha,
+        red = dab.red,
+        green = dab.green,
+        blue = dab.blue,
+        shape = { frameD / determinant, -frameB / determinant, -frameC / determinant, frameA / determinant },
+        extentX = math.sqrt(frameA * frameA + frameB * frameB),
+        extentY = math.sqrt(frameC * frameC + frameD * frameD),
+      } :: Dab)
+    end
+
+    local reachX, reachY = moved.extentX or moved.radius, moved.extentY or moved.radius
+
+    table.insert(dabs, moved)
+    left, right = math.min(left, centerX - reachX), (math.max(right, centerX + reachX))
+    top, bottom = math.min(top, centerY - reachY), (math.max(bottom, centerY + reachY))
   end
 
   local made: Stroke = {
@@ -433,8 +508,10 @@ function Module.paint(tile: Tile, stroke: Stroke, options: { opacity: number?, b
 
   for _, dab in stroke.dabs do
     local radius = dab.radius
-    local fromX, toX = math.max(tile.left, math.floor(dab.centerX - radius)), math.min(tile.left + width, math.ceil(dab.centerX + radius))
-    local fromY, toY = math.max(tile.top, math.floor(dab.centerY - radius)), math.min(tile.top + height, math.ceil(dab.centerY + radius))
+    local shape = dab.shape
+    local reachX, reachY = dab.extentX or radius, dab.extentY or radius
+    local fromX, toX = math.max(tile.left, math.floor(dab.centerX - reachX)), math.min(tile.left + width, math.ceil(dab.centerX + reachX))
+    local fromY, toY = math.max(tile.top, math.floor(dab.centerY - reachY)), math.min(tile.top + height, math.ceil(dab.centerY + reachY))
 
     if fromX >= toX or fromY >= toY then continue end
 
@@ -446,11 +523,29 @@ function Module.paint(tile: Tile, stroke: Stroke, options: { opacity: number?, b
     for row = fromY, toY - 1 do
       for column = fromX, toX - 1 do
         local offsetX, offsetY = column + 0.5 - dab.centerX, row + 0.5 - dab.centerY
-        local along = (offsetX * cosine + offsetY * sine) / radius
-        local across = (-offsetX * sine + offsetY * cosine) / (radius * dab.aspect)
+        local along, across
+        -- The radius that sets the edge's softness: the dab's own, or for a framed dab the one that
+        -- makes the edge one device pixel wide across it here, from the gradient of the tip distance.
+        local edgeRadius = radius
+
+        if shape then
+          along, across = shape[1] * offsetX + shape[2] * offsetY, shape[3] * offsetX + shape[4] * offsetY
+
+          local distance = math.sqrt(along * along + across * across)
+
+          if distance > 1e-9 then
+            local slopeX = (shape[1] * along + shape[3] * across) / distance
+            local slopeY = (shape[2] * along + shape[4] * across) / distance
+
+            edgeRadius = 1 / math.max(math.sqrt(slopeX * slopeX + slopeY * slopeY), 1e-9)
+          end
+        else
+          along, across = (offsetX * cosine + offsetY * sine) / radius, (-offsetX * sine + offsetY * cosine) / (radius * dab.aspect)
+        end
+
         -- A wet stroke keeps its tip coverage alone, the flow coming in once at the end; the other
         -- accumulations take each dab's own alpha now.
-        local alpha = tipAlpha(tip, along, across, radius, profile) * (if accumulation == 'wet' then 1 else dab.alpha)
+        local alpha = tipAlpha(tip, along, across, edgeRadius, profile) * (if accumulation == 'wet' then 1 else dab.alpha)
 
         if alpha <= 0 then continue end
 

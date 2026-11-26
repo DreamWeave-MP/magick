@@ -8,6 +8,7 @@ local magick = require '@magick'
 local render = require '@magick/render'
 local scene = require '@magick/scene'
 local test = require '@jess/test'
+local transform = require '@magick/transform'
 
 local expect = test.expect
 local suite = test.new()
@@ -219,6 +220,108 @@ suite.describe('refusals', function()
     expect(second.flow).toBe(nil)
     expect(#brush.presetNames).toBe(5)
     expect(magick.color(second.color)[1]).toBe(0)
+  end)
+end)
+
+suite.describe('affine moves', function()
+  --- One hard round dab at (0, 0), moved by `matrix` and painted on a 64 square tile around the
+  --- origin: its covered pixels, and the box they span.
+  local function painted(matrix: transform.Matrix, settings: brush.Brush?): (color.Tile, number, { number })
+    local hard: brush.Brush = { size = 20, color = '#000000', tip = { kind = 'round', hardness = 1 } }
+    local stroke = brush.moved(brush.stroke({ { 0, 0 } }, settings or hard), matrix)
+    local tile = color.tile(64, 64, { left = -32, top = -32 })
+    local covered, box = 0, { math.huge, math.huge, -math.huge, -math.huge }
+
+    brush.paint(tile, stroke)
+
+    for row = -32, 31 do
+      for column = -32, 31 do
+        local alpha = alphaAt(tile, column + 32, row + 32)
+
+        covered += alpha
+
+        if alpha > 0.5 then
+          box = { math.min(box[1], column), math.min(box[2], row), math.max(box[3], column + 1), math.max(box[4], row + 1) }
+        end
+      end
+    end
+
+    return tile, covered, box
+  end
+
+  -- A hard dab's edge is one device pixel wide, so its half-covered outline sits half a pixel inside
+  -- its geometry: a circle of radius 10 covers about pi * 9.5^2, and an ellipse of semi-axes a and b
+  -- about pi * (a - 0.5) * (b - 0.5).
+  local function near(actual: number, expected: number): boolean
+    return math.abs(actual / expected - 1) < 0.015
+  end
+
+  suite.it('stretches a round dab into an ellipse of the same proportions', function()
+    local _, plain, round = painted(transform.identity())
+    local _, stretched, box = painted(transform.scale(2, 1))
+
+    expect(near(plain, math.pi * 9.5 * 9.5)).toBe(true)
+    expect(near(stretched, math.pi * 19.5 * 9.5)).toBe(true)
+    -- Twice as wide, and exactly as tall, as the round dab's half-covered pixels.
+    expect(box[3] - box[1]).toBe(2 * (round[3] - round[1]) + 2)
+    expect(box[4] - box[2]).toBe(round[4] - round[2])
+  end)
+
+  suite.it('keeps a dab the area the matrix gives it under a shear and an uneven scale', function()
+    local _, sheared = painted(transform.skew(0.75))
+    local _, squashed = painted(transform.scale(1.5, 0.5))
+
+    -- A shear keeps area; its ellipse's edge is a pixel wide all the way round.
+    expect(near(sheared, math.pi * 9.5 * 9.5)).toBe(true)
+    expect(near(squashed, math.pi * 14.5 * 4.5)).toBe(true)
+  end)
+
+  suite.it('draws a reflected image tip reflected', function()
+    local data = buffer.create(16)
+
+    -- An L: the left column and the bottom row of a 4 by 4 mask.
+    for index = 0, 3 do
+      buffer.writeu8(data, index * 4, 255)
+      buffer.writeu8(data, 12 + index, 255)
+    end
+
+    local settings: brush.Brush = {
+      size = 16,
+      color = '#000000',
+      tip = { kind = 'image', mask = magick.mask(4, 4, data) } :: brush.Tip,
+      followDirection = false,
+    }
+    local plain = painted(transform.identity(), settings)
+    local mirrored = painted(transform.scale(-1, 1), settings)
+
+    for row = 0, 63 do
+      for column = 0, 63 do
+        expect(alphaAt(mirrored, column, row)).toBe(alphaAt(plain, 63 - column, row))
+      end
+    end
+  end)
+
+  suite.it('keeps the radius and angle form, bytes and all, under a rotation and uniform scale', function()
+    local stroke = brush.moved(brush.stroke({ { 0, 0 }, { 30, 10 } }, Round), transform.compose(transform.rotate(0.4), transform.scale(1.5)))
+
+    for _, dab in stroke.dabs do
+      expect(dab.shape).toBe(nil)
+    end
+  end)
+
+  suite.it('lets a plan own an image tip: writing the mask after a compile changes nothing', function()
+    local data = buffer.create(16)
+
+    buffer.fill(data, 0, 255)
+    local document = scene.new(32, 32)
+
+    document:add(document:stroke({ { 8, 16 }, { 24, 16 } }, { size = 12, color = '#204080', tip = { kind = 'image', mask = magick.mask(4, 4, data) } }))
+
+    local plan = render.compile(document)
+    local before = render.image(plan)
+
+    buffer.fill(data, 0, 0)
+    expect(buffer.tostring(render.image(plan).data)).toBe(buffer.tostring(before.data))
   end)
 end)
 

@@ -283,6 +283,32 @@ local function own(value: paint.Paint): paint.Paint
   return table.freeze(copy) :: paint.Paint
 end
 
+--- A stroke the plan owns: an image tip's mask is copied now, as a pattern's source is, so writing
+--- the mask afterwards never reaches the plan. Round and bristle tips hold no buffer.
+local function ownStroke(stroke: brush.Stroke): brush.Stroke
+  local tip = stroke.brush.tip
+
+  if not tip or tip.kind ~= 'image' then return stroke end
+
+  local copies = owning :: { [buffer]: buffer }
+  local mask = tip.mask
+  local data = copies[mask.data]
+
+  if not data then
+    data = buffer.create(buffer.len(mask.data))
+    buffer.copy(data, 0, mask.data)
+    copies[mask.data] = data
+  end
+
+  local settings = table.clone(stroke.brush) :: { [string]: unknown }
+  local copy = table.clone(stroke) :: { [string]: unknown }
+
+  settings.tip = table.freeze { kind = 'image', mask = magick.mask(mask.width, mask.height, data) }
+  copy.brush = table.freeze(settings)
+
+  return table.freeze(copy) :: brush.Stroke
+end
+
 --- A copy of a group's filters, so the document's list and colors can change after a compile.
 local function ownFilters(filters: { scene.Filter }): { scene.Filter }
   local out: { scene.Filter } = {}
@@ -353,7 +379,7 @@ local function compileNode(node: scene.Node, outer: Matrix, ops: { Op }, toleran
   end
 
   if node.kind == 'stroke' then
-    local made = brush.moved(brush.stroke(node.samples :: { brush.Sample }, node.brush :: brush.Brush, node.seed), matrix)
+    local made = ownStroke(brush.moved(brush.stroke(node.samples :: { brush.Sample }, node.brush :: brush.Brush, node.seed), matrix))
     local op = frameOp('push', node)
 
     op.kind = 'dabs'
@@ -436,6 +462,8 @@ end
 local SlotBytes = 16
 local RecordBytes = 2048
 local PreparedBytes = 1024
+--- A dab: a record of nine numbers, or fifteen and a four-slot array with a frame, in 16 nodes.
+local DabBytes = 640
 
 --- An estimate of the memory operations hold: a record each, a prepared outline's record, arrays and
 --- six slots an edge, and a mask's operations. Owned pixels are counted by `compile`, once per copy.
@@ -449,6 +477,10 @@ local function planBytes(ops: { Op }): number
     local prepared = op.prepared
 
     if prepared then total += PreparedBytes + prepared.count * 6 * SlotBytes end
+
+    local stroke = op.stroke
+
+    if stroke then total += #stroke.dabs * DabBytes end
 
     local clip = op.clip
 
