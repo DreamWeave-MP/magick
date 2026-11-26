@@ -20,11 +20,12 @@ font-rs (MIT OR Apache-2.0) describes; this is a separate implementation of it.
 Since 0.2.0 a path also keeps what it was drawn with (RFC-0001 P1): each closed contour carries its
 commands (points, quadratic and cubic curves, elliptical arcs) and the matrix it has been moved by.
 `contours` stays what 0.1.3 made, the contours flattened at the path's tolerance, so every 0.1.x
-call reads the points it always did. `transformBy`, `flatten` and `deviceBounds`
+call reads the points it always did. `transformBy`, `flatten`, `deviceBounds` and `coverageIn`
 flatten the commands again under their matrix, to a tolerance in device pixels, so a curve drawn
 small and shown large is as smooth as one drawn large.
 ]]
 local magick = require '@magick'
+local raster = require './raster'
 local transform = require '@magick/transform'
 
 type Matrix = transform.Matrix
@@ -64,6 +65,25 @@ export type Path = typeof(setmetatable({} :: Outline, Path))
 --- past them.
 export type Cap = 'butt' | 'round' | 'square'
 
+--- Which pixels a new coverage call fills: where the winding is not 0, or where it is odd.
+export type FillRule = raster.FillRule
+
+--- The options of `coverageIn` and `fillIn`.
+export type CoverageOptions = {
+  --- `nonzero` (the default) or `evenodd`.
+  fillRule: FillRule?,
+  --- Where the path is drawn, user space to device space; the identity when left out.
+  transform: Matrix?,
+  --- The flattening tolerance in device pixels; the path's own when left out.
+  tolerance: number?,
+  --- Clips the coverage is multiplied by, at most MaxClipDepth of them.
+  clips: { Clip }?,
+}
+
+--- A clip: coverage bytes whose top left pixel is at `left`, `top` in device space. Outside its mask a
+--- clip covers nothing.
+export type Clip = { mask: magick.Mask, left: number, top: number }
+
 local Point, Quad, Cubic, Arc, Ellipse = 1, 2, 3, 4, 5
 
 local Module = {}
@@ -72,6 +92,10 @@ local Module = {}
 Module.MaxPiecesPerCurve = 16384
 --- The most commands one path may hold when it is flattened by a 0.2.0 call.
 Module.MaxCommandsPerPath = 1048576
+--- The widest or tallest window one coverage call covers.
+Module.MaxImageEdge = 8192
+--- The most clips one coverage call multiplies by.
+Module.MaxClipDepth = 16
 
 --- A piece count, refused past the cap. NaN passes through, as 0.1.3 let it.
 local function capped(pieces: number): number
@@ -791,6 +815,104 @@ function Path.deviceBounds(self: Path, matrix: Matrix?, halfWidth: number?): (nu
   local inflate = (halfWidth or 0) * transform.sigmaMax(chosen)
 
   return left - inflate, top - inflate, right + inflate, bottom + inflate
+end
+
+--- Checks a window: whole numbers, its edges at most MaxImageEdge.
+local function checkWindow(left: number, top: number, width: number, height: number)
+  for _, value in { left, top, width, height } do
+    if not finite(value) or value ~= math.floor(value) then error('magick: coverage window must be whole numbers', 4) end
+  end
+
+  if width < 0 or height < 0 then error('magick: coverage window must not be negative', 4) end
+  if width > Module.MaxImageEdge or height > Module.MaxImageEdge then error(`magick: MaxImageEdge {Module.MaxImageEdge} exceeded`, 4) end
+end
+
+local Options = { fillRule = true, transform = true, tolerance = true, clips = true }
+
+local function checkOptions(options: CoverageOptions?): FillRule
+  if not options then return 'nonzero' end
+
+  for name in (options :: unknown) :: { [string]: unknown } do
+    if not Options[name] then error(`magick: unknown option {name}`, 4) end
+  end
+
+  local rule = options.fillRule or 'nonzero'
+
+  if rule ~= 'nonzero' and rule ~= 'evenodd' then error(`magick: unknown fill rule {rule}`, 4) end
+
+  return rule
+end
+
+--- Multiplies a window's coverage bytes by each clip's, in place: a pixel keeps
+--- `(coverage * clip + 127) // 255` for each clip in turn, and 0 where a clip's mask does not reach.
+--- Nothing is allocated.
+local function applyClips(data: buffer, left: number, top: number, width: number, height: number, clips: { Clip }?)
+  if not clips then return end
+  if #clips > Module.MaxClipDepth then error(`magick: MaxClipDepth {Module.MaxClipDepth} exceeded`, 4) end
+
+  for _, clip in clips do
+    local mask = clip.mask
+
+    if clip.left ~= math.floor(clip.left) or clip.top ~= math.floor(clip.top) then
+      error('magick: a clip must sit at whole pixels', 4)
+    end
+
+    for row = 0, height - 1 do
+      local maskRow = top + row - clip.top
+
+      for column = 0, width - 1 do
+        local maskColumn = left + column - clip.left
+        local at = row * width + column
+        local value = buffer.readu8(data, at)
+
+        if value == 0 then continue end
+
+        local inside = maskRow >= 0 and maskRow < mask.height and maskColumn >= 0 and maskColumn < mask.width
+        local factor = if inside then buffer.readu8(mask.data, maskRow * mask.width + maskColumn) else 0
+
+        buffer.writeu8(data, at, (value * factor + 127) // 255)
+      end
+    end
+  end
+end
+
+--- A path flattened and ready to be covered over many windows, such as the tiles of one image.
+export type Prepared = raster.Prepared
+
+--- Flattens the path under the options' matrix and tolerance and sorts its edges, once, for
+--- `coverOf` to cover any number of windows with.
+function Module.prepare(self: Path, options: CoverageOptions?): Prepared
+  checkOptions(options)
+
+  local matrix, tolerance = if options then options.transform else nil, if options then options.tolerance else nil
+
+  return raster.prepare(Module.flatten(self, deviceTolerance(self, tolerance), matrix))
+end
+
+--- Coverage bytes of a prepared path over a window, by a fill rule.
+function Module.coverOf(prepared: Prepared, rule: FillRule, left: number, top: number, width: number, height: number): magick.Mask
+  checkWindow(left, top, width, height)
+  if rule ~= 'nonzero' and rule ~= 'evenodd' then error(`magick: unknown fill rule {rule}`, 2) end
+
+  return magick.mask(width, height, raster.coverage(prepared, rule, left, top, width, height))
+end
+
+--- The path's coverage over the window `width` by `height` pixels whose top left pixel is
+--- (`left`, `top`), by a fill rule, exact for the flattened outline whether or not its contours
+--- cross or overlap. Scratch is one row of the window; any part of the path outside it costs only
+--- its edges. A window is the same bytes as that part of a larger window.
+function Path.coverageIn(self: Path, left: number, top: number, width: number, height: number, options: CoverageOptions?): magick.Mask
+  checkWindow(left, top, width, height)
+
+  local rule = checkOptions(options)
+  local matrix, tolerance = if options then options.transform else nil, if options then options.tolerance else nil
+  local prepared = raster.prepare(Module.flatten(self, deviceTolerance(self, tolerance), matrix))
+
+  local data = raster.coverage(prepared, rule, left, top, width, height)
+
+  applyClips(data, left, top, width, height, if options then options.clips else nil)
+
+  return magick.mask(width, height, data)
 end
 
 --- Adds the signed area a line from one point to another sweeps over each cell it crosses, and
