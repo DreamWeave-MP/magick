@@ -358,6 +358,37 @@ suite.describe('retained paths', function()
     end
   end)
 
+  suite.it('returns frozen matrices, and keeps a frozen copy of a plain table it is given', function()
+    local made = {
+      transform.identity(),
+      transform.translate(1, 2),
+      transform.scale(2, 3),
+      transform.rotate(0.5),
+      transform.skew(0.25),
+      transform.multiply(transform.scale(2), transform.translate(1, 1)),
+      transform.compose(transform.rotate(1), transform.scale(3)),
+      transform.inverse(transform.scale(4)),
+      transform.matrix(1, 2, 3, 4, 5, 6),
+    }
+
+    for _, matrix in made do
+      expect(table.isfrozen(matrix)).toBe(true)
+      expect(function()
+        local writable = (matrix :: unknown) :: { [string]: number }
+
+        writable.offsetX = 99
+      end).toThrow()
+    end
+
+    local plain = { scaleX = 2, skewY = 0, skewX = 0, scaleY = 2, offsetX = 3, offsetY = 4 }
+    local kept = transform.check(plain)
+
+    plain.offsetX = 1000
+    expect(table.isfrozen(kept)).toBe(true)
+    expect(kept.offsetX).toBe(3)
+    expect(rawequal(transform.check(kept), kept)).toBe(true)
+  end)
+
   suite.it('appends retained contours, so an appended path transforms with its curves', function()
     local circle = path.new():circle(0, 0, 3)
     local joined = path.new():rect(10, 10, 12, 12):append(circle)

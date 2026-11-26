@@ -7,7 +7,9 @@ fields are SVG's matrix(a b c d e f) in that order: scaleX = a, skewY = b, skewX
 offsetX = e, offsetY = f. `multiply(first, second)` is first o second: the point goes through
 `second` first, so `multiply(translate, multiply(scale, rotate))` rotates, then scales, then moves.
 
-Matrices are plain immutable tables; every function here returns a new one. A matrix with a NaN or
+Matrices are frozen tables; every function here returns a new one, and writing a field of one raises.
+A plain table of the six fields is taken wherever a matrix is, and `check` keeps a frozen copy of it,
+so changing the caller's table afterwards changes nothing that kept it. A matrix with a NaN or
 infinite field is refused wherever one enters (`magick: transform must be finite`), and an inverse
 of a singular matrix is refused rather than made up (`magick: transform is singular`).
 ]]
@@ -16,12 +18,12 @@ local Module = {}
 
 --- A 2x3 affine matrix, SVG's matrix(a b c d e f) by field name.
 export type Matrix = {
-  scaleX: number,
-  skewY: number,
-  skewX: number,
-  scaleY: number,
-  offsetX: number,
-  offsetY: number,
+  read scaleX: number,
+  read skewY: number,
+  read skewX: number,
+  read scaleY: number,
+  read offsetX: number,
+  read offsetY: number,
 }
 
 --- The largest absolute coordinate, offset or width a new API takes: 2^22.
@@ -31,7 +33,8 @@ local function finite(value: number): boolean
   return value == value and value > -math.huge and value < math.huge
 end
 
---- Refuses a matrix with a NaN or infinite field, naming the caller's line.
+--- Refuses a matrix with a NaN or infinite field, naming the caller's line, and returns it frozen:
+--- the matrix itself when it already is, otherwise a frozen copy of its six fields.
 function Module.check(matrix: Matrix): Matrix
   if
     not finite(matrix.scaleX)
@@ -44,11 +47,21 @@ function Module.check(matrix: Matrix): Matrix
     error('magick: transform must be finite', 3)
   end
 
-  return matrix
+  if table.isfrozen(matrix) then return matrix end
+
+  return table.freeze {
+    scaleX = matrix.scaleX,
+    skewY = matrix.skewY,
+    skewX = matrix.skewX,
+    scaleY = matrix.scaleY,
+    offsetX = matrix.offsetX,
+    offsetY = matrix.offsetY,
+  }
 end
 
 local function make(scaleX: number, skewY: number, skewX: number, scaleY: number, offsetX: number, offsetY: number): Matrix
-  return Module.check { scaleX = scaleX, skewY = skewY, skewX = skewX, scaleY = scaleY, offsetX = offsetX, offsetY = offsetY }
+  -- Frozen before `check` sees it, so it is checked in place rather than copied.
+  return Module.check(table.freeze { scaleX = scaleX, skewY = skewY, skewX = skewX, scaleY = scaleY, offsetX = offsetX, offsetY = offsetY })
 end
 
 --- A matrix from SVG's six numbers in their order, `matrix(a b c d e f)`.
