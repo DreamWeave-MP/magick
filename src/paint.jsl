@@ -384,6 +384,136 @@ function Module.moved(value: Paint, matrix: Matrix): Paint
   return table.freeze(copy) :: Paint
 end
 
+--- A paint as plain data, for saving: its kind, opacity, transform (SVG's six numbers), and what
+--- the kind needs. Gradient stops come back as the `#rrggbbaa` bytes they were made from. A
+--- pattern's source is named by `asset`, a number `assetOf` gives it, since its pixels are saved apart.
+export type Description = {
+  kind: string,
+  opacity: number,
+  transform: { number },
+  color: string?,
+  stops: { { offset: number, color: string } }?,
+  geometry: { number }?,
+  spread: string?,
+  interpolation: string?,
+  sampling: string?,
+  edge: string?,
+  asset: number?,
+}
+
+local function hexByte(value: number): string
+  return string.format('%02x', math.floor(math.clamp(value, 0, 255) + 0.5))
+end
+
+function Module.describe(value: Paint, assetOf: ((source: PatternSource) -> number)?): Description
+  local matrix = value.transform
+  local out: Description = {
+    kind = value.kind,
+    opacity = value.opacity,
+    transform = { matrix.scaleX, matrix.skewY, matrix.skewX, matrix.scaleY, matrix.offsetX, matrix.offsetY },
+  }
+
+  if value.kind == 'solid' then
+    local channels = value.channels
+
+    out.color = `#{hexByte(channels[1])}{hexByte(channels[2])}{hexByte(channels[3])}{hexByte(channels[4])}`
+  elseif value.kind == 'pattern' then
+    if not assetOf then error('magick: describing a pattern needs somewhere to put its source', 2) end
+
+    out.asset = assetOf(value.source :: PatternSource)
+    out.sampling = value.sampling
+    out.edge = value.edge
+  else
+    local stops = {}
+
+    for index, offset in value.offsets do
+      local at = (index - 1) * 4
+      local function byte(channel: number): string
+        local stored = value.colors[at + channel]
+
+        if channel < 4 and value.interpolation == 'linear' then stored = color.encode(stored) end
+
+        return hexByte(stored * 255)
+      end
+
+      table.insert(stops, { offset = offset, color = `#{byte(1)}{byte(2)}{byte(3)}{byte(4)}` })
+    end
+
+    out.stops = stops
+    out.geometry = table.clone(value.geometry)
+    out.spread = value.spread
+    out.interpolation = value.interpolation
+  end
+
+  return out
+end
+
+--- A paint from `describe`'s data, checked as every constructor checks its arguments. `sourceOf`
+--- turns an asset number back into the image or tile it named.
+function Module.fromDescription(description: Description, sourceOf: ((asset: number) -> magick.Image | Tile)?): Paint
+  local fields = description.transform
+
+  if type(fields) ~= 'table' or #fields ~= 6 then error('magick: a paint transform is six numbers', 2) end
+
+  local matrix = transform.matrix(fields[1], fields[2], fields[3], fields[4], fields[5], fields[6])
+  local opacity = description.opacity
+
+  if description.kind == 'solid' then return Module.solid(description.color :: string, { opacity = opacity }) end
+
+  if description.kind == 'pattern' then
+    if not sourceOf or type(description.asset) ~= 'number' then error('magick: a pattern needs its source asset', 2) end
+
+    return Module.pattern(sourceOf(description.asset :: number), {
+      transform = matrix,
+      opacity = opacity,
+      sampling = description.sampling :: Sampling,
+      edge = description.edge :: Edge,
+    })
+  end
+
+  local geometry = description.geometry
+
+  if type(geometry) ~= 'table' then error('magick: a gradient needs its geometry', 2) end
+
+  local options: GradientOptions = {
+    spread = description.spread :: Spread,
+    interpolation = description.interpolation :: Space,
+    transform = matrix,
+    opacity = opacity,
+  }
+  local stops: { Stop } = {}
+
+  for _, stop in description.stops or {} do
+    table.insert(stops, { offset = stop.offset, color = stop.color :: magick.Color })
+  end
+
+  if description.kind == 'linear' then
+    if #geometry ~= 4 then error('magick: a linear gradient has four numbers of geometry', 2) end
+
+    return Module.linear(geometry[1], geometry[2], geometry[3], geometry[4], stops, options)
+  end
+
+  if description.kind == 'radial' then
+    if #geometry ~= 5 then error('magick: a radial gradient has five numbers of geometry', 2) end
+
+    options.focusX, options.focusY = geometry[4], geometry[5]
+
+    return Module.radial(geometry[1], geometry[2], geometry[3], stops, options)
+  end
+
+  if description.kind == 'conic' then
+    if #geometry ~= 3 then error('magick: a conic gradient has three numbers of geometry', 2) end
+
+    local conicOptions = options :: GradientOptions & { startAngle: number? }
+
+    conicOptions.startAngle = geometry[3]
+
+    return Module.conic(geometry[1], geometry[2], stops, conicOptions)
+  end
+
+  error(`magick: unknown paint kind {description.kind}`, 2)
+end
+
 --- `t` brought into 0..1 by a spread.
 local function spreadOf(spread: Spread, along: number): number
   if spread == 'repeat' then return along - math.floor(along) end

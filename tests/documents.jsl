@@ -1,0 +1,66 @@
+--!strict
+-- Documents the scene suites share: one that uses everything the renderer does.
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+
+--- Everything the renderer does, in one small document: nested transformed groups, every node
+--- kind, strokes, a clip with a hole, both mask kinds, blur and shadow, blends and opacity, and
+--- shapes that run off the canvas.
+local function busy(width: number, height: number): scene.Document
+  local document = scene.new(width, height, { background = '#182030', space = 'linear' })
+  local checker = magick.new(4, 4)
+
+  for row = 0, 3 do
+    for column = 0, 3 do
+      if (row + column) % 2 == 0 then checker:set(column, row, 250, 220, 120, 255) end
+    end
+  end
+
+  local sky = document:group { filters = { { kind = 'blur', radius = 2.5 } }, opacity = 0.9 }
+
+  document:add(sky)
+  sky:add(document:shape(path.new():rect(-20, 5, width + 20, 30), {
+    fill = paint.linear(0, 0, width, 0, paint.stops(0, '#ff6040', 1, '#4060ff')),
+  }))
+
+  local turned = document:group {
+    transform = transform.compose(transform.translate(width / 2, height / 2), transform.rotate(0.35)),
+    clip = { path = path.new():circle(0, 0, 40):circle(0, 0, 12), fillRule = 'evenodd' },
+    filters = { { kind = 'shadow', radius = 2, offsetX = 3, offsetY = 4, color = '#000000c0' } },
+  }
+
+  document:add(turned)
+
+  for index = -2, 2 do
+    turned:add(document:shape(path.new():circle(index * 16, 0, 14), {
+      fill = paint.radial(index * 16 - 4, -4, 18, paint.stops(0, '#fff0c0', 1, '#c03060')),
+      stroke = paint.solid '#ffffff',
+      strokeStyle = { width = 2, join = 'round' },
+      opacity = 0.85,
+    }))
+  end
+
+  turned:add(document:image(checker, { transform = transform.compose(transform.translate(-30, 10), transform.scale(5)), sampling = 'bilinear' }))
+
+  local faded = document:group {
+    mask = { node = document:shape(path.new():rect(0, 0, width, height), { fill = paint.linear(0, 0, width, 0, paint.stops(0, '#000000', 1, '#ffffff')) }), kind = 'luminance' },
+    blend = 'screen',
+  }
+
+  document:add(faded)
+  faded:add(document:shape(path.new():rect(4, height - 30, width - 4, height - 6), { fill = paint.solid '#40ff80' }))
+
+  local cut = document:group {
+    mask = { node = document:shape(path.new():circle(width - 20, 20, 14), { fill = paint.radial(width - 20, 20, 14, paint.stops(0, '#ffffffff', 1, '#ffffff00')) }) },
+  }
+
+  document:add(cut)
+  cut:add(document:shape(path.new():rect(width - 40, 0, width + 10, 40), { fill = paint.solid '#ffe040' }))
+
+  return document
+end
+
+return table.freeze { busy = busy }

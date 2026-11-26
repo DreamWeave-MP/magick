@@ -1,0 +1,179 @@
+--!strict
+-- The saved text of the small document tests/serialize.jsl draws, committed so a change to the
+-- scene format or to what it draws is a diff a reviewer reads.
+return [==[
+{
+  "assets": [],
+  "background": "#102030ff",
+  "format": "magick.scene",
+  "height": 16,
+  "root": {
+    "blend": "normal",
+    "children": [
+      {
+        "blend": "normal",
+        "children": [
+          {
+            "blend": "normal",
+            "fill": {
+              "geometry": [
+                2,
+                0,
+                14,
+                0
+              ],
+              "interpolation": "srgb",
+              "kind": "linear",
+              "opacity": 1,
+              "spread": "pad",
+              "stops": [
+                {
+                  "color": "#ff8040ff",
+                  "offset": 0
+                },
+                {
+                  "color": "#4080ffff",
+                  "offset": 1
+                }
+              ],
+              "transform": [
+                1,
+                0,
+                0,
+                1,
+                0,
+                0
+              ]
+            },
+            "fillRule": "nonzero",
+            "id": 3,
+            "kind": "shape",
+            "opacity": 1,
+            "path": {
+              "contours": [
+                {
+                  "closed": true,
+                  "commands": [
+                    1,
+                    2,
+                    2,
+                    1,
+                    14,
+                    2,
+                    1,
+                    14,
+                    12,
+                    1,
+                    2,
+                    12
+                  ],
+                  "reverse": false
+                }
+              ],
+              "lines": [],
+              "tolerance": 0.25
+            },
+            "transform": [
+              1,
+              0,
+              0,
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "blend": "normal",
+            "fill": {
+              "color": "#ffffff80",
+              "kind": "solid",
+              "opacity": 1,
+              "transform": [
+                1,
+                0,
+                0,
+                1,
+                0,
+                0
+              ]
+            },
+            "fillRule": "nonzero",
+            "id": 4,
+            "kind": "shape",
+            "opacity": 1,
+            "path": {
+              "contours": [
+                {
+                  "closed": true,
+                  "commands": [
+                    5,
+                    16,
+                    8,
+                    5,
+                    5
+                  ],
+                  "reverse": false
+                }
+              ],
+              "lines": [],
+              "tolerance": 0.25
+            },
+            "stroke": {
+              "color": "#000000ff",
+              "kind": "solid",
+              "opacity": 1,
+              "transform": [
+                1,
+                0,
+                0,
+                1,
+                0,
+                0
+              ]
+            },
+            "strokeStyle": {
+              "width": 1
+            },
+            "transform": [
+              1,
+              0,
+              0,
+              1,
+              0,
+              0
+            ]
+          }
+        ],
+        "id": 2,
+        "kind": "group",
+        "name": "pair",
+        "opacity": 0.75,
+        "transform": [
+          1,
+          0,
+          0,
+          1,
+          0,
+          0
+        ]
+      }
+    ],
+    "id": 1,
+    "kind": "group",
+    "name": "root",
+    "opacity": 1,
+    "transform": [
+      1,
+      0,
+      0,
+      1,
+      0,
+      0
+    ]
+  },
+  "seed": 7,
+  "space": "srgb",
+  "version": 1,
+  "width": 24
+}
+]==]

@@ -13,7 +13,9 @@ every path, paint and option, so changing the document after a compile never cha
 Paths and paints are shared freely between nodes: a paint is a frozen value, and a path is read
 only at compile time.
 ]]
+local bytes = require '@dream/bytes'
 local color = require '@magick/color'
+local json = require '@jess/json'
 local magick = require '@magick'
 local paint = require '@magick/paint'
 local path = require '@magick/path'
@@ -410,6 +412,328 @@ end
 --- Adds a node to the document's root and returns it.
 function Document.add(self: Document, node: Node, index: number?): Node
   return self.root:add(node, index)
+end
+
+--- The format a saved scene names, and the version this module writes and reads.
+Module.Format = 'magick.scene'
+Module.Version = 1
+--- The longest saved scene `load` reads, and the most pixels its images may hold together.
+Module.MaxSceneBytes = 64 * 1024 * 1024
+Module.MaxAssetPixels = 67108864
+
+local function matrixFields(matrix: Matrix): { number }
+  return { matrix.scaleX, matrix.skewY, matrix.skewX, matrix.scaleY, matrix.offsetX, matrix.offsetY }
+end
+
+local function colorText(value: magick.Color?): string?
+  if value == nil then return nil end
+
+  local channels = magick.color(value)
+
+  return string.format('#%02x%02x%02x%02x', channels[1], channels[2], channels[3], channels[4])
+end
+
+--- Pixels saved once however many nodes and paints use them: the images and tiles a document
+--- reads, numbered in the order they are first met.
+type Assets = { list: { { [string]: unknown } }, index: { [buffer]: number } }
+
+local function assetOf(assets: Assets, width: number, height: number, data: buffer, format: string, space: string): number
+  local known = assets.index[data]
+
+  if known then return known end
+
+  local record: { [string]: unknown } = {
+    id = #assets.list + 1,
+    width = width,
+    height = height,
+    format = format,
+    space = space,
+    crc32 = string.format('%08x', bytes.crc32(data)),
+    data = bytes.toBase64(data),
+  }
+
+  table.insert(assets.list, record)
+  assets.index[data] = #assets.list
+
+  return #assets.list
+end
+
+local function describeNode(node: Node, assets: Assets): { [string]: unknown }
+  local out: { [string]: unknown } = {
+    id = node.id,
+    kind = node.kind,
+    name = node.name,
+    transform = matrixFields(node.transform),
+    opacity = node.opacity,
+    blend = node.blend,
+  }
+
+  local function sourceAsset(source: paint.PatternSource): number
+    return assetOf(assets, source.width, source.height, source.data, source.format, source.space)
+  end
+
+  if node.kind == 'shape' then
+    out.path = path.describe(node.geometry :: path.Path)
+    out.fillRule = node.fillRule
+    out.fill = if node.fill then paint.describe(node.fill, sourceAsset) else nil
+    out.stroke = if node.stroke then paint.describe(node.stroke, sourceAsset) else nil
+    out.strokeStyle = node.strokeStyle
+  elseif node.kind == 'image' then
+    local image = node.image :: magick.Image
+
+    out.image = assetOf(assets, image.width, image.height, image.data, 'straight8', 'srgb')
+    out.sampling = node.sampling
+  else
+    local children = {}
+
+    for _, child in node.children do
+      table.insert(children, describeNode(child, assets))
+    end
+
+    out.children = children
+
+    local clip = node.clip
+
+    if clip then out.clip = { path = path.describe(clip.path), fillRule = clip.fillRule or 'nonzero' } end
+
+    local mask = node.mask
+
+    if mask then out.mask = { node = describeNode(mask.node, assets), kind = mask.kind or 'alpha' } end
+
+    if #node.filters > 0 then
+      local filters = {}
+
+      for _, filter in node.filters do
+        local copy = table.clone(filter) :: { [string]: unknown }
+
+        if filter.kind == 'shadow' then copy.color = colorText(filter.color) end
+
+        table.insert(filters, copy)
+      end
+
+      out.filters = filters
+    end
+  end
+
+  return out
+end
+
+--- The document as plain data: diffable, versioned, every number and name the render reads, and
+--- its pixels as checksummed assets. No functions, nothing executable.
+function Module.describe(document: Document): { [string]: unknown }
+  local assets: Assets = { list = {}, index = {} }
+  local root = describeNode(document.root, assets)
+
+  return {
+    format = Module.Format,
+    version = Module.Version,
+    width = document.width,
+    height = document.height,
+    space = document.space,
+    seed = document.seed,
+    background = colorText(document.background),
+    assets = assets.list,
+    root = root,
+  }
+end
+
+--- The document as JSON text with sorted keys, two spaces a level: the same document always gives
+--- the same text.
+function Module.save(document: Document): string
+  return json.encodeTable(Module.describe(document), { indent = 2 })
+end
+
+local NodeKeys: { [string]: boolean } = {
+  id = true,
+  kind = true,
+  name = true,
+  transform = true,
+  opacity = true,
+  blend = true,
+  path = true,
+  fillRule = true,
+  fill = true,
+  stroke = true,
+  strokeStyle = true,
+  image = true,
+  sampling = true,
+  children = true,
+  clip = true,
+  mask = true,
+  filters = true,
+}
+
+local function field(record: { [string]: unknown }, name: string, kind: string): unknown
+  local value = record[name]
+
+  if type(value) ~= kind then error(`magick: scene field {name} must be a {kind}`, 4) end
+
+  return value
+end
+
+type Loading = { document: Document, assets: { magick.Image | color.Tile }, seen: { [number]: boolean } }
+
+local function loadNode(record: { [string]: unknown }, loading: Loading): Node
+  for name in record do
+    if not NodeKeys[name] then error(`magick: unknown scene field {name}`, 3) end
+  end
+
+  local fields = field(record, 'transform', 'table') :: { number }
+
+  if #fields ~= 6 then error('magick: a node transform is six numbers', 3) end
+
+  local options: NodeOptions = {
+    transform = transform.matrix(fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]),
+    opacity = field(record, 'opacity', 'number') :: number,
+    blend = field(record, 'blend', 'string') :: color.BlendMode,
+    name = if record.name ~= nil then field(record, 'name', 'string') :: string else nil,
+  }
+  local document = loading.document
+  local kind = field(record, 'kind', 'string')
+  local function source(asset: number): magick.Image | color.Tile
+    local found = loading.assets[asset]
+
+    if not found then error(`magick: unknown scene asset {asset}`, 5) end
+
+    return found
+  end
+  local node: Node
+
+  if kind == 'shape' then
+    local shapeOptions = options :: ShapeOptions
+
+    shapeOptions.fillRule = field(record, 'fillRule', 'string') :: path.FillRule
+    shapeOptions.fill = if record.fill ~= nil then paint.fromDescription(record.fill :: paint.Description, source) else nil
+    shapeOptions.stroke = if record.stroke ~= nil then paint.fromDescription(record.stroke :: paint.Description, source) else nil
+    shapeOptions.strokeStyle = record.strokeStyle :: StrokeStyle?
+    node = document:shape(path.fromDescription(field(record, 'path', 'table') :: path.Description), shapeOptions)
+  elseif kind == 'image' then
+    local image = source(field(record, 'image', 'number') :: number)
+
+    if (image :: { [string]: unknown }).space then error('magick: an image node takes an image asset', 3) end
+
+    local imageOptions = options :: ImageOptions
+
+    imageOptions.sampling = field(record, 'sampling', 'string') :: paint.Sampling
+    node = document:image(image :: magick.Image, imageOptions)
+  elseif kind == 'group' then
+    local groupOptions = options :: GroupOptions
+    local clip = record.clip
+
+    if clip ~= nil then
+      local clipRecord = clip :: { [string]: unknown }
+
+      groupOptions.clip = {
+        path = path.fromDescription(field(clipRecord, 'path', 'table') :: path.Description),
+        fillRule = field(clipRecord, 'fillRule', 'string') :: path.FillRule,
+      }
+    end
+
+    if record.mask ~= nil then
+      local maskRecord = record.mask :: { [string]: unknown }
+
+      groupOptions.mask = {
+        node = loadNode(field(maskRecord, 'node', 'table') :: { [string]: unknown }, loading),
+        kind = field(maskRecord, 'kind', 'string') :: 'alpha' | 'luminance',
+      }
+    end
+
+    if record.filters ~= nil then groupOptions.filters = field(record, 'filters', 'table') :: { Filter } end
+
+    node = document:group(groupOptions)
+
+    for _, child in (if record.children ~= nil then field(record, 'children', 'table') else {}) :: { { [string]: unknown } } do
+      node:add(loadNode(child, loading))
+    end
+  else
+    error(`magick: unknown node kind {kind}`, 3)
+  end
+
+  -- Ids come back as saved, so a reload lists the same plan.
+  local id = field(record, 'id', 'number') :: number
+
+  if id ~= math.floor(id) or id < 1 or id > Module.MaxNodes * 4 or loading.seen[id] then error(`magick: scene node id {id} is not a fresh whole number`, 3) end
+
+  loading.seen[id] = true
+  node.id = id
+  document.nextId = math.max(document.nextId, id + 1)
+
+  return node
+end
+
+--- A document from `save`'s text, read as untrusted: refused, with a message naming what is wrong,
+--- when it is too long, too deep, of another format or a later version, has unknown fields or
+--- kinds, nonfinite or out-of-range numbers, assets whose bytes do not match their checksum or
+--- size, or more nodes, commands or pixels than the caps allow.
+function Module.load(text: string): Document
+  if #text > Module.MaxSceneBytes then error(`magick: MaxSceneBytes {Module.MaxSceneBytes} exceeded`, 2) end
+
+  local limits: json.Options = { maxDepth = 4 * Module.MaxDepth + 32 }
+  -- pcall only around the JSON decoder, which raises on text that is not JSON: the refusal is
+  -- rephrased as a magick: error naming the scene.
+  local parsed, decoded = pcall(json.decode, text, limits)
+
+  if not parsed then error(`magick: a saved scene is not valid JSON: {decoded}`, 2) end
+
+  if type(decoded) ~= 'table' then error('magick: a saved scene is a JSON object', 2) end
+
+  local record = decoded :: { [string]: unknown }
+
+  if record.format ~= Module.Format then error(`magick: not a saved scene: format {tostring(record.format)}`, 2) end
+
+  if type(record.version) ~= 'number' or record.version > Module.Version or record.version < 1 then
+    error(`magick: scene version {tostring(record.version)} is not one this Magick reads (1..{Module.Version})`, 2)
+  end
+
+  local document = Module.new(field(record, 'width', 'number') :: number, field(record, 'height', 'number') :: number, {
+    space = field(record, 'space', 'string') :: color.Space,
+    seed = field(record, 'seed', 'number') :: number,
+    background = if record.background ~= nil then field(record, 'background', 'string') :: string else nil,
+  })
+  local loading: Loading = { document = document, assets = {}, seen = {} }
+  local pixels = 0
+
+  for index, asset in (if record.assets ~= nil then field(record, 'assets', 'table') else {}) :: { { [string]: unknown } } do
+    local width, height = field(asset, 'width', 'number') :: number, field(asset, 'height', 'number') :: number
+
+    if width ~= math.floor(width) or height ~= math.floor(height) or width < 1 or height < 1 then error('magick: an asset needs a whole size', 2) end
+
+    pixels += width * height
+    if pixels > Module.MaxAssetPixels then error(`magick: MaxAssetPixels {Module.MaxAssetPixels} exceeded`, 2) end
+
+    local data = bytes.fromBase64(field(asset, 'data', 'string') :: string)
+    local format = field(asset, 'format', 'string')
+    local size = width * height * (if format == 'premultiplied32' then 16 else 4)
+
+    if buffer.len(data) ~= size then error(`magick: asset {index} holds {buffer.len(data)} bytes, not {size}`, 2) end
+    if string.format('%08x', bytes.crc32(data)) ~= asset.crc32 then error(`magick: asset {index} does not match its checksum`, 2) end
+
+    if format == 'premultiplied32' then
+      local tile = color.tile(width, height, { space = field(asset, 'space', 'string') :: color.Space })
+
+      buffer.copy(tile.data, 0, data)
+      loading.assets[index] = tile
+    else
+      loading.assets[index] = magick.fromRGBA(width, height, data)
+    end
+  end
+
+  local root = field(record, 'root', 'table') :: { [string]: unknown }
+
+  for _, child in (if root.children ~= nil then field(root, 'children', 'table') else {}) :: { { [string]: unknown } } do
+    document.root:add(loadNode(child, loading))
+  end
+
+  -- The root's own settings, as saved.
+  local fields = field(root, 'transform', 'table') :: { number }
+
+  document.root:set {
+    transform = transform.matrix(fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]),
+    opacity = field(root, 'opacity', 'number') :: number,
+    blend = field(root, 'blend', 'string') :: color.BlendMode,
+  }
+
+  return document
 end
 
 Module.Node = Node

@@ -1,0 +1,130 @@
+--!strict
+-- Scene serialization (MAG-026): a saved scene loads back to the same pixels and saves to the same
+-- text, a committed replay file renders to its recorded bytes, and untrusted payloads are refused
+-- with a message naming what is wrong, before anything is drawn.
+local bytes = require '@dream/bytes'
+local documents = require './documents'
+local json = require '@jess/json'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local test = require '@jess/test'
+
+local expect = test.expect
+local suite = test.new()
+
+local function pixels(document: scene.Document): string
+  local image = render.image(document)
+
+  return `{image.width}x{image.height}:{string.format('%08x', bytes.crc32(image.data))}`
+end
+
+--- A small document whose saved text is short enough to read: two shapes, a gradient, a group.
+local function small(): scene.Document
+  local document = scene.new(24, 16, { background = '#102030', seed = 7 })
+  local group = document:add(document:group { opacity = 0.75, name = 'pair' })
+
+  group:add(document:shape(path.new():rect(2, 2, 14, 12), { fill = paint.linear(2, 0, 14, 0, paint.stops(0, '#ff8040', 1, '#4080ff')) }))
+  group:add(document:shape(path.new():circle(16, 8, 5), { fill = paint.solid '#ffffff80', stroke = paint.solid '#000000', strokeStyle = { width = 1 } }))
+
+  return document
+end
+
+suite.describe('round trips', function()
+  suite.it('loads a saved scene to the same pixels, and saves it to the same text', function()
+    local original = documents.busy(70, 50)
+    local text = scene.save(original)
+    local loaded = scene.load(text)
+
+    expect(pixels(loaded)).toBe(pixels(original))
+    expect(scene.save(loaded)).toBe(text)
+    expect(render.dump(render.compile(loaded))).toBe(render.dump(render.compile(original)))
+  end)
+
+  suite.it('writes the same text for the same document, keys sorted and indented', function()
+    local text = scene.save(small())
+
+    expect(scene.save(small())).toBe(text)
+    expect(string.find(text, '"format": "magick.scene"', 1, true) ~= nil).toBe(true)
+    expect(string.find(text, '\n  "height": 16,', 1, true) ~= nil).toBe(true)
+  end)
+
+  suite.it('saves each image once however many nodes use it, with its checksum', function()
+    local document = documents.busy(40, 30)
+    local described = scene.describe(document)
+
+    expect(#(described.assets :: { unknown })).toBe(1)
+  end)
+
+  suite.it('replays the committed scene to its recorded pixels', function()
+    -- tests/replay.jsl holds `scene.save(small())`, committed: a change to the format or to what it
+    -- draws shows up here, in a file a reviewer can diff.
+    local text = require('./replay') :: string
+
+    expect(pixels(scene.load(text))).toBe(pixels(small()))
+    expect(pixels(small())).toBe '24x16:8411af22'
+  end)
+end)
+
+suite.describe('untrusted payloads', function()
+  local function broken(change: (text: string) -> string): () -> ()
+    local text = change(scene.save(small()))
+
+    return function()
+      scene.load(text)
+    end
+  end
+
+  suite.it('refuses other formats, later versions and unknown fields', function()
+    expect(broken(function(text) return (string.gsub(text, 'magick.scene', 'other.scene')) end)).toThrow 'magick: not a saved scene: format other.scene'
+    expect(broken(function(text) return (string.gsub(text, '"version": 1', '"version": 2')) end)).toThrow 'magick: scene version 2 is not one this Magick reads (1..1)'
+    expect(broken(function(text) return (string.gsub(text, '"opacity": 0.75', '"opacity": 0.75, "script": "os.exit()"', 1)) end)).toThrow 'magick: unknown scene field script'
+    expect(broken(function(text) return (string.gsub(text, '"kind": "group"', '"kind": "plugin"', 1)) end)).toThrow 'magick: unknown node kind plugin'
+  end)
+
+  suite.it('refuses numbers out of range and unknown path commands', function()
+    expect(broken(function(text) return (string.gsub(text, '"opacity": 0.75', '"opacity": 7.5', 1)) end)).toThrow 'magick: opacity must be in 0..1'
+    expect(broken(function(text) return (string.gsub(text, '%[\n%s*1,\n%s*2,\n%s*2,', '[\n1,\n2e300,\n2,', 1)) end)).toThrow 'magick: path coordinates must be finite and within MaxCoordinate'
+    expect(broken(function(text) return (string.gsub(text, '"commands": %[\n%s*1,', '"commands": [\n9,', 1)) end)).toThrow 'magick: unknown path command 9'
+  end)
+
+  suite.it('refuses assets that do not match their checksum, and duplicate ids', function()
+    local document = documents.busy(30, 20)
+    local text = scene.save(document)
+    local tampered = string.gsub(text, '"crc32": "%x+"', '"crc32": "00000000"', 1)
+
+    expect(function()
+      scene.load(tampered)
+    end).toThrow 'magick: asset 1 does not match its checksum'
+
+    expect(broken(function(text) return (string.gsub(text, '"id": 3,', '"id": 2,', 1)) end)).toThrow 'magick: scene node id 2 is not a fresh whole number'
+  end)
+
+  suite.it('refuses scenes nested past MaxDepth, and texts too long to read', function()
+    local described = scene.describe(small())
+    local root = described.root :: { [string]: unknown }
+    local chain = root.children :: { { [string]: unknown } }
+
+    for depth = 1, 40 do
+      local group: { [string]: unknown } = { kind = 'group', id = 100 + depth, transform = { 1, 0, 0, 1, 0, 0 }, opacity = 1, blend = 'normal', children = {} }
+
+      table.insert(chain, group)
+      chain = group.children :: { { [string]: unknown } }
+    end
+
+    expect(function()
+      scene.load(json.encodeTable(described))
+    end).toThrow 'magick: MaxDepth 32 exceeded'
+
+    expect(function()
+      scene.load('{"format": "magick.scene", ')
+    end).toThrow 'magick: a saved scene is not valid JSON'
+
+    expect(function()
+      scene.load(string.rep(' ', scene.MaxSceneBytes + 1))
+    end).toThrow 'magick: MaxSceneBytes 67108864 exceeded'
+  end)
+end)
+
+return suite

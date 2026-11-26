@@ -691,6 +691,109 @@ local function finite(value: number): boolean
   return value == value and value > -math.huge and value < math.huge
 end
 
+--- A path as plain data, for saving: its tolerance, and each contour's commands (opcode and
+--- numbers: 1 point, 2 quadratic, 3 cubic, 4 arc, 5 ellipse), the matrix it was moved by as
+--- SVG's six numbers, whether it winds reversed and whether it was closed on purpose. An open
+--- contour still being drawn is not included.
+export type ContourDescription = { commands: { number }, matrix: { number }?, reverse: boolean, closed: boolean }
+export type Description = { tolerance: number, contours: { ContourDescription }, lines: { ContourDescription } }
+
+local function describeContour(contour: Retained): ContourDescription
+  local matrix = contour.matrix
+
+  return {
+    commands = table.clone(contour.commands),
+    matrix = if matrix then { matrix.scaleX, matrix.skewY, matrix.skewX, matrix.scaleY, matrix.offsetX, matrix.offsetY } else nil,
+    reverse = contour.reverse,
+    closed = contour.closed,
+  }
+end
+
+function Module.describe(self: Path): Description
+  local contours, lines = {}, {}
+
+  for _, contour in self.retained do
+    table.insert(contours, describeContour(contour))
+  end
+
+  for _, line in self.lines do
+    table.insert(lines, describeContour(line))
+  end
+
+  return { tolerance = self.tolerance, contours = contours, lines = lines }
+end
+
+--- The numbers each opcode takes.
+local Arguments: { [number]: number } = { [Point] = 2, [Quad] = 4, [Cubic] = 6, [Arc] = 6, [Ellipse] = 4 }
+
+--- Checks a described contour from an untrusted source: known opcodes with their numbers, all
+--- finite and within MaxCoordinate, a finite matrix, and at most `budget` commands in all.
+local function checkContour(description: ContourDescription, budget: { number }): Retained
+  local commands = description.commands
+
+  if type(commands) ~= 'table' then error('magick: a path contour needs commands', 4) end
+
+  local index = 1
+
+  while index <= #commands do
+    local count = Arguments[commands[index]]
+
+    if not count then error(`magick: unknown path command {commands[index]}`, 4) end
+
+    for offset = 1, count do
+      local value = commands[index + offset]
+
+      if type(value) ~= 'number' or not finite(value) or math.abs(value) > transform.MaxCoordinate then
+        error('magick: path coordinates must be finite and within MaxCoordinate', 4)
+      end
+    end
+
+    index += count + 1
+  end
+
+  if index ~= #commands + 1 or #commands == 0 or commands[1] ~= Point and commands[1] ~= Arc and commands[1] ~= Ellipse then
+    error('magick: a path contour must start with a point, an arc or an ellipse', 4)
+  end
+
+  budget[1] += #commands
+  if budget[1] > Module.MaxCommandsPerPath then error(`magick: MaxCommandsPerPath {Module.MaxCommandsPerPath} exceeded`, 4) end
+
+  local fields = description.matrix
+  local matrix: Matrix? = nil
+
+  if fields then
+    if type(fields) ~= 'table' or #fields ~= 6 then error('magick: a contour matrix is six numbers', 4) end
+
+    matrix = transform.matrix(fields[1], fields[2], fields[3], fields[4], fields[5], fields[6])
+  end
+
+  return { commands = table.clone(commands), matrix = matrix, reverse = description.reverse == true, closed = description.closed == true }
+end
+
+--- A path from `describe`'s data, checked as untrusted: refused rather than trusted when anything in
+--- it is unknown, nonfinite or past a cap. Its contours flatten again at its tolerance.
+function Module.fromDescription(description: Description): Path
+  local tolerance = description.tolerance
+
+  if type(tolerance) ~= 'number' or not finite(tolerance) or tolerance <= 0 then error('magick: tolerance must be a positive finite number', 2) end
+
+  local out = Module.new(tolerance)
+  local budget = { 0 }
+
+  for _, contour in description.contours or {} do
+    local retained = checkContour(contour, budget)
+
+    table.insert(out.retained, retained)
+    table.insert(out.contours, flattenRetained(retained, nil, tolerance))
+  end
+
+  for _, line in description.lines or {} do
+    table.insert(out.lines, checkContour(line, budget))
+  end
+
+  return out
+end
+
 --- The tolerance a 0.2.0 call flattens to, checked.
 local function deviceTolerance(self: Path, tolerance: number?): number
   local chosen = tolerance or self.tolerance
