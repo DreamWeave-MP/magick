@@ -7,8 +7,8 @@ local Records: { [string]: string } = {
   ['rosette'] = '1000x1000:4d1413ef',
   ['valley'] = '960x540:5f71731b',
   ['heron'] = '800x1000:7b868098',
-  ['oil'] = '960x540:036937b3',
-  ['portrait'] = '540x675:507fa205',
+  ['oil'] = '960x540:bdf08d8b',
+  ['portrait'] = '540x675:a0c7bfe1',
 }
 
 return table.freeze(Records)

@@ -564,10 +564,30 @@ function Module.apply(document: scene.Document, parent: scene.Node, plan: Plan, 
   local underpaint = if options then options.underpaint else nil
 
   if underpaint then
+    -- Blurred here, as the plan's own coarsest target is, with each average taken over the pixels
+    -- that exist. A blur filter would take the canvas's outside as transparent and fade the
+    -- underpainting toward its edges, leaving a ragged unpainted frame around the strokes.
     local largest = if #plan.strokes > 0 then plan.strokes[1].radius else 4
-    local toned = layer:add(document:group { name = 'underpainting', filters = { { kind = 'blur', radius = math.min(21, largest) } } })
+    local width, height = underpaint.width, underpaint.height
+    local size = math.max(1, math.floor(largest / 2))
+    local spare = plane(width * height)
+    local toned = magick.new(width, height)
 
-    toned:add(document:image(underpaint, { sampling = 'bilinear' }))
+    for channel = 0, 3 do
+      local values = plane(width * height)
+
+      for index = 0, width * height - 1 do
+        put(values, index, buffer.readu8(underpaint.data, index * 4 + channel))
+      end
+
+      local blurred = blurPlane(values, width, height, size, spare)
+
+      for index = 0, width * height - 1 do
+        buffer.writeu8(toned.data, index * 4 + channel, math.floor(math.clamp(at(blurred, index), 0, 255) + 0.5))
+      end
+    end
+
+    layer:add(document:image(toned, { sampling = 'bilinear', name = 'underpainting' }))
   end
 
   for index, stroke in plan.strokes do
