@@ -391,13 +391,17 @@ local function compileNode(node: scene.Node, outer: Matrix, ops: { Op }, toleran
   return box
 end
 
---- Bytes a Luau table slot holds (a value and its tag), and an estimate of one small record with its
---- header: what `planBytes` counts by.
+--- What `planBytes` counts by, from how Luau lays tables out: an array slot is a 16-byte value; a
+--- record of n fields hashes into the next power of two of 32-byte nodes after a 64-byte header. An
+--- operation is a record of about twenty fields (32 nodes) with its matrix and paint copies; a
+--- prepared outline is a record and six arrays, plus six slots an edge.
 local SlotBytes = 16
-local RecordBytes = 512
+local RecordBytes = 2048
+local PreparedBytes = 1024
 
---- An estimate of the memory operations hold: a record each, six slots for each prepared edge, and
---- a mask's operations. Owned pixels are counted by `compile`, once per copy.
+--- An estimate of the memory operations hold: a record each, a prepared outline's record, arrays and
+--- six slots an edge, and a mask's operations. Owned pixels are counted by `compile`, once per copy.
+--- It is meant to err high: the budget it feeds is a ceiling, not a guess.
 local function planBytes(ops: { Op }): number
   local total = 0
 
@@ -406,11 +410,11 @@ local function planBytes(ops: { Op }): number
 
     local prepared = op.prepared
 
-    if prepared then total += prepared.count * 6 * SlotBytes end
+    if prepared then total += PreparedBytes + prepared.count * 6 * SlotBytes end
 
     local clip = op.clip
 
-    if clip then total += clip.prepared.count * 6 * SlotBytes end
+    if clip then total += PreparedBytes + clip.prepared.count * 6 * SlotBytes end
 
     local mask = op.mask
 

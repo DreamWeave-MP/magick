@@ -599,7 +599,8 @@ frozen handle (`width`, `height`, `space`, `nodes`, `operations`, `bytes`); its 
 sources) are copied at compile time, once per source buffer. Tiles are worked out from a grid, never listed. A
 parallel render keeps at most `InFlightBatches` (2) batches of `BatchTiles` (8) tiles waiting on each worker, and
 stops and joins every worker before any error propagates. B3's parallel total adds, per worker, the plan copy it holds
-(`plan.bytes`, an estimate: 512 bytes an operation, 96 bytes a prepared edge, owned pixels exactly) and the tile bytes
+(`plan.bytes`, an estimate meant to err high: 2 KiB an operation, 1 KiB and 96 bytes an edge a prepared
+outline, owned pixels exactly) and the tile bytes
 that may wait in its queues (`(InFlightBatches + 1) * BatchTiles * E * E * 4`).
 
 **Computable arithmetic (`tests/rfc.jsl`, `tests/rfc_contracts.jsl`).** The table, with the hand-derived values:
