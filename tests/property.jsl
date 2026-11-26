@@ -27,6 +27,13 @@ local function wellFormed(value: Shape, bytesPerPixel: number): boolean
   return buffer.len(value.data) == value.width * value.height * bytesPerPixel
 end
 
+--- Whether a result keeps to the ownership contract: an operation that works in place hands back the
+--- image it was given, whose shape `wellFormed` then holds trivially; any other result owns a buffer
+--- of its own, so drawing into it never changes the input.
+local function owned(value: Shape, input: Image): boolean
+  return rawequal(value, input) or value.data ~= input.data
+end
+
 --- One operation of the sweep: its name, the bytes a pixel of its result takes (4 for an image, 1
 --- for a mask), and what it does to a seeded image of the size given.
 type Operation = { name: string, bytes: number, run: (image: Image) -> Shape }
@@ -91,14 +98,15 @@ suite.it('tiling a zero-wide source throws the legacy error, pinned as the defec
   expect(string.find(tostring(failure), 'buffer access out of bounds', 1, true) ~= nil).toBe(true)
 end)
 
-suite.it('every operation returns the shape its contract gives at every size from 0x0 to 17x17', function()
+suite.it('every operation returns the shape its contract gives, in place or in a buffer of its own, at every size from 0x0 to 17x17', function()
   for width = 0, Largest do
     for height = 0, Largest do
       for _, operation in operations do
-        local result = operation.run(support.noisy(width, height, 1000 + width * 31 + height))
+        local input = support.noisy(width, height, 1000 + width * 31 + height)
+        local result = operation.run(input)
         local label = `{operation.name} {width}x{height}`
 
-        expect(`{label}: {wellFormed(result, operation.bytes)}`).toBe(`{label}: true`)
+        expect(`{label}: {wellFormed(result, operation.bytes)} {owned(result, input)}`).toBe(`{label}: true true`)
       end
     end
   end

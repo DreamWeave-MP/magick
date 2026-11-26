@@ -56,6 +56,11 @@ local function wellFormed(value: Shape, bytesPerPixel: number): boolean
   return buffer.len(value.data) == value.width * value.height * bytesPerPixel
 end
 
+--- Whether an in-place operation handed back its own image, or any other result owns its buffer.
+local function owned(value: Shape, input: Image): boolean
+  return rawequal(value, input) or value.data ~= input.data
+end
+
 --- The scenes, by name, as tests/scenes.jsl gives them.
 local function scene(name: string): Image
   for _, candidate in scenes.scenes do
@@ -132,7 +137,8 @@ suite.describe('clipping', function()
 
     path.new():rect(5, 5, 8, 8):fill(image, '#ffffff')
 
-    expect(alphaArea(image)).toBe(9)
+    -- Alpha alone cannot tell: the base is already opaque, so every pixel must still be black.
+    expect(buffer.tostring(image.data)).toBe(buffer.tostring(magick.new(3, 3, '#000000').data))
   end)
 end)
 
@@ -283,9 +289,10 @@ suite.describe('extreme sizes', function()
 
     suite.it(`{width}x{height} images come back well formed from every operation`, function()
       for _, operation in operations do
-        local result = operation.run(magick.new(width, height, '#102030'))
+        local input = magick.new(width, height, '#102030')
+        local result = operation.run(input)
 
-        expect(wellFormed(result :: Shape, operation.bytes)).toBe(true)
+        expect(wellFormed(result :: Shape, operation.bytes) and owned(result :: Shape, input)).toBe(true)
       end
     end)
 
@@ -714,7 +721,7 @@ suite.describe('values at extreme sizes, by hand: the rest', function()
     local column = magick.new(1, 17, background):sigmoidalContrast(2, 0.5)
     local line = magick.new(17, 1, background):sigmoidalContrast(2, 0.5)
 
-    everyPixel(magick.new(1, 1, background):sigmoidalContrast(2, 0.5), darkCase)
+    everyPixel(magick.new(3, 3, background):sigmoidalContrast(2, 0.5), darkCase)
     expect(at(column, 0, 16)).toEqual(darkCase)
     expect(at(line, 16, 0)).toEqual(darkCase)
   end)
@@ -854,7 +861,7 @@ suite.describe('gallery', function()
   end)
 
   suite.it('decodes every committed baseline PNG to the pixels and bytes its record names', function()
-    -- Needs filesystem.read: `jess package test . --capability filesystem.read`, as CI runs it.
+    -- Reads the baseline PNGs from tests/gallery under the package folder.
     for _, candidate in scenes.scenes do
       local bytes = fs.readFile(`tests/gallery/{candidate.name}.png`) :: buffer
       local decoded = magick.readPNG(bytes)

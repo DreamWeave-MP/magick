@@ -63,7 +63,9 @@ jobs:
       - name: Gallery refuses the baseline folder
         run: |
           if jess run --package . --capability filesystem.read --capability filesystem.write \
-            tools/gallery.jsl tests/gallery; then
+            tools/gallery.jsl tests/gallery > target/refusal.txt 2>&1; then
             echo "::error::the gallery wrote into tests/gallery, the baseline folder"
             exit 1
           fi
+          grep -q "is the baseline folder" target/refusal.txt \
+            || { cat target/refusal.txt; echo "::error::the gallery failed for another reason"; exit 1; }
