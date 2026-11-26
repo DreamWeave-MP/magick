@@ -10,10 +10,13 @@
 -- `clipped circle` by area alone, and the rest at the points listed there. Every other pixel of a
 -- scene is held by its fingerprint alone, so the fingerprint says the tree drew this, not that it
 -- drew the right thing. A change that moves one is a visual change and needs a reviewed rebaseline.
+local brush = require '@magick/brush'
 local color = require '@magick/color'
 local magick = require '@magick'
 local paint = require '@magick/paint'
 local path = require '@magick/path'
+local render = require '@magick/render'
+local sceneModule = require '@magick/scene'
 local transform = require '@magick/transform'
 local support = require './support'
 
@@ -302,6 +305,55 @@ scene('isolated group', function()
   return color.toImage(backdrop)
 end)
 
+-- MAG-032, MAG-033: the five media presets, one stroke each over paper, and below them one brush
+-- under each accumulation: buildup piling up, constant staying even, wet pooling at its edges.
+scene('brush media', function()
+  local document = sceneModule.new(160, 150, { background = '#f2ead8', space = 'linear' })
+  local paper = brush.paper(21)
+
+  local function wave(top: number, pressure: (along: number) -> number): { brush.Sample }
+    local samples: { brush.Sample } = {}
+
+    for step = 0, 24 do
+      local along = step / 24
+
+      table.insert(samples, { 10 + along * 140, top + math.sin(along * 6) * 6, pressure(along) })
+    end
+
+    return samples
+  end
+
+  local media: { { name: string, size: number, color: string } } = {
+    { name = 'ink', size = 5, color = '#151520' },
+    { name = 'oil', size = 12, color = '#b04428' },
+    { name = 'watercolor', size = 14, color = '#2a68b8' },
+    { name = 'graphite', size = 3, color = '#303030' },
+    { name = 'airbrush', size = 16, color = '#d04080' },
+  }
+
+  for index, medium in media do
+    local settings = brush.preset(medium.name, medium.size, medium.color, { grain = paper })
+
+    document:add(document:stroke(wave(10 + (index - 1) * 20, function(along: number): number
+      return 0.3 + 0.7 * math.sin(along * math.pi)
+    end), settings, { seed = index }))
+  end
+
+  for index, accumulation in { 'buildup', 'constant', 'wet' } :: { 'buildup' | 'constant' | 'wet' } do
+    document:add(document:stroke({ { 12 + (index - 1) * 50, 140 }, { 30 + (index - 1) * 50, 112 }, { 48 + (index - 1) * 50, 140 } }, {
+      size = 12,
+      color = '#802060',
+      flow = 0.35,
+      spacing = 0.15,
+      tip = { kind = 'round', hardness = 0.3 },
+      accumulation = accumulation,
+      edge = 1,
+    }))
+  end
+
+  return (render.image(document))
+end)
+
 --- The scenes, in the order the gallery renders and the gate suite checks them.
 local Scenes: { Scene } = scenes
 
@@ -353,6 +405,8 @@ local Recorded: { [string]: string } = {
   ['blend modes png'] = '17167:eb53cda6',
   ['isolated group pixels'] = '64x32:8f65ed7c',
   ['isolated group png'] = '556:454e1c6b',
+  ['brush media pixels'] = '160x150:18a2b638',
+  ['brush media png'] = '16365:ecf64b5a',
 }
 
 return table.freeze {

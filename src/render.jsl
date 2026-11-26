@@ -30,6 +30,7 @@ size (the parity tests hold this).
 Filters see the canvas only: what a group draws outside the canvas is not there for its blur or
 shadow to spread, as if the group had been drawn into a canvas-sized surface first.
 ]]
+local brush = require '@magick/brush'
 local color = require '@magick/color'
 local magick = require '@magick'
 local paint = require '@magick/paint'
@@ -50,7 +51,7 @@ Module.MaxHaloPx = 64
 
 --- One operation of a plan.
 export type Op = {
-  kind: 'fill' | 'push' | 'pop',
+  kind: 'fill' | 'push' | 'pop' | 'dabs',
   --- The node it came from, and that node's name.
   node: number,
   name: string?,
@@ -72,6 +73,8 @@ export type Op = {
   clip: { prepared: path.Prepared, rule: path.FillRule }?,
   mask: { ops: { Op }, kind: 'alpha' | 'luminance' }?,
   filters: { scene.Filter },
+  --- Dabs: the stroke, moved into device space.
+  stroke: brush.Stroke?,
 }
 
 --- A compiled document, as this module holds it: everything a render reads, fixed.
@@ -208,6 +211,7 @@ local function fillOp(node: scene.Node, prepared: path.Prepared, rule: path.Fill
     clip = nil,
     mask = nil,
     filters = {},
+    stroke = nil,
   }
 end
 
@@ -230,6 +234,7 @@ local function frameOp(kind: 'push' | 'pop', node: scene.Node): Op
     clip = nil,
     mask = nil,
     filters = {},
+    stroke = nil,
   }
 end
 
@@ -345,6 +350,18 @@ local function compileNode(node: scene.Node, outer: Matrix, ops: { Op }, toleran
     end
 
     return box
+  end
+
+  if node.kind == 'stroke' then
+    local made = brush.moved(brush.stroke(node.samples :: { brush.Sample }, node.brush :: brush.Brush, node.seed), matrix)
+    local op = frameOp('push', node)
+
+    op.kind = 'dabs'
+    op.stroke = made
+    op.left, op.top, op.right, op.bottom = made.left, made.top, made.right, made.bottom
+    table.insert(ops, op)
+
+    return { made.left, made.top, made.right, made.bottom }
   end
 
   if node.kind == 'image' then
@@ -520,7 +537,7 @@ function Module.dump(handle: Plan): string
 
     local offCanvas = op.right <= 0 or op.bottom <= 0 or op.left >= plan.width or op.top >= plan.height
     local box = if op.kind == 'pop' then '' else ` [{op.left}, {op.top}, {op.right}, {op.bottom}]`
-    local extra = if op.kind == 'fill' then ` {(op.paint :: paint.Paint).kind} {op.rule} {op.prepared and (op.prepared :: path.Prepared).count or 0} edges` else ''
+    local extra = if op.kind == 'fill' then ` {(op.paint :: paint.Paint).kind} {op.rule} {op.prepared and (op.prepared :: path.Prepared).count or 0} edges` elseif op.kind == 'dabs' then ` {#(op.stroke :: brush.Stroke).dabs} dabs` else ''
 
     table.insert(lines, `{string.format('%4d', index)} {string.rep('  ', depth)}{op.kind} #{op.node}{if op.name then ' ' .. op.name else ''}{box}{extra}{if offCanvas and op.kind ~= 'pop' then ' OFF-CANVAS' else ''}`)
 
@@ -770,7 +787,10 @@ runOps = function(plan: Compiled, ops: { Op }, base: Tile, pool: Pool, depth: nu
       continue
     end
 
-    if op.kind == 'fill' then
+    if op.kind == 'dabs' then
+      stats.rendered += 1
+      brush.paint(top, op.stroke :: brush.Stroke, { opacity = op.opacity, blend = op.blend })
+    elseif op.kind == 'fill' then
       stats.rendered += 1
       paint.fillPrepared(top, op.prepared :: path.Prepared, op.paint :: paint.Paint, {
         fillRule = op.rule,
