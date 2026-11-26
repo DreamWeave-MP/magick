@@ -28,18 +28,23 @@ jess run --package . --capability filesystem.read --capability filesystem.write 
 ![The toned ground and each pass](gallery/monalisa-progress.png)
 
 [`demos/monalisa.jsl`](demos/monalisa.jsl) paints Leonardo's portrait with `painter.paint`. The canvas is toned a
-flat umber, then laid in with loaded oil strokes at radius 8, 4 and 2. The face and hands carry on to 1-pixel strokes
-with a soft, thin, low-flow brush (sfumato) and a tighter threshold; the bust sits between the two. Each region's
-strokes stay inside it. Every pass is planned against the canvas the brush engine actually rendered, and its error is
-measured against the reference itself (mean absolute difference of the colors, 0..1, at the reference's size):
+flat umber, then laid in with loaded oil strokes at radius 8, 4 and 2. The face and hands carry on through radius 3,
+2, 1.5 and 1 in glazes: very soft, translucent strokes that never pile up past their own coverage, refined almost
+everywhere (threshold 0.008), so the flesh turns continuously (sfumato). An earlier opaque brush with a coarser
+threshold banded the face into plateaus, as an independent review pointed out. The bust sits between the two. Each
+region's strokes start inside it. Every pass is planned against the canvas the brush engine actually rendered, and
+its error is measured against the reference itself (mean absolute difference of the colors, 0..1, at the reference's
+size):
 
 | Stage | Strokes | Error against the reference |
 |---|---|---|
 | Toned ground | 0 | 0.1490 |
-| Radius 8, everywhere | 5,922 | 0.0517 |
-| Radius 4 | 4,458 | 0.0418 |
-| Radius 2 | 7,960 | 0.0376 |
-| Radius 1, face and hands only | 3,492 | 0.0373 |
+| Radius 8, everywhere | 5,922 | 0.0519 |
+| Radius 4 | 5,616 | 0.0410 |
+| Radius 3, flesh and bust | 3,243 | 0.0404 |
+| Radius 2 | 10,077 | 0.0371 |
+| Radius 1.5, face and hands | 3,021 | 0.0370 |
+| Radius 1, face and hands | 9,415 | 0.0369 |
 
 The numbers report what happened; nothing promises they fall. They are not a score to chase either: the reference
 merely blurred by the largest brush measured 0.0343, lower than the finished painting, so the painter is judged by the
@@ -48,7 +53,7 @@ pictures, with the numbers as evidence that every pass moved the canvas toward i
 | | |
 |---|---|
 | ![Heron at Dusk](gallery/heron.png) [Heron at Dusk](demos/heron.jsl): ink and watercolor | ![Portrait of a Reader](gallery/portrait.png) [Portrait of a Reader](demos/portrait.jsl): an original vector reference ([reference](gallery/portrait-reference.png)) painted in oil |
-| ![The Valley, in Oil](gallery/oil.png) [The Valley, in Oil](demos/oil.jsl): the valley repainted by `@magick/painter` | ![Valley at First Light](gallery/valley.png) [Valley at First Light](demos/valley.jsl): 5,941 scene nodes, 4K and 8K targets |
+| ![The Valley, in Oil](gallery/oil.png) [The Valley, in Oil](demos/oil.jsl): the valley repainted by `painter.plan` and `apply`, its strokes larger than the ridges and sun they erase; compare [The Valley, Painted](gallery/valley-painted.png) ([source](demos/valleypainted.jsl)), the same reference painted by `painter.paint` against its real renders | ![Valley at First Light](gallery/valley.png) [Valley at First Light](demos/valley.jsl): 5,941 scene nodes, 4K and 8K targets |
 | ![Lighthouse at Dusk](gallery/lighthouse.png) [Lighthouse at Dusk](demos/lighthouse.jsl): a vector poster | ![Rosette](gallery/rosette.png) [Rosette](demos/rosette.jsl): engraved guilloche |
 
 ## 0.5.0 changes: Masterpiece
