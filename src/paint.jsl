@@ -370,6 +370,20 @@ function Module.pattern(source: magick.Image | Tile, options: PatternOptions?): 
   } :: Paint
 end
 
+--- The same paint drawn where `matrix` puts it: its transform becomes `matrix` o its own, so a paint
+--- given in a shape's user space follows the shape. A solid is returned as it is.
+function Module.moved(value: Paint, matrix: Matrix): Paint
+  if value.kind == 'solid' then return value end
+
+  local combined, inverse = checkMatrix(transform.multiply(matrix, value.transform), 2)
+  local copy = table.clone(value) :: { [string]: unknown }
+
+  copy.transform = combined
+  copy.inverse = inverse
+
+  return table.freeze(copy) :: Paint
+end
+
 --- `t` brought into 0..1 by a spread.
 local function spreadOf(spread: Spread, along: number): number
   if spread == 'repeat' then return along - math.floor(along) end
@@ -813,16 +827,15 @@ local function paintThrough(
   end
 end
 
---- Fills a path on a working tile with a paint: the path is covered over the tile's window, exactly
---- by its fill rule, and the paint composited through that coverage. Returns the tile.
-function Module.fillPath(tile: Tile, shape: path.Path, value: Paint, options: FillOptions?): Tile
-  checkKeys(options, FillKeys, 2)
+local PreparedKeys = { operator = true, blend = true, opacity = true, fillRule = true, clips = true }
+
+--- Fills an outline already flattened and sorted by `path.prepare` (in device space) on a tile, as
+--- `fillPath` does; for code that fills one outline into many tiles. `transform` and `tolerance`
+--- were the prepare's, so they are not options here.
+function Module.fillPrepared(tile: Tile, prepared: path.Prepared, value: Paint, options: FillOptions?): Tile
+  checkKeys(options, PreparedKeys, 2)
 
   local operator, mode, opacity = settings(options)
-  local prepared = path.prepare(shape, {
-    transform = if options then options.transform else nil,
-    tolerance = if options then options.tolerance else nil,
-  })
   local rule: path.FillRule = if options and options.fillRule then options.fillRule else 'nonzero'
   local clips = if options then options.clips else nil
   local window = { 0, 0, tile.width, tile.height }
@@ -845,6 +858,25 @@ function Module.fillPath(tile: Tile, shape: path.Path, value: Paint, options: Fi
   paintThrough(tile, coverage.data, value, operator, mode, opacity, window)
 
   return tile
+end
+
+--- Fills a path on a working tile with a paint: the path is covered over the tile's window, exactly
+--- by its fill rule, and the paint composited through that coverage. Returns the tile.
+function Module.fillPath(tile: Tile, shape: path.Path, value: Paint, options: FillOptions?): Tile
+  checkKeys(options, FillKeys, 2)
+
+  local prepared = path.prepare(shape, {
+    transform = if options then options.transform else nil,
+    tolerance = if options then options.tolerance else nil,
+  })
+
+  return Module.fillPrepared(tile, prepared, value, {
+    operator = if options then options.operator else nil,
+    blend = if options then options.blend else nil,
+    opacity = if options then options.opacity else nil,
+    fillRule = if options then options.fillRule else nil,
+    clips = if options then options.clips else nil,
+  })
 end
 
 --- Composites a paint over a whole tile, or through a coverage mask placed at (`left`, `top`) in
