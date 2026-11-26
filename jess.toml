@@ -5,15 +5,16 @@ id = "org.dreamweave.magick"
 version = "0.1.3"
 jess_api = "1"
 include = ["src", "LICENSES", "README.md", "COMPATIBILITY.md", "tests"]
-tests = ["tests/basic.jsl", "tests/compat.jsl", "tests/gate.jsl", "tests/property.jsl", "tests/png.jsl", "tests/path.jsl", "tests/resample.jsl", "tests/rfc.jsl", "tests/rfc_contracts.jsl", "tests/transform.jsl", "tests/coverage.jsl", "tests/stroke.jsl", "tests/color.jsl", "tests/style.jsl"]
+tests = ["tests/basic.jsl", "tests/compat.jsl", "tests/gate.jsl", "tests/property.jsl", "tests/png.jsl", "tests/path.jsl", "tests/resample.jsl", "tests/rfc.jsl", "tests/rfc_contracts.jsl", "tests/transform.jsl", "tests/coverage.jsl", "tests/stroke.jsl", "tests/color.jsl", "tests/paint.jsl", "tests/style.jsl"]
 
 [modules]
 "@magick" = "src/init.jsl"
 "@magick/path" = "src/path.jsl"
 "@magick/transform" = "src/transform.jsl"
 "@magick/color" = "src/color.jsl"
+"@magick/paint" = "src/paint.jsl"
 
 [[layer]]
 id = "org.dreamweave.magick"
 requires = []
-exports = ["@magick", "@magick/path", "@magick/transform", "@magick/color"]
+exports = ["@magick", "@magick/path", "@magick/transform", "@magick/color", "@magick/paint"]

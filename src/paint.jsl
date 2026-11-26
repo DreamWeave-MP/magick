@@ -1,0 +1,565 @@
+--!strict
+--[[
+@magick/paint: what color geometry lays down (RFC-0001 section 9).
+
+A paint is an immutable value: a solid color, a gradient or an image pattern, with an opacity. It is
+evaluated a span at a time (a run of pixel centers along one row of a working tile) into a scratch
+buffer of premultiplied values in the tile's space, with the paint's kind checked once per span and
+never per pixel. One paint can fill any number of shapes and tiles; nothing about it changes, and
+nothing the size of the canvas is ever made for it.
+
+Every paint has a `transform` from paint space to device space (the identity by default); a
+gradient's points and a pattern's pixels are in paint space, and a pixel center is taken back
+through the inverse. Gradients interpolate premultiplied colors, in `srgb` (the default) or
+`linear` light, between stops sorted by offset (stable, so a coincident pair makes a hard edge, the
+later stop winning at the shared offset). Past their ends, `spread` pads, repeats or reflects.
+]]
+local color = require '@magick/color'
+local magick = require '@magick'
+local path = require '@magick/path'
+local transform = require '@magick/transform'
+
+type Matrix = transform.Matrix
+type Tile = color.Tile
+
+local Module = {}
+
+export type Spread = 'pad' | 'repeat' | 'reflect'
+export type Space = color.Space
+
+--- A gradient stop: its offset in 0..1 and a legacy color.
+export type Stop = { offset: number, color: magick.Color }
+
+--- What the gradient constructors take besides their geometry.
+export type GradientOptions = {
+  spread: Spread?,
+  --- The space stops are interpolated in.
+  interpolation: Space?,
+  transform: Matrix?,
+  opacity: number?,
+  --- Radial only: the focal point the gradient starts from, the center when left out.
+  focusX: number?,
+  focusY: number?,
+}
+
+--- A paint. Its fields are read-only; `kind` says which of the rest it uses.
+export type Paint = {
+  kind: 'solid' | 'linear' | 'radial' | 'conic' | 'pattern',
+  opacity: number,
+  transform: Matrix,
+  inverse: Matrix,
+  --- Solid: its straight color, channels in 0..255.
+  channels: { number },
+  --- Gradients: stop offsets, and their straight channels in 0..1 in the interpolation space, four a stop.
+  offsets: { number },
+  colors: { number },
+  spread: Spread,
+  interpolation: Space,
+  --- Gradient geometry, in paint space.
+  geometry: { number },
+}
+
+--- How a fill composites: its operator and opacity, and how its path is covered.
+export type FillOptions = {
+  operator: color.Operator?,
+  opacity: number?,
+  fillRule: path.FillRule?,
+  --- The path's transform, user space to device space.
+  transform: Matrix?,
+  tolerance: number?,
+  clips: { path.Clip }?,
+}
+
+--- The most stops a gradient has.
+Module.MaxStops = 256
+
+local function finite(value: number): boolean
+  return value == value and value > -math.huge and value < math.huge
+end
+
+local function checkKeys(options: unknown, known: { [string]: boolean }, level: number)
+  if options == nil then return end
+
+  for name in options :: { [string]: unknown } do
+    if not known[name] then error(`magick: unknown option {name}`, level + 1) end
+  end
+end
+
+local function checkOpacity(opacity: number?, level: number): number
+  local value = opacity or 1
+
+  if not finite(value) or value < 0 or value > 1 then error('magick: opacity must be in 0..1', level + 1) end
+
+  return value
+end
+
+local function checkMatrix(matrix: Matrix?, level: number): (Matrix, Matrix)
+  local chosen = matrix or transform.identity()
+
+  transform.check(chosen)
+  if transform.isSingular(chosen) then error('magick: transform is singular', level + 1) end
+
+  return chosen, transform.inverse(chosen)
+end
+
+--- A paint of one color everywhere.
+function Module.solid(fill: magick.Color, options: { opacity: number? }?): Paint
+  checkKeys(options, { opacity = true }, 2)
+
+  local channels = magick.color(fill)
+
+  for index = 1, 4 do
+    if not finite(channels[index]) then error('magick: color channels must be finite', 2) end
+
+    channels[index] = math.floor(math.clamp(channels[index], 0, 255) + 0.5)
+  end
+
+  local identity = transform.identity()
+
+  return table.freeze {
+    kind = 'solid',
+    opacity = checkOpacity(if options then options.opacity else nil, 2),
+    transform = identity,
+    inverse = identity,
+    channels = table.freeze(channels),
+    offsets = {},
+    colors = {},
+    spread = 'pad',
+    interpolation = 'srgb',
+    geometry = {},
+  } :: Paint
+end
+
+--- Stops from offsets and colors by turns: `stops(0, '#000', 1, '#fff')`.
+function Module.stops(...: number | magick.Color): { Stop }
+  local count = select('#', ...)
+
+  if count % 2 ~= 0 then error('magick: stops come in pairs of an offset and a color', 2) end
+
+  local out = table.create(count // 2) :: { Stop }
+
+  for index = 1, count, 2 do
+    local offset = select(index, ...)
+
+    if type(offset) ~= 'number' then error('magick: stops come in pairs of an offset and a color', 2) end
+
+    table.insert(out, { offset = offset, color = (select(index + 1, ...)) :: magick.Color })
+  end
+
+  return out
+end
+
+local GradientKeys = { spread = true, interpolation = true, transform = true, opacity = true, focusX = true, focusY = true }
+
+--- Checks and sorts stops, stably, into offsets and straight channels in 0..1 of a space.
+local function prepareStops(stops: { Stop }, interpolation: Space): ({ number }, { number })
+  if #stops == 0 then error('magick: a gradient needs at least one stop', 4) end
+  if #stops > Module.MaxStops then error(`magick: MaxStops {Module.MaxStops} exceeded`, 4) end
+
+  local order = table.create(#stops) :: { number }
+
+  for index, stop in stops do
+    local offset = stop.offset
+
+    if type(offset) ~= 'number' or not finite(offset) or offset < 0 or offset > 1 then
+      error('magick: stop offsets must be numbers in 0..1', 4)
+    end
+
+    order[index] = index
+  end
+
+  table.sort(order, function(first: number, second: number): boolean
+    local firstOffset, secondOffset = stops[first].offset, stops[second].offset
+
+    if firstOffset ~= secondOffset then return firstOffset < secondOffset end
+
+    return first < second
+  end)
+
+  local offsets, colors = table.create(#stops) :: { number }, table.create(#stops * 4) :: { number }
+
+  for position, index in order do
+    local channels = magick.color(stops[index].color)
+
+    offsets[position] = stops[index].offset
+
+    for channel = 1, 4 do
+      if not finite(channels[channel]) then error('magick: color channels must be finite', 4) end
+
+      local byte = math.floor(math.clamp(channels[channel], 0, 255) + 0.5)
+
+      colors[(position - 1) * 4 + channel] = if channel < 4 and interpolation == 'linear' then color.decode(byte / 255) else byte / 255
+    end
+  end
+
+  return offsets, colors
+end
+
+local function gradient(
+  kind: 'linear' | 'radial' | 'conic',
+  geometry: { number },
+  stops: { Stop },
+  options: GradientOptions?
+): Paint
+  checkKeys(options, GradientKeys, 3)
+
+  for _, value in geometry do
+    if not finite(value) then error('magick: gradient geometry must be finite', 3) end
+  end
+
+  local spread = if options then options.spread or 'pad' else 'pad'
+
+  if spread ~= 'pad' and spread ~= 'repeat' and spread ~= 'reflect' then error(`magick: unknown spread {spread}`, 3) end
+
+  local interpolation = if options then options.interpolation or 'srgb' else 'srgb'
+
+  if interpolation ~= 'srgb' and interpolation ~= 'linear' then error(`magick: unknown color space {interpolation}`, 3) end
+
+  local matrix, inverse = checkMatrix(if options then options.transform else nil, 3)
+  local offsets, colors = prepareStops(stops, interpolation)
+
+  return table.freeze {
+    kind = kind,
+    opacity = checkOpacity(if options then options.opacity else nil, 3),
+    transform = matrix,
+    inverse = inverse,
+    channels = {},
+    offsets = table.freeze(offsets),
+    colors = table.freeze(colors),
+    spread = spread,
+    interpolation = interpolation,
+    geometry = table.freeze(geometry),
+  } :: Paint
+end
+
+--- A linear gradient from (`x0`, `y0`), where the offset is 0, to (`x1`, `y1`), where it is 1,
+--- constant across. A gradient of no length is its last stop's color everywhere.
+function Module.linear(x0: number, y0: number, x1: number, y1: number, stops: { Stop }, options: GradientOptions?): Paint
+  if options and (options.focusX or options.focusY) then error('magick: only a radial gradient has a focus', 2) end
+
+  return gradient('linear', { x0, y0, x1, y1 }, stops, options)
+end
+
+--- A radial gradient: offset 0 at the focus (the center unless given) and 1 on the circle of
+--- `radius` about the center. A focus on or outside the circle is drawn in to 0.999 of the
+--- radius, as SVG 1.1 does. A radius of 0 is the last stop's color everywhere.
+function Module.radial(centerX: number, centerY: number, radius: number, stops: { Stop }, options: GradientOptions?): Paint
+  if not finite(radius) or radius < 0 then error('magick: radius must be finite and not negative', 2) end
+
+  local focusX, focusY = centerX, centerY
+
+  if options then
+    focusX, focusY = options.focusX or centerX, options.focusY or centerY
+  end
+
+  local awayX, awayY = focusX - centerX, focusY - centerY
+  local away = math.sqrt(awayX * awayX + awayY * awayY)
+
+  if radius > 0 and away >= radius * 0.999 then
+    focusX, focusY = centerX + awayX / away * radius * 0.999, centerY + awayY / away * radius * 0.999
+  end
+
+  return gradient('radial', { centerX, centerY, radius, focusX, focusY }, stops, options)
+end
+
+--- `t` brought into 0..1 by a spread.
+local function spreadOf(spread: Spread, along: number): number
+  if spread == 'repeat' then return along - math.floor(along) end
+
+  if spread == 'reflect' then
+    local folded = along % 2
+
+    return if folded > 1 then 2 - folded else folded
+  end
+
+  return math.clamp(along, 0, 1)
+end
+
+Module.spreadOf = spreadOf
+
+--- Writes the premultiplied color of a gradient at `along` (already spread into 0..1) into `out`
+--- at `at`, in the target space. Between two stops the straight colors are premultiplied by their
+--- own alphas, mixed, and their alpha mixed (RFC-0001 M9); at a shared offset the later stop wins.
+@native
+local function stopColor(paint: Paint, along: number, target: Space, opacity: number, out: buffer, at: number)
+  local offsets, colors = paint.offsets, paint.colors
+  local count = #offsets
+  local upper = 1
+
+  while upper <= count and offsets[upper] <= along do
+    upper += 1
+  end
+
+  local red, green, blue, alpha
+
+  if upper == 1 or upper > count then
+    -- Before the first stop, or at or past the last: that stop's color.
+    local index = if upper == 1 then 0 else (count - 1) * 4
+
+    alpha = colors[index + 4]
+    red, green, blue = colors[index + 1] * alpha, colors[index + 2] * alpha, colors[index + 3] * alpha
+  else
+    local lower = upper - 1
+    local span = offsets[upper] - offsets[lower]
+    local weight = if span > 0 then (along - offsets[lower]) / span else 1
+    local from, to = (lower - 1) * 4, (upper - 1) * 4
+    local fromAlpha, toAlpha = colors[from + 4], colors[to + 4]
+
+    alpha = fromAlpha + (toAlpha - fromAlpha) * weight
+    red = colors[from + 1] * fromAlpha + (colors[to + 1] * toAlpha - colors[from + 1] * fromAlpha) * weight
+    green = colors[from + 2] * fromAlpha + (colors[to + 2] * toAlpha - colors[from + 2] * fromAlpha) * weight
+    blue = colors[from + 3] * fromAlpha + (colors[to + 3] * toAlpha - colors[from + 3] * fromAlpha) * weight
+  end
+
+  if target ~= paint.interpolation and alpha > 0 then
+    local transfer = if target == 'linear' then color.decode else color.encode
+
+    red = transfer(math.clamp(red / alpha, 0, 1)) * alpha
+    green = transfer(math.clamp(green / alpha, 0, 1)) * alpha
+    blue = transfer(math.clamp(blue / alpha, 0, 1)) * alpha
+  end
+
+  buffer.writef64(out, at, red * opacity)
+  buffer.writef64(out, at + 8, green * opacity)
+  buffer.writef64(out, at + 16, blue * opacity)
+  buffer.writef64(out, at + 24, alpha * opacity)
+end
+
+--- The gradient parameter at a paint-space point, before spread; nil where it is degenerate and
+--- takes the last stop.
+local function parameter(paint: Paint, pointX: number, pointY: number): number?
+  local geometry = paint.geometry
+
+  if paint.kind == 'linear' then
+    local deltaX, deltaY = geometry[3] - geometry[1], geometry[4] - geometry[2]
+    local length = deltaX * deltaX + deltaY * deltaY
+
+    if length == 0 then return nil end
+
+    return ((pointX - geometry[1]) * deltaX + (pointY - geometry[2]) * deltaY) / length
+  end
+
+  -- Radial: the point is `focus + t * (edge - focus)` for the edge on the circle along the ray
+  -- from the focus, so t solves |w + u / t| = r with u = point - focus and w = focus - center.
+  local radius = geometry[3]
+
+  if radius == 0 then return nil end
+
+  local towardX, towardY = pointX - geometry[4], pointY - geometry[5]
+  local offsetX, offsetY = geometry[4] - geometry[1], geometry[5] - geometry[2]
+  local reach = towardX * towardX + towardY * towardY
+
+  if reach == 0 then return 0 end
+
+  local dot = offsetX * towardX + offsetY * towardY
+  local inside = radius * radius - offsetX * offsetX - offsetY * offsetY
+  local inverse = (-dot + math.sqrt(dot * dot + reach * inside)) / reach
+
+  return 1 / inverse
+end
+
+--- A gradient's span: each pixel center taken back to paint space, its parameter spread, and the
+--- stops' color there. A linear gradient's parameter is worked out inline, with the same arithmetic.
+@native
+local function gradientSpan(paint: Paint, tile: Tile, row: number, first: number, count: number, out: buffer, scale: number)
+  local inverse = paint.inverse
+  local centerY = tile.top + row + 0.5
+  local lastOffset = #paint.offsets
+  local geometry = paint.geometry
+  local linear = paint.kind == 'linear'
+  local deltaX, deltaY = geometry[3] - geometry[1], geometry[4] - geometry[2]
+  local length = deltaX * deltaX + deltaY * deltaY
+
+  for index = 0, count - 1 do
+    local centerX = tile.left + first + index + 0.5
+    local pointX = inverse.scaleX * centerX + inverse.skewX * centerY + inverse.offsetX
+    local pointY = inverse.skewY * centerX + inverse.scaleY * centerY + inverse.offsetY
+    local along: number?
+
+    if linear then
+      along = if length == 0 then nil else ((pointX - geometry[1]) * deltaX + (pointY - geometry[2]) * deltaY) / length
+    else
+      along = parameter(paint, pointX, pointY)
+    end
+
+    local spread = if along then spreadOf(paint.spread, along) else paint.offsets[lastOffset]
+
+    stopColor(paint, spread, tile.space, scale, out, index * 32)
+  end
+end
+
+--- Evaluates `count` pixel centers of a row of a tile, from tile column `first`, into `out` as
+--- premultiplied f64 values in the tile's space, four a pixel, times the paint's opacity and
+--- `opacity`.
+function Module.span(paint: Paint, tile: Tile, row: number, first: number, count: number, out: buffer, opacity: number?)
+  local scale = paint.opacity * (opacity or 1)
+
+  if paint.kind == 'solid' then
+    local red, green, blue, alpha = color.premultiplied(paint.channels, tile.space)
+
+    red, green, blue, alpha = red * scale, green * scale, blue * scale, alpha * scale
+
+    for index = 0, count - 1 do
+      local at = index * 32
+
+      buffer.writef64(out, at, red)
+      buffer.writef64(out, at + 8, green)
+      buffer.writef64(out, at + 16, blue)
+      buffer.writef64(out, at + 24, alpha)
+    end
+
+    return
+  end
+
+  gradientSpan(paint, tile, row, first, count, out, scale)
+end
+
+local FillKeys = { operator = true, opacity = true, fillRule = true, transform = true, tolerance = true, clips = true }
+
+--- Composites one row's covered run: the source at each pixel is the scratch span's value (or, with
+--- `solid`, the four constants), its alpha scaled by the coverage; `fa = first + byBackdrop *
+--- backdropAlpha` and `fb = second + bySource * sourceAlpha`.
+@native
+local function composeRow(
+  data: buffer,
+  coverage: buffer,
+  base: number,
+  from: number,
+  to: number,
+  scratch: buffer,
+  solid: { number }?,
+  first: number,
+  byBackdrop: number,
+  second: number,
+  bySource: number
+)
+  local red, green, blue, alpha = 0, 0, 0, 0
+
+  if solid then red, green, blue, alpha = solid[1], solid[2], solid[3], solid[4] end
+
+  for column = from, to do
+    local covered = buffer.readu8(coverage, base + column)
+    local weight = covered / 255
+    local at = (base + column) * 16
+
+    if not solid then
+      local span = (column - from) * 32
+
+      red, green, blue = buffer.readf64(scratch, span), buffer.readf64(scratch, span + 8), (buffer.readf64(scratch, span + 16))
+      alpha = buffer.readf64(scratch, span + 24)
+    end
+
+    local sourceAlpha = alpha * weight
+    local backdropAlpha = buffer.readf32(data, at + 12)
+    local fa, fb = first + byBackdrop * backdropAlpha, second + bySource * sourceAlpha
+    local outAlpha = math.clamp(sourceAlpha * fa + backdropAlpha * fb, 0, 1)
+    local scale = weight * fa
+
+    buffer.writef32(data, at, math.clamp(red * scale + buffer.readf32(data, at) * fb, 0, outAlpha))
+    buffer.writef32(data, at + 4, math.clamp(green * scale + buffer.readf32(data, at + 4) * fb, 0, outAlpha))
+    buffer.writef32(data, at + 8, math.clamp(blue * scale + buffer.readf32(data, at + 8) * fb, 0, outAlpha))
+    buffer.writef32(data, at + 12, outAlpha)
+  end
+end
+
+--- Composites a paint through coverage bytes over a tile: the paint at each pixel, its alpha scaled
+--- by the coverage, by an operator. Where coverage is 0 the source is transparent, so an operator
+--- that clears under transparency clears there.
+local function paintThrough(tile: Tile, coverage: buffer, value: Paint, operator: color.Operator, opacity: number)
+  -- The operator's factors are linear in the alphas: read their coefficients off two corners.
+  local first, second = color.factors(operator, 0, 0)
+  local firstAtOne, secondAtOne = color.factors(operator, 1, 1)
+  local byBackdrop, bySource = firstAtOne - first, secondAtOne - second
+  local scratch = buffer.create(if value.kind == 'solid' then 0 else tile.width * 32)
+  local solid: { number }? = nil
+
+  if value.kind == 'solid' then
+    local red, green, blue, alpha = color.premultiplied(value.channels, tile.space)
+    local scale = value.opacity * opacity
+
+    solid = { red * scale, green * scale, blue * scale, alpha * scale }
+  end
+
+  -- Operators that leave the backdrop under a transparent source need only the covered run.
+  local skipsClear = second == 1 and bySource <= 0
+
+  for row = 0, tile.height - 1 do
+    local base = row * tile.width
+    local from, to = 0, tile.width - 1
+
+    if skipsClear then
+      while from <= to and buffer.readu8(coverage, base + from) == 0 do
+        from += 1
+      end
+
+      while to >= from and buffer.readu8(coverage, base + to) == 0 do
+        to -= 1
+      end
+
+      if from > to then continue end
+    end
+
+    if not solid then Module.span(value, tile, row, from, to - from + 1, scratch, opacity) end
+
+    composeRow(tile.data, coverage, base, from, to, scratch, solid, first, byBackdrop, second, bySource)
+  end
+end
+
+--- Fills a path on a working tile with a paint: the path is covered over the tile's window, exactly
+--- by its fill rule, and the paint composited through that coverage. Returns the tile.
+function Module.fillPath(tile: Tile, shape: path.Path, value: Paint, options: FillOptions?): Tile
+  checkKeys(options, FillKeys, 2)
+
+  local operator: color.Operator = 'src-over'
+
+  if options and options.operator then operator = options.operator end
+
+  color.factors(operator, 0, 0)
+
+  local opacity = checkOpacity(if options then options.opacity else nil, 2)
+  local coverage = shape:coverageIn(tile.left, tile.top, tile.width, tile.height, {
+    fillRule = if options then options.fillRule else nil,
+    transform = if options then options.transform else nil,
+    tolerance = if options then options.tolerance else nil,
+    clips = if options then options.clips else nil,
+  })
+
+  paintThrough(tile, coverage.data, value, operator, opacity)
+
+  return tile
+end
+
+--- Composites a paint over a whole tile, or through a coverage mask placed at (`left`, `top`) in
+--- device space (outside the mask nothing is covered). Returns the tile.
+function Module.fillMask(tile: Tile, value: Paint, mask: magick.Mask?, left: number?, top: number?, options: FillOptions?): Tile
+  checkKeys(options, { operator = true, opacity = true }, 2)
+
+  local operator: color.Operator = 'src-over'
+
+  if options and options.operator then operator = options.operator end
+
+  color.factors(operator, 0, 0)
+
+  local opacity = checkOpacity(if options then options.opacity else nil, 2)
+  local coverage = buffer.create(tile.width * tile.height)
+
+  if not mask then
+    buffer.fill(coverage, 0, 255)
+  else
+    local maskLeft, maskTop = (left or 0) - tile.left, (top or 0) - tile.top
+
+    for row = math.max(0, maskTop), math.min(tile.height, maskTop + mask.height) - 1 do
+      local fromX, toX = math.max(0, maskLeft), math.min(tile.width, maskLeft + mask.width)
+
+      if toX > fromX then
+        buffer.copy(coverage, row * tile.width + fromX, mask.data, (row - maskTop) * mask.width + fromX - maskLeft, toX - fromX)
+      end
+    end
+  end
+
+  paintThrough(tile, coverage, value, operator, opacity)
+
+  return tile
+end
+
+return Module
