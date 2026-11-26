@@ -58,6 +58,11 @@ An unknown option, fill rule or a window that is not whole numbers is refused by
 - **Cost** (`bench/bench.jsl`, a 512 square, this machine, jess 0.4.0): the ring row is 2.1 ms against 1.5 ms for the
   0.1.3 mask; a row of many small shapes costs more (400 circles: 8.7 ms against 2.0 ms), since each crossing and
   vertex cuts the row. Known limitation, recorded rather than hidden.
+- **Bounded**: exactness needs every crossing, so geometry that crosses itself densely inside one pixel row is
+  refused rather than approximated: `path.MaxStripCrossings` (65,536) crossings, or `path.MaxStripWork` (2^22) pair
+  tests and band steps, for one cluster of overlapping edges in one row raises before that work is done. Whether an
+  outline is refused depends on the outline alone, never on the tiling. A 400-edge zigzag inside one row took 11.6 s
+  before the caps and is now refused in milliseconds; 200 such edges cover exactly in 0.35 s.
 
 ## Gates
 

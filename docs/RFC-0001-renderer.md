@@ -613,6 +613,8 @@ relations are tested, and their code is owned by the issue named in the row.
 | `MaxCommandsPerPath` | `2^20` | constant; E5 rule tested; owned by MAG-004 | About a million commands is an outline far larger than any glyph or sprite set. |
 | `MaxPiecesPerCurve` | `16384` | constant; relation tested: the coordinate-limit cubic needs 8437 pieces; owned by MAG-004 | At 0.25 px, a cubic may have a control bend up to `16384^2 * 0.25 / 0.75`, about `8.9e7` px; the largest bend `MaxCoordinate` allows is about `2.4e7`. |
 | `MaxSegmentsPerCoverage` | `2^20` | constant; E5 rule tested; owned by MAG-008 | Flattened segments one coverage call may produce. |
+| `MaxStripCrossings` | `65536` | `raster.cover`; refusal and tiling-independence tested in `tests/coverage.jsl` | Crossings of one cluster of overlapping edges inside one pixel row. Exact coverage needs every one; past this the outline is refused, not approximated (A1). |
+| `MaxStripWork` | `2^22` | `raster.cover`, checked before the bands are cut | Pair tests plus band steps (bands x cluster edges) for one cluster in one row: about 0.7 s of work at most per row. |
 | `MaxDashEntries` | `64` | `checkDashes`; E5 boundary tested | A dash pattern is a short list (SK6). |
 | `MaxDashesPerStroke` | `2^20` | constant; E5 rule tested; owned by MAG-007 | Generated dashes per stroke (SK6). |
 | `MaxStops` | `256` | constant; E5 rule tested; owned by MAG-010 | A gradient stop list is not a lookup table (M6). |
