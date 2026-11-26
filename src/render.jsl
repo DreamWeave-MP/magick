@@ -748,12 +748,18 @@ local runOps: (plan: Compiled, ops: { Op }, base: Tile, pool: Pool, depth: numbe
 --- blend as it is laid onto the tile below.
 local function finishGroup(plan: Compiled, op: Op, group: Tile, parent: Tile, pool: Pool, depth: number)
   if #op.filters > 0 then
+    -- One shadow scratch a group, made only if it has a shadow, however many it has.
+    local shade = buffer.create(0)
+
     for _, filter in op.filters do
       if filter.kind == 'blur' then
         if filter.radius > 0 then blurTile(group, filter.radius, false) end
-      else
-        shadowTile(group, filter, buffer.create(buffer.len(group.data)))
+        continue
       end
+
+      if buffer.len(shade) == 0 then shade = buffer.create(buffer.len(group.data)) end
+
+      shadowTile(group, filter, shade)
     end
   end
 
@@ -964,16 +970,50 @@ local function merge(into: Stats, from: Stats)
   into.peakTileBytes = math.max(into.peakTileBytes, from.peakTileBytes)
 end
 
+--- The deepest group nesting and widest halo of operations, masks included: a masked group draws
+--- its mask a level below itself, and the mask's own groups go deeper still.
+local function nesting(ops: { Op }, start: number): (number, number)
+  local depth, deepest, halo = start, start, 0
+
+  for _, op in ops do
+    if op.kind == 'push' then
+      depth += 1
+      deepest = math.max(deepest, depth)
+      halo = math.max(halo, op.halo)
+
+      local mask = op.mask
+
+      if mask then
+        local maskDeepest, maskHalo = nesting(mask.ops, depth + 1)
+
+        deepest, halo = math.max(deepest, maskDeepest, depth + 1), (math.max(halo, maskHalo))
+      end
+    elseif op.kind == 'pop' then
+      depth -= 1
+    end
+  end
+
+  return deepest, halo
+end
+
+--- Whether any operation, masks included, paints with a shader.
+local function usesShader(ops: { Op }): boolean
+  for _, op in ops do
+    if op.paint and paint.hasShader(op.paint) then return true end
+    if op.mask and usesShader(op.mask.ops) then return true end
+  end
+
+  return false
+end
+
 --- Renders a grid's tiles on `workers` workers. Each worker is sent the plan once; then batches are
 --- dealt by turns, at most InFlightBatches waiting on each, and each reply is stitched into its own
 --- place before that worker is sent the next, so the queues stay bounded however large the canvas.
 --- Replies come back in the order each worker was sent them, so the output does not depend on
 --- timing. Every worker is stopped and joined before an error, a failed worker or a cancel goes on.
 local function renderParallel(plan: Compiled, grid: Grid, output: magick.Image, workers: number, cancel: (() -> boolean)?, stats: Stats)
-  for _, op in plan.ops do
-    if op.paint and paint.hasShader(op.paint) then
-      error('magick: a shader paint renders on one worker only, since a function cannot cross to a worker; use a field paint', 3)
-    end
+  if usesShader(plan.ops) then
+    error('magick: a shader paint renders on one worker only, since a function cannot cross to a worker; use a field paint', 3)
   end
 
   local worker = require '@jess/worker'
@@ -1062,18 +1102,7 @@ end
 --- bytes that may wait in its queues.
 function Module.workingBytes(handle: Plan, tileSize: number, workers: number?): number
   local plan = open(handle, 1)
-  local depth, deepest, halo = 0, 0, 0
-
-  for _, op in plan.ops do
-    if op.kind == 'push' then
-      depth += 1
-      deepest = math.max(deepest, depth)
-      halo = math.max(halo, op.halo)
-    elseif op.kind == 'pop' then
-      depth -= 1
-    end
-  end
-
+  local deepest, halo = nesting(plan.ops, 0)
   local wide = tileSize + 2 * halo * math.max(1, deepest)
   local perWorker = (1 + deepest + 2) * wide * wide * 16
   local count = workers or 1

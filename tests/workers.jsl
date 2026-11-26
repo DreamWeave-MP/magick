@@ -88,6 +88,20 @@ local stopping: render.RenderOptions = {
   end,
 }
 
+local shaded = scene.new(512, 512)
+local maskedGroup = shaded:add(shaded:group { mask = { node = shaded:shape(path.new():rect(0, 0, 512, 512), { fill = paint.shader(function(): (number, number, number, number)
+  return 1, 1, 1, 1
+end) }) } })
+
+maskedGroup:add(shaded:shape(path.new():rect(0, 0, 512, 512), { fill = paint.solid '#ff0000' }))
+
+-- pcall only around a render that must raise: a shader inside a mask cannot cross to a worker.
+local crossed, refusal = pcall(render.image, shaded, { workers = 2 } :: render.RenderOptions)
+
+print(`shader in a mask: {if not crossed and string.find(tostring(refusal), 'renders on one worker only', 1, true) then 'refused' else 'NOT REFUSED'}`)
+
+if crossed then failures += 1 end
+
 -- pcall only around a render that must raise: a cancel asked between tiles stops it.
 local cancelled, message = pcall(render.image, plan, stopping)
 
