@@ -215,4 +215,20 @@ suite.describe('degenerate and giant geometry', function()
   end)
 end)
 
+suite.describe('process budget', function()
+  suite.it('counts the heap the process already holds, refusing a render that fits its own budget', function()
+    local plan = render.compile(sample())
+
+    -- Far below any heap a running Luau holds: refused, whatever the collector has done.
+    expect(function()
+      render.image(plan, { processBudgetBytes = 1024 })
+    end).toThrow 'over the'
+
+    -- Far above any heap this suite reaches: drawn, the same bytes as without it.
+    local within = render.image(plan, { processBudgetBytes = 64 * 1024 * 1024 * 1024 })
+
+    expect(buffer.tostring(within.data)).toBe(buffer.tostring(render.image(plan).data))
+  end)
+end)
+
 return suite

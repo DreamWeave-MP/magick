@@ -127,6 +127,11 @@ export type RenderOptions = {
   into: magick.Image?,
   --- Refuse before any tile runs when the working set would pass this many bytes.
   memoryBudgetBytes: number?,
+  --- Refuse before any tile runs when the Luau heap in use now, plus what the render needs, would
+  --- pass this many bytes: a bound on the process, not only the render. The heap depends on how far
+  --- the collector has got, so near the bound the same call may pass or be refused; for refusals
+  --- that reproduce exactly, use memoryBudgetBytes.
+  processBudgetBytes: number?,
   --- How many workers render tiles: 1 (the default), up to MaxWorkers, or `auto`.
   workers: (number | 'auto')?,
   --- Asked between tiles; true stops the render with `magick: render cancelled`.
@@ -1122,6 +1127,7 @@ local RenderKeys = {
   region = true,
   into = true,
   memoryBudgetBytes = true,
+  processBudgetBytes = true,
   workers = true,
   cancel = true,
 }
@@ -1183,6 +1189,18 @@ function Module.image(source: Plan | scene.Document, options: RenderOptions?): (
   local needed = Module.workingBytes(handle, tileSize, workers)
 
   if needed > budget then error(`magick: render needs {needed} bytes, budget is {budget}`, 2) end
+
+  local processBudget = if options then options.processBudgetBytes else nil
+
+  -- The heap the process holds already (the document, this plan, everything else) comes first: a
+  -- render that fits its own budget can still pass what the whole process may use.
+  if processBudget then
+    local held = gcinfo() * 1024
+
+    if held + needed > processBudget then
+      error(`magick: render needs {needed} bytes over the {held} the process holds, process budget is {processBudget}`, 2)
+    end
+  end
 
   local output = if options and options.into then options.into else magick.new(plan.width, plan.height)
 
