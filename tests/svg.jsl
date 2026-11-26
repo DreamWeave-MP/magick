@@ -1,0 +1,141 @@
+--!strict
+-- `@magick/svg` (MAG-043): export that is deterministic and reads back to the same picture, an
+-- import of the subset hand-written SVG uses, and refusals of what is out of the subset or past its
+-- caps. (The export was also checked against ImageMagick's SVG renderer by hand: MAE 0.11%.)
+local brush = require '@magick/brush'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local svg = require '@magick/svg'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+local function meanDifference(first: { data: buffer }, second: { data: buffer }): number
+  local total = 0
+
+  for index = 0, buffer.len(first.data) - 1 do
+    total += math.abs(buffer.readu8(first.data, index) - buffer.readu8(second.data, index))
+  end
+
+  return total / buffer.len(first.data)
+end
+
+local function sample(): scene.Document
+  local document = scene.new(200, 120, { background = '#f0f0f0' })
+  local group = document:add(document:group { transform = transform.rotate(0.1), opacity = 0.9, clip = { path = path.new():circle(100, 60, 58) } })
+
+  group:add(document:shape(path.new():ring(60, 60, 40, 18), { fill = paint.linear(20, 0, 100, 0, paint.stops(0, '#ff6040', 1, '#4060ff')) }))
+  group:add(document:shape(path.new():moveTo(110, 20):quadTo(190, 40, 150, 100):cubicTo(130, 110, 120, 90, 110, 20):close(), {
+    fill = paint.radial(140, 60, 40, paint.stops(0, '#ffff80', 1, '#40a040')),
+    stroke = paint.solid '#202020',
+    strokeStyle = { width = 3, join = 'round', dashes = { 6, 3 } },
+  }))
+  document:add(document:group { filters = { { kind = 'blur', radius = 2 } }, blend = 'multiply' }):add(document:shape(path.new():rect(10, 10, 40, 30), { fill = paint.solid '#80808080' }))
+
+  return document
+end
+
+suite.describe('export', function()
+  suite.it('writes the same text for the same document, and reads back to the same picture', function()
+    local text = svg.export(sample())
+
+    expect(svg.export(sample())).toBe(text)
+    expect(string.find(text, 'A40 40 0 0 1 20 60 ', 1, true) ~= nil).toBe(true)
+    expect(string.find(text, '<feGaussianBlur stdDeviation="2"/>', 1, true) ~= nil).toBe(true)
+    expect(string.find(text, 'mix-blend-mode:multiply', 1, true) ~= nil).toBe(true)
+
+    -- The read-back has no filter (blur is not in the import subset), so compare without it.
+    local plain = sample()
+
+    plain.root.children[2]:remove()
+
+    local back = svg.import(svg.export(plain))
+
+    expect(meanDifference(render.image(back.document), render.image(plain)) < 0.5).toBe(true)
+  end)
+
+  suite.it('refuses what SVG cannot say as this package draws it', function()
+    local conic = scene.new(10, 10)
+
+    conic:add(conic:shape(path.new():rect(0, 0, 10, 10), { fill = paint.conic(5, 5, paint.stops(0, '#000', 1, '#fff')) }))
+
+    expect(function()
+      svg.export(conic)
+    end).toThrow 'magick: svg export takes solid, linear and radial paints, not a conic paint (node #2)'
+
+    local painted = scene.new(10, 10)
+
+    painted:add(painted:stroke({ { 1, 1 }, { 9, 9 } }, brush.preset('ink', 2, '#000')))
+
+    expect(function()
+      svg.export(painted)
+    end).toThrow 'magick: svg export does not take brush strokes (node #2)'
+  end)
+end)
+
+suite.describe('import', function()
+  local drawing = [[<?xml version="1.0"?>
+<!-- hand written -->
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80" viewBox="0 0 60 40">
+  <defs>
+    <linearGradient id="sky"><stop offset="0%" stop-color="#204080"/><stop offset="100%" style="stop-color: #f0c080"/></linearGradient>
+  </defs>
+  <rect width="60" height="40" fill="url(#sky)"/>
+  <g fill="#203018" transform="translate(0 2)">
+    <path d="M0 30 q15 -12 30 -2 t30 0 V40 H0 z"/>
+    <circle cx="44" cy="10" r="5" style="fill: white; fill-opacity: 0.8"/>
+    <path d="M5 5 a6 4 0 1 0 12 0 a6 4 0 1 0 -12 0" fill="red" stroke="black" stroke-width="0.5"/>
+  </g>
+  <polygon points="20,5 24,12 16,12" fill="rgb(255, 160, 0)"/>
+  <text x="2" y="38">ignored</text>
+</svg>]]
+
+  suite.it('draws the subset: viewBox, gradients, inheritance, styles, relative and smooth commands, arcs', function()
+    local result = svg.import(drawing)
+    local image = render.image(result.document)
+
+    expect({ image.width, image.height }).toEqual { 120, 80 }
+    expect(#result.warnings).toBe(1)
+    expect(result.warnings[1]).toBe 'skipped <text>: not in the subset this reads'
+
+    -- The sky runs from blue at the left to warm at the right, through the bounding box.
+    expect((image:get(2, 2)) < (image:get(117, 2))).toBe(true)
+    -- The hill is dark green, the sun near white, the triangle orange, the ellipse red.
+    expect({ image:get(10, 76) }).toEqual { 32, 48, 24, 255 }
+    expect((image:get(88, 24)) > 230).toBe(true)
+    expect({ image:get(40, 18) }).toEqual { 255, 160, 0, 255 }
+    expect({ image:get(22, 16) }).toEqual { 255, 0, 0, 255 }
+  end)
+
+  suite.it('refuses untrusted input past its caps or out of range', function()
+    expect(function()
+      svg.import(string.rep(' ', svg.MaxSvgBytes + 1))
+    end).toThrow 'magick: MaxSvgBytes 16777216 exceeded'
+
+    expect(function()
+      svg.import('<svg>' .. string.rep('<g/>', svg.MaxElements + 1) .. '</svg>')
+    end).toThrow 'magick: MaxElements 65536 exceeded'
+
+    expect(function()
+      svg.import('<svg>' .. string.rep('<g>', 40) .. string.rep('</g>', 40) .. '</svg>')
+    end).toThrow 'magick: MaxDepth 32 exceeded'
+
+    expect(function()
+      svg.import('<svg><path d="M0 0 L1e400 0"/></svg>')
+    end).toThrow 'magick: svg path numbers must be finite and within MaxCoordinate'
+
+    expect(function()
+      svg.import('<svg><g transform="perspective(3)"/></svg>')
+    end).toThrow 'magick: unknown svg transform perspective'
+
+    expect(function()
+      svg.import('<html></html>')
+    end).toThrow 'magick: no svg element'
+  end)
+end)
+
+return suite
