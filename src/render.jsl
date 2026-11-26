@@ -1,0 +1,692 @@
+--!strict
+--[[
+@magick/render: compiles a scene into an immutable plan and renders it tile by tile (RFC-0001
+sections 10 and 11).
+
+`compile` walks the document once, in tree order, into a flat list of operations: fills of outlines
+already flattened and sorted in device space, with their paints moved into device space, and
+group frames (`push` ... `pop`) carrying their opacity, blend, clip, mask and filters. Every
+operation has a device box, so a tile skips what cannot reach it, and a group whose box misses a
+tile is skipped whole. The plan holds no reference to anything the document can still change.
+
+`image` runs a plan over a grid of tiles from the origin, in row-major order, each tile a
+premultiplied working tile with one more for every open group, and writes each finished tile into
+the output image. Every pixel's arithmetic is the same whatever tile it falls in, and filters read a
+halo around the tile wide enough for their kernels, so the output is the same bytes at every tile
+size (the parity tests hold this).
+
+Filters see the canvas only: what a group draws outside the canvas is not there for its blur or
+shadow to spread, as if the group had been drawn into a canvas-sized surface first.
+]]
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+
+type Matrix = transform.Matrix
+type Tile = color.Tile
+
+local Module = {}
+
+Module.DefaultTileSize = 128
+Module.MaxTileSize = 256
+Module.DefaultBudgetBytes = 512 * 1024 * 1024
+--- The widest halo a filter may ask for, in pixels a side.
+Module.MaxHaloPx = 64
+
+--- One operation of a plan.
+export type Op = {
+  kind: 'fill' | 'push' | 'pop',
+  --- The node it came from, and that node's name.
+  node: number,
+  name: string?,
+  --- The device box it can touch: left, top, right, bottom, in whole pixels, right and bottom
+  --- exclusive.
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+  --- Fill: the outline and how it lays down.
+  prepared: path.Prepared?,
+  rule: path.FillRule,
+  paint: paint.Paint?,
+  opacity: number,
+  blend: color.BlendMode,
+  --- Push: the index of its pop, the halo its filters read, its clip, mask and filters.
+  skip: number,
+  halo: number,
+  clip: { prepared: path.Prepared, rule: path.FillRule }?,
+  mask: { ops: { Op }, kind: 'alpha' | 'luminance' }?,
+  filters: { scene.Filter },
+}
+
+--- A compiled document: everything a render reads, fixed.
+export type Plan = {
+  width: number,
+  height: number,
+  space: color.Space,
+  --- The background, premultiplied in the plan's space, or nil for transparent.
+  background: { number }?,
+  ops: { Op },
+  nodes: number,
+}
+
+--- What `image` takes.
+export type RenderOptions = {
+  --- The tile edge, 128 by default, at most 256.
+  tileSize: number?,
+  --- Render the canvas as one tile, as a reference for the tiled result. Small canvases only.
+  reference: boolean?,
+  --- Redraw only the tiles that meet this box (left, top, right, bottom) into `into`.
+  region: { number }?,
+  --- The image to draw into, the plan's size; a new one when left out.
+  into: magick.Image?,
+  --- Refuse before any tile runs when the working set would pass this many bytes.
+  memoryBudgetBytes: number?,
+}
+
+--- What a render did, for finding overdraw and waste.
+export type Stats = {
+  tiles: number,
+  candidates: number,
+  rendered: number,
+  skipped: number,
+  groups: number,
+  --- The largest number of working-tile bytes held at once.
+  peakTileBytes: number,
+}
+
+local function finite(value: number): boolean
+  return value == value and value > -math.huge and value < math.huge
+end
+
+--- The kernel half-width of a gaussian of standard deviation `radius`: three deviations.
+local function reach(radius: number): number
+  return math.ceil(3 * radius)
+end
+
+--- How far a group's filters read beyond what they write.
+local function haloOf(filters: { scene.Filter }): number
+  local halo = 0
+
+  for _, filter in filters do
+    local own = reach(filter.radius)
+
+    if filter.kind == 'shadow' then own += math.ceil(math.max(math.abs(filter.offsetX), math.abs(filter.offsetY))) end
+
+    halo += own
+  end
+
+  return halo
+end
+
+type Box = { number }
+
+local Empty: Box = { math.huge, math.huge, -math.huge, -math.huge }
+
+local function union(first: Box, second: Box): Box
+  return { math.min(first[1], second[1]), math.min(first[2], second[2]), math.max(first[3], second[3]), math.max(first[4], second[4]) }
+end
+
+local function isEmpty(box: Box): boolean
+  return box[1] >= box[3] or box[2] >= box[4]
+end
+
+local function boxOf(prepared: path.Prepared): Box
+  if prepared.count == 0 then return Empty end
+
+  return { math.floor(prepared.left), math.floor(prepared.top), math.ceil(prepared.right), math.ceil(prepared.bottom) }
+end
+
+local function fillOp(node: scene.Node, prepared: path.Prepared, rule: path.FillRule, value: paint.Paint, opacity: number, blend: color.BlendMode): Op
+  local box = boxOf(prepared)
+
+  return {
+    kind = 'fill',
+    node = node.id,
+    name = node.name,
+    left = box[1],
+    top = box[2],
+    right = box[3],
+    bottom = box[4],
+    prepared = prepared,
+    rule = rule,
+    paint = value,
+    opacity = opacity,
+    blend = blend,
+    skip = 0,
+    halo = 0,
+    clip = nil,
+    mask = nil,
+    filters = {},
+  }
+end
+
+local function frameOp(kind: 'push' | 'pop', node: scene.Node): Op
+  return {
+    kind = kind,
+    node = node.id,
+    name = node.name,
+    left = 0,
+    top = 0,
+    right = 0,
+    bottom = 0,
+    prepared = nil,
+    rule = 'nonzero',
+    paint = nil,
+    opacity = node.opacity,
+    blend = node.blend,
+    skip = 0,
+    halo = 0,
+    clip = nil,
+    mask = nil,
+    filters = {},
+  }
+end
+
+--- Compiles a node under a matrix onto `ops`; returns the device box of what it can draw.
+local function compileNode(node: scene.Node, outer: Matrix, ops: { Op }, tolerance: number?): Box
+  local matrix = transform.multiply(outer, node.transform)
+
+  if node.kind == 'shape' then
+    local geometry = node.geometry :: path.Path
+    local both = node.fill ~= nil and node.stroke ~= nil
+    -- A shape with both paints and an opacity or blend is one isolated layer, as SVG's opacity is.
+    local wrapped = both and (node.opacity < 1 or node.blend ~= 'normal')
+    local opacity, blend = if wrapped then 1 else node.opacity, if wrapped then 'normal' else node.blend
+    local box = Empty
+    local start = #ops + 1
+
+    if wrapped then table.insert(ops, frameOp('push', node)) end
+
+    if node.fill then
+      local prepared = path.prepare(geometry, { transform = matrix, tolerance = tolerance })
+      local op = fillOp(node, prepared, node.fillRule, paint.moved(node.fill, matrix), opacity, blend)
+
+      table.insert(ops, op)
+      box = union(box, { op.left, op.top, op.right, op.bottom })
+    end
+
+    local stroke, style = node.stroke, node.strokeStyle
+
+    if stroke and style then
+      local outline = geometry:stroked {
+        width = style.width,
+        join = style.join,
+        miterLimit = style.miterLimit,
+        cap = style.cap,
+        dashes = style.dashes,
+        dashOffset = style.dashOffset,
+        transform = matrix,
+        tolerance = tolerance,
+      }
+      local prepared = path.prepare(outline, { transform = matrix, tolerance = tolerance })
+      local op = fillOp(node, prepared, 'nonzero', paint.moved(stroke, matrix), opacity, blend)
+
+      table.insert(ops, op)
+      box = union(box, { op.left, op.top, op.right, op.bottom })
+    end
+
+    if wrapped then
+      local push, pop = ops[start], frameOp('pop', node)
+
+      table.insert(ops, pop)
+      push.skip = #ops
+      push.left, push.top, push.right, push.bottom = box[1], box[2], box[3], box[4]
+    end
+
+    return box
+  end
+
+  if node.kind == 'image' then
+    local image = node.image :: magick.Image
+    local prepared = path.prepare(path.new():rect(0, 0, image.width, image.height), { transform = matrix, tolerance = tolerance })
+    local pattern = paint.pattern(image, { transform = matrix, edge = 'transparent', sampling = node.sampling })
+    local op = fillOp(node, prepared, 'nonzero', pattern, node.opacity, node.blend)
+
+    table.insert(ops, op)
+
+    return { op.left, op.top, op.right, op.bottom }
+  end
+
+  -- A group: its frame, its children, and its box from theirs, widened by its halo and cut by its
+  -- clip. One with nothing to draw is left out of the plan altogether.
+  local push = frameOp('push', node)
+  local start = #ops + 1
+
+  table.insert(ops, push)
+
+  local box = Empty
+
+  for _, child in node.children do
+    box = union(box, compileNode(child, matrix, ops, tolerance))
+  end
+
+  if isEmpty(box) then
+    for index = #ops, start, -1 do
+      ops[index] = nil
+    end
+
+    return Empty
+  end
+
+  push.filters = node.filters
+  push.halo = haloOf(node.filters)
+
+  if push.halo > Module.MaxHaloPx then error(`magick: MaxHaloPx {Module.MaxHaloPx} exceeded`, 4) end
+
+  box = { box[1] - push.halo, box[2] - push.halo, box[3] + push.halo, box[4] + push.halo }
+
+  local clip = node.clip
+
+  if clip then
+    local prepared = path.prepare(clip.path, { transform = matrix, tolerance = tolerance })
+    local clipBox = boxOf(prepared)
+
+    push.clip = { prepared = prepared, rule = clip.fillRule or 'nonzero' }
+    box = { math.max(box[1], clipBox[1]), math.max(box[2], clipBox[2]), math.min(box[3], clipBox[3]), math.min(box[4], clipBox[4]) }
+  end
+
+  local mask = node.mask
+
+  if mask then
+    local maskOps: { Op } = {}
+
+    compileNode(mask.node, matrix, maskOps, tolerance)
+    push.mask = { ops = maskOps, kind = mask.kind or 'alpha' }
+  end
+
+  table.insert(ops, frameOp('pop', node))
+  push.skip = #ops
+  push.left, push.top, push.right, push.bottom = box[1], box[2], box[3], box[4]
+
+  return box
+end
+
+--- Compiles a document into a plan: every path flattened and sorted in device space now, every
+--- paint moved into device space, every group framed. The plan shares nothing the document can
+--- still change. `tolerance` is the flattening tolerance in device pixels (each path's own when left
+--- out).
+function Module.compile(document: scene.Document, options: { tolerance: number? }?): Plan
+  local ops: { Op } = {}
+  local tolerance = if options then options.tolerance else nil
+
+  local root = document.root
+
+  -- A plain root is the canvas itself: its children draw straight onto the base tile, with no
+  -- group tile of its own.
+  if root.opacity == 1 and root.blend == 'normal' and #root.filters == 0 and not root.clip and not root.mask then
+    for _, child in root.children do
+      compileNode(child, root.transform, ops, tolerance)
+    end
+  else
+    compileNode(root, transform.identity(), ops, tolerance)
+  end
+
+  local background: { number }? = nil
+
+  if document.background then
+    local red, green, blue, alpha = color.premultiplied(document.background, document.space)
+
+    background = { red, green, blue, alpha }
+  end
+
+  local plan: Plan = {
+    width = document.width,
+    height = document.height,
+    space = document.space,
+    background = background,
+    ops = ops,
+    nodes = document.count,
+  }
+
+  table.freeze(ops)
+  table.freeze((plan :: unknown) :: { [string]: unknown })
+
+  return plan
+end
+
+--- A readable listing of a plan: one line an operation, with its node, box, and whether it lies
+--- off the canvas, for finding overdraw and waste.
+function Module.dump(plan: Plan): string
+  local lines = { `plan {plan.width}x{plan.height} {plan.space}, {#plan.ops} ops from {plan.nodes} nodes` }
+  local depth = 0
+
+  for index, op in plan.ops do
+    if op.kind == 'pop' then depth -= 1 end
+
+    local offCanvas = op.right <= 0 or op.bottom <= 0 or op.left >= plan.width or op.top >= plan.height
+    local box = if op.kind == 'pop' then '' else ` [{op.left}, {op.top}, {op.right}, {op.bottom}]`
+    local extra = if op.kind == 'fill' then ` {(op.paint :: paint.Paint).kind} {op.rule} {op.prepared and (op.prepared :: path.Prepared).count or 0} edges` else ''
+
+    table.insert(lines, `{string.format('%4d', index)} {string.rep('  ', depth)}{op.kind} #{op.node}{if op.name then ' ' .. op.name else ''}{box}{extra}{if offCanvas and op.kind ~= 'pop' then ' OFF-CANVAS' else ''}`)
+
+    if op.kind == 'push' then depth += 1 end
+  end
+
+  return table.concat(lines, '\n')
+end
+
+--- Gaussian weights for a radius, normalized to sum to 1, from offset 0 to the reach.
+local function kernel(radius: number): { number }
+  local size = reach(radius)
+  local weights = table.create(size + 1) :: { number }
+  local total = 0
+
+  for offset = 0, size do
+    weights[offset + 1] = math.exp(-offset * offset / (2 * radius * radius))
+    total += weights[offset + 1] * (if offset == 0 then 1 else 2)
+  end
+
+  for offset = 0, size do
+    weights[offset + 1] /= total
+  end
+
+  return weights
+end
+
+--- Blurs `channels` (0..3, four bytes apart from `first`) of a tile in place, separably, with
+--- nothing beyond its edges. `scratch` holds one tile.
+@native
+local function blurTile(tile: Tile, radius: number, scratch: buffer, onlyAlpha: boolean)
+  local weights = kernel(radius)
+  local size = #weights - 1
+  local width, height, data = tile.width, tile.height, tile.data
+  local first = if onlyAlpha then 12 else 0
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      for channel = first, 12, 4 do
+        local total = 0
+
+        for offset = -size, size do
+          local at = column + offset
+
+          if at >= 0 and at < width then
+            total += buffer.readf32(data, ((row * width) + at) * 16 + channel) * weights[math.abs(offset) + 1]
+          end
+        end
+
+        buffer.writef32(scratch, (row * width + column) * 16 + channel, total)
+      end
+    end
+  end
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      for channel = first, 12, 4 do
+        local total = 0
+
+        for offset = -size, size do
+          local at = row + offset
+
+          if at >= 0 and at < height then
+            total += buffer.readf32(scratch, ((at * width) + column) * 16 + channel) * weights[math.abs(offset) + 1]
+          end
+        end
+
+        buffer.writef32(data, (row * width + column) * 16 + channel, total)
+      end
+    end
+  end
+end
+
+--- Lays a blurred, offset, colored copy of a tile's alpha under it, in place.
+local function shadowTile(tile: Tile, filter: scene.Filter, scratch: buffer, shade: buffer)
+  if filter.kind ~= 'shadow' then return end
+
+  local width, height = tile.width, tile.height
+  local offsetX, offsetY = math.floor(filter.offsetX + 0.5), math.floor(filter.offsetY + 0.5)
+  local red, green, blue, alpha = color.premultiplied(filter.color, tile.space)
+  local alphaOnly: Tile = { width = width, height = height, left = tile.left, top = tile.top, space = tile.space, data = shade }
+
+  buffer.fill(shade, 0, 0)
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      local fromRow, fromColumn = row - offsetY, column - offsetX
+
+      if fromRow >= 0 and fromRow < height and fromColumn >= 0 and fromColumn < width then
+        buffer.writef32(shade, (row * width + column) * 16 + 12, buffer.readf32(tile.data, (fromRow * width + fromColumn) * 16 + 12))
+      end
+    end
+  end
+
+  if filter.radius > 0 then blurTile(alphaOnly, filter.radius, scratch, true) end
+
+  for at = 0, width * height * 16 - 16, 16 do
+    local cover = buffer.readf32(shade, at + 12)
+    local keep = 1 - buffer.readf32(tile.data, at + 12)
+
+    buffer.writef32(tile.data, at, buffer.readf32(tile.data, at) + red * cover * keep)
+    buffer.writef32(tile.data, at + 4, buffer.readf32(tile.data, at + 4) + green * cover * keep)
+    buffer.writef32(tile.data, at + 8, buffer.readf32(tile.data, at + 8) + blue * cover * keep)
+    buffer.writef32(tile.data, at + 12, buffer.readf32(tile.data, at + 12) + alpha * cover * keep)
+  end
+end
+
+--- Working tiles by depth, reused from tile to tile: at most one a group level, each cleared before
+--- it is used.
+type Pool = { tiles: { Tile }, stats: Stats, held: number }
+
+local function borrow(pool: Pool, depth: number, left: number, top: number, width: number, height: number, space: color.Space): Tile
+  local existing = pool.tiles[depth]
+
+  if existing and existing.width == width and existing.height == height then
+    buffer.fill(existing.data, 0, 0)
+    existing.left, existing.top = left, top
+
+    return existing
+  end
+
+  if existing then pool.held -= buffer.len(existing.data) end
+
+  local tile = color.tile(width, height, { space = space, left = left, top = top })
+
+  pool.tiles[depth] = tile
+  pool.held += buffer.len(tile.data)
+  pool.stats.peakTileBytes = math.max(pool.stats.peakTileBytes, pool.held)
+
+  return tile
+end
+
+--- A mask tile's coverage bytes: its alpha, or its luminance times its alpha.
+local function maskBytes(tile: Tile, kind: 'alpha' | 'luminance'): magick.Mask
+  local count = tile.width * tile.height
+  local out = buffer.create(count)
+
+  for index = 0, count - 1 do
+    local at = index * 16
+    local value = buffer.readf32(tile.data, at + 12)
+
+    if kind == 'luminance' then
+      value = 0.2126 * buffer.readf32(tile.data, at) + 0.7152 * buffer.readf32(tile.data, at + 4) + 0.0722 * buffer.readf32(tile.data, at + 8)
+    end
+
+    buffer.writeu8(out, index, math.floor(math.clamp(value, 0, 1) * 255 + 0.5))
+  end
+
+  return magick.mask(tile.width, tile.height, out)
+end
+
+local runOps: (plan: Plan, ops: { Op }, base: Tile, pool: Pool, depth: number) -> ()
+
+--- Finishes a group: its filters, then its clip and mask as one coverage, then its opacity and
+--- blend as it is laid onto the tile below.
+local function finishGroup(plan: Plan, op: Op, group: Tile, parent: Tile, pool: Pool, depth: number)
+  if #op.filters > 0 then
+    local scratch = buffer.create(buffer.len(group.data))
+
+    for _, filter in op.filters do
+      if filter.kind == 'blur' then
+        if filter.radius > 0 then blurTile(group, filter.radius, scratch, false) end
+      else
+        shadowTile(group, filter, scratch, buffer.create(buffer.len(group.data)))
+      end
+    end
+  end
+
+  local coverage: magick.Mask? = nil
+  local clip = op.clip
+
+  if clip then coverage = path.coverOf(clip.prepared, clip.rule, group.left, group.top, group.width, group.height) end
+
+  local mask = op.mask
+
+  if mask then
+    local maskTile = borrow(pool, depth + 1, group.left, group.top, group.width, group.height, plan.space)
+
+    runOps(plan, mask.ops, maskTile, pool, depth + 1)
+
+    local bytes = maskBytes(maskTile, mask.kind)
+
+    if coverage then
+      local data = (coverage :: magick.Mask).data
+
+      for index = 0, buffer.len(data) - 1 do
+        buffer.writeu8(data, index, (buffer.readu8(data, index) * buffer.readu8(bytes.data, index) + 127) // 255)
+      end
+    else
+      coverage = bytes
+    end
+  end
+
+  color.compositeGroup(parent, group, {
+    opacity = op.opacity,
+    blend = op.blend,
+    clip = if coverage then { mask = coverage, left = group.left, top = group.top } else nil,
+  })
+end
+
+--- Runs operations onto a tile, groups opening tiles of their own a level down.
+runOps = function(plan: Plan, ops: { Op }, base: Tile, pool: Pool, depth: number)
+  local stack: { Tile } = { base }
+  local frames: { Op } = {}
+  local index = 1
+  local stats = pool.stats
+
+  while index <= #ops do
+    local op = ops[index]
+    local top = stack[#stack]
+
+    if op.kind == 'pop' then
+      local group = table.remove(stack) :: Tile
+      local frame = table.remove(frames) :: Op
+
+      finishGroup(plan, frame, group, stack[#stack], pool, depth + #stack)
+      index += 1
+      continue
+    end
+
+    stats.candidates += 1
+
+    local misses = op.right <= top.left or op.bottom <= top.top or op.left >= top.left + top.width or op.top >= top.top + top.height
+
+    if misses then
+      stats.skipped += 1
+      index = if op.kind == 'push' then op.skip + 1 else index + 1
+      continue
+    end
+
+    if op.kind == 'fill' then
+      stats.rendered += 1
+      paint.fillPrepared(top, op.prepared :: path.Prepared, op.paint :: paint.Paint, {
+        fillRule = op.rule,
+        opacity = op.opacity,
+        blend = op.blend,
+      })
+    else
+      -- A group's tile is the tile below widened by its halo, cut to the canvas.
+      local left = math.max(0, top.left - op.halo)
+      local up = math.max(0, top.top - op.halo)
+      local right = math.min(plan.width, top.left + top.width + op.halo)
+      local bottom = math.min(plan.height, top.top + top.height + op.halo)
+
+      stats.groups += 1
+      table.insert(stack, borrow(pool, depth + #stack, left, up, right - left, bottom - up, plan.space))
+      table.insert(frames, op)
+    end
+
+    index += 1
+  end
+end
+
+--- The bytes a render's working set needs at most: a tile for the base and one for each group level
+--- (each widened by the largest halo), a tile of filter scratch, and the output image.
+function Module.workingBytes(plan: Plan, tileSize: number): number
+  local depth, deepest, halo = 0, 0, 0
+
+  for _, op in plan.ops do
+    if op.kind == 'push' then
+      depth += 1
+      deepest = math.max(deepest, depth)
+      halo = math.max(halo, op.halo)
+    elseif op.kind == 'pop' then
+      depth -= 1
+    end
+  end
+
+  local wide = tileSize + 2 * halo * math.max(1, deepest)
+
+  return (1 + deepest + 2) * wide * wide * 16 + plan.width * plan.height * 4
+end
+
+local RenderKeys = { tileSize = true, reference = true, region = true, into = true, memoryBudgetBytes = true }
+
+--- Renders a plan (or a document, compiled first) into a straight RGBA8 image, tile by tile in
+--- row-major order. Returns the image and what the render did.
+function Module.image(source: Plan | scene.Document, options: RenderOptions?): (magick.Image, Stats)
+  if options then
+    for name in (options :: unknown) :: { [string]: unknown } do
+      if not RenderKeys[name] then error(`magick: unknown option {name}`, 2) end
+    end
+  end
+
+  local plan: Plan = if (source :: { [string]: unknown }).ops then source :: Plan else Module.compile(source :: scene.Document)
+  local reference = options and options.reference
+  local tileSize = if reference then math.max(plan.width, plan.height) else (if options and options.tileSize then options.tileSize else Module.DefaultTileSize)
+
+  if not finite(tileSize) or tileSize ~= math.floor(tileSize) or tileSize < 1 then error('magick: tileSize must be a whole number of at least 1', 2) end
+  if not reference and tileSize > Module.MaxTileSize then error(`magick: MaxTileEdge {Module.MaxTileSize} exceeded`, 2) end
+
+  local budget = if options and options.memoryBudgetBytes then options.memoryBudgetBytes else Module.DefaultBudgetBytes
+  local needed = Module.workingBytes(plan, tileSize)
+
+  if needed > budget then error(`magick: render needs {needed} bytes, budget is {budget}`, 2) end
+
+  local output = if options and options.into then options.into else magick.new(plan.width, plan.height)
+
+  if output.width ~= plan.width or output.height ~= plan.height then error('magick: the image to draw into must be the plan\'s size', 2) end
+
+  local region = if options and options.region then options.region else { 0, 0, plan.width, plan.height }
+  local stats: Stats = { tiles = 0, candidates = 0, rendered = 0, skipped = 0, groups = 0, peakTileBytes = 0 }
+  local pool: Pool = { tiles = {}, stats = stats, held = 0 }
+  local backdrop = plan.background
+  local solid = if backdrop then paint.solid({ 0, 0, 0, 0 }) else nil
+
+  for tileTop = math.max(0, region[2] // tileSize * tileSize), math.min(plan.height, region[4]) - 1, tileSize do
+    for tileLeft = math.max(0, region[1] // tileSize * tileSize), math.min(plan.width, region[3]) - 1, tileSize do
+      local width, height = math.min(tileSize, plan.width - tileLeft), math.min(tileSize, plan.height - tileTop)
+      local base = borrow(pool, 1, tileLeft, tileTop, width, height, plan.space)
+
+      if backdrop and solid then
+        for at = 0, width * height * 16 - 16, 16 do
+          buffer.writef32(base.data, at, backdrop[1])
+          buffer.writef32(base.data, at + 4, backdrop[2])
+          buffer.writef32(base.data, at + 8, backdrop[3])
+          buffer.writef32(base.data, at + 12, backdrop[4])
+        end
+      end
+
+      runOps(plan, plan.ops, base, pool, 1)
+      color.toImage(base, output)
+      stats.tiles += 1
+    end
+  end
+
+  return output, stats
+end
+
+return Module
