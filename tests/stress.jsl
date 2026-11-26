@@ -66,7 +66,8 @@ do
   print(`stress: 100k nodes: {plan.nodes} nodes, {plan.operations} operations, plan {plan.bytes // (1024 * 1024)} MiB, compiled in {string.format('%.2f', os.clock() - started)} s`)
 
   local began = os.clock()
-  local image, stats = render.image(plan, { workers = 4, memoryBudgetBytes = 1024 * 1024 * 1024 })
+  -- Four copies of a 366 MiB plan (its estimate), besides the working sets and the output: 2 GiB.
+  local image, stats = render.image(plan, { workers = 4, memoryBudgetBytes = 2 * 1024 * 1024 * 1024 })
 
   report('100k nodes, 4 workers', began, image, stats)
 
@@ -109,7 +110,8 @@ do
   print(`stress: 100k dabs: {dabs} dabs in {plan.operations} strokes, plan {plan.bytes // (1024 * 1024)} MiB, compiled in {string.format('%.2f', os.clock() - started)} s`)
 
   local began = os.clock()
-  local image, stats = render.image(plan, { workers = 4 })
+  -- Four copies of a 163 MiB plan, besides the working sets and the output: past the default 512 MiB.
+  local image, stats = render.image(plan, { workers = 4, memoryBudgetBytes = 1024 * 1024 * 1024 })
 
   report('100k dabs, 4 workers', began, image, stats)
 
