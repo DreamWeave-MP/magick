@@ -70,6 +70,10 @@ export type FillOptions = {
   clips: { path.Clip }?,
 }
 
+--- The empty list a paint holds where its kind has no channels, stops or geometry: frozen, like the
+--- rest of a paint.
+local Nothing: { number } = table.freeze({} :: { number })
+
 --- The most stops a gradient has.
 Module.MaxStops = 256
 
@@ -122,11 +126,11 @@ function Module.solid(fill: magick.Color, options: { opacity: number? }?): Paint
     transform = identity,
     inverse = identity,
     channels = table.freeze(channels),
-    offsets = {},
-    colors = {},
+    offsets = Nothing,
+    colors = Nothing,
     spread = 'pad',
     interpolation = 'srgb',
-    geometry = {},
+    geometry = Nothing,
   } :: Paint
 end
 
@@ -223,7 +227,7 @@ local function gradient(
     opacity = checkOpacity(if options then options.opacity else nil, 3),
     transform = matrix,
     inverse = inverse,
-    channels = {},
+    channels = Nothing,
     offsets = table.freeze(offsets),
     colors = table.freeze(colors),
     spread = spread,

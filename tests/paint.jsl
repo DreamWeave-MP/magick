@@ -76,6 +76,32 @@ suite.describe('solid', function()
       (value :: any).opacity = 0
     end).toThrow 'attempt to modify a readonly table'
   end)
+
+  suite.it('is frozen all the way down, every kind of paint', function()
+    local function unfrozen(value: unknown, where: string): string?
+      if type(value) ~= 'table' then return nil end
+      if not table.isfrozen(value :: { [unknown]: unknown }) then return where end
+
+      for key, inner in value :: { [unknown]: unknown } do
+        local found = unfrozen(inner, `{where}.{tostring(key)}`)
+
+        if found then return found end
+      end
+
+      return nil
+    end
+
+    local stops = paint.stops(0, '#000000', 1, '#ffffff')
+    local paints: { [string]: paint.Paint } = {
+      solid = paint.solid '#336699',
+      linear = paint.linear(0, 0, 10, 0, stops),
+      radial = paint.radial(5, 5, 5, stops, { focusX = 4 }),
+    }
+
+    for name, value in paints do
+      expect(unfrozen(value, name)).toBe(nil)
+    end
+  end)
 end)
 
 suite.describe('linear', function()
