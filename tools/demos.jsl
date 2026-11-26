@@ -17,6 +17,7 @@ local oil = require '../demos/oil'
 local heron = require '../demos/heron'
 local portrait = require '../demos/portrait'
 local monalisa = require '../demos/monalisa'
+local valleyPainted = require '../demos/valleypainted'
 
 --- The Mona Lisa's reference and its pinned SHA-256 (gallery/references/PROVENANCE.md).
 local MonaLisaReference = 'gallery/references/mona-lisa-500.png'
@@ -50,6 +51,12 @@ local Demos: { Demo } = {
     name = 'portrait',
     render = function(): magick.Image
       return (render.image(portrait.build()))
+    end,
+  },
+  {
+    name = 'valley-painted',
+    render = function(): magick.Image
+      return valleyPainted.build().image
     end,
   },
   {
