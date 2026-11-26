@@ -28,3 +28,8 @@ summary = "Anti-aliased paths through @magick/path, Image.screen and Image.scale
 version = "0.2.0"
 date = 2026-11-27
 summary = "Vector and paint foundation: retained paths and affine transforms, exact nonzero and evenodd coverage over tiles, strokes with joins, caps and dashes, premultiplied working tiles, gradients, patterns, the sixteen W3C blend modes and isolated groups."
+
+[[releases]]
+version = "0.3.0"
+date = 2026-11-25
+summary = "Retained canvas: typed scenes compiled to immutable plans, tiled rendering with the same bytes at every tile size and on Jess workers, group clips, masks, blur and shadow filters, and saved scenes."
