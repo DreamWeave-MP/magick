@@ -43,6 +43,9 @@ type Retained = {
   matrix: Matrix?,
   --- Whether the flattened points are taken in the other order, as `wound` turns a shape.
   reverse: boolean,
+  --- Whether the contour was closed on purpose, so a stroke joins its ends. One ended by a move, or
+  --- by rasterizing, is open to a stroke and closed to a fill, as in SVG.
+  closed: boolean,
 }
 
 type Outline = {
@@ -50,6 +53,8 @@ type Outline = {
   contours: { { number } },
   --- The commands each of `contours` was flattened from, one for one.
   retained: { Retained },
+  --- Subpaths of two points, which enclose nothing: kept for strokes, never filled.
+  lines: { Retained },
   --- The contour lines and curves are being added to, until the next move or close.
   open: { number }?,
   --- The commands of the open contour.
@@ -111,7 +116,7 @@ end
 
 --- An empty path whose curves are flattened to within `tolerance` pixels, or a quarter pixel.
 function Module.new(tolerance: number?): Path
-  local outline: Outline = { contours = {}, retained = {}, open = nil, drawing = nil, tolerance = tolerance or 0.25 }
+  local outline: Outline = { contours = {}, retained = {}, lines = {}, open = nil, drawing = nil, tolerance = tolerance or 0.25 }
 
   return setmetatable(outline, Path)
 end
@@ -339,7 +344,7 @@ local function wound(self: Path, points: { number }, hole: boolean, commands: { 
   local reverse = (area < 0) ~= hole
 
   table.insert(self.contours, if reverse then reversed(points) else points)
-  table.insert(self.retained, { commands = commands, matrix = nil, reverse = reverse })
+  table.insert(self.retained, { commands = commands, matrix = nil, reverse = reverse, closed = true })
 
   return self
 end
@@ -357,9 +362,30 @@ local function pointCommands(points: { number }): { number }
   return commands
 end
 
+--- Ends the open contour: a fill closes it whatever `closed` says, and a contour of fewer than
+--- three points is dropped from the fill as in 0.1.3, though one of two is kept for strokes.
+local function finish(self: Path, closed: boolean): Path
+  local points, commands = self.open, self.drawing
+
+  self.open, self.drawing = nil, nil
+
+  if not points or not commands then return self end
+
+  local contour: Retained = { commands = commands, matrix = nil, reverse = false, closed = closed }
+
+  if #points >= 6 then
+    table.insert(self.contours, points)
+    table.insert(self.retained, contour)
+  elseif #points == 4 then
+    table.insert(self.lines, contour)
+  end
+
+  return self
+end
+
 --- Starts a contour at a point, closing the one before it.
 function Path.moveTo(self: Path, toX: number, toY: number): Path
-  self:close()
+  finish(self, false)
   self.open = { toX, toY }
   self.drawing = { Point, toX, toY }
 
@@ -418,16 +444,7 @@ end
 --- Closes the open contour, if there is one, back to where it started. A contour drawn here
 --- keeps its own winding.
 function Path.close(self: Path): Path
-  local points, commands = self.open, self.drawing
-
-  self.open, self.drawing = nil, nil
-
-  if points and commands and #points >= 6 then
-    table.insert(self.contours, points)
-    table.insert(self.retained, { commands = commands, matrix = nil, reverse = false })
-  end
-
-  return self
+  return finish(self, true)
 end
 
 --- What draws into a path through plain functions, for a caller that hands outlines to whatever
@@ -628,15 +645,24 @@ function Path.transformBy(self: Path, matrix: Matrix): Path
 
   local out = Module.new(self.tolerance)
 
-  for _, contour in self.retained do
-    local moved: Retained = {
+  local function moved(contour: Retained): Retained
+    return {
       commands = contour.commands,
       matrix = if contour.matrix then transform.multiply(matrix, contour.matrix) else matrix,
       reverse = contour.reverse,
+      closed = contour.closed,
     }
+  end
 
-    table.insert(out.retained, moved)
-    table.insert(out.contours, flattenRetained(moved, nil, self.tolerance))
+  for _, contour in self.retained do
+    local each = moved(contour)
+
+    table.insert(out.retained, each)
+    table.insert(out.contours, flattenRetained(each, nil, self.tolerance))
+  end
+
+  for _, line in self.lines do
+    table.insert(out.lines, moved(line))
   end
 
   return out
@@ -655,6 +681,8 @@ function Path.append(self: Path, other: Path): Path
     table.insert(self.contours, table.clone(points))
     table.insert(self.retained, other.retained[index])
   end
+
+  table.move(other.lines, 1, #other.lines, #self.lines + 1, self.lines)
 
   return self
 end
@@ -820,6 +848,397 @@ function Path.deviceBounds(self: Path, matrix: Matrix?, halfWidth: number?): (nu
   local inflate = (halfWidth or 0) * transform.sigmaMax(chosen)
 
   return left - inflate, top - inflate, right + inflate, bottom + inflate
+end
+
+--- How the segments of a stroke meet: at a point (cut off past `miterLimit`), round, or cut flat.
+export type Join = 'miter' | 'round' | 'bevel'
+
+--- The options of `stroked`. Lengths are in the path's space (user space); `transform` is where the
+--- stroke will be drawn, and only sets how finely the centerline is flattened.
+export type StrokeOptions = {
+  width: number,
+  --- `miter` (the default), `round` or `bevel`.
+  join: Join?,
+  --- The longest a miter may be, in widths: past it a join is a bevel. 4 by default, at least 1.
+  miterLimit: number?,
+  --- `butt` (the default), `round` or `square`, at the ends of open subpaths and of dashes.
+  cap: Cap?,
+  --- Lengths drawn and skipped by turns, at most MaxDashEntries; an empty list or all zeros is solid.
+  dashes: { number }?,
+  --- How far into the dash pattern the stroke starts.
+  dashOffset: number?,
+  transform: Matrix?,
+  --- The device tolerance the centerline is flattened to; the path's own when left out.
+  tolerance: number?,
+}
+
+--- The most entries a dash pattern has, and the most dashes one stroke draws.
+Module.MaxDashEntries = 64
+Module.MaxDashesPerStroke = 1048576
+
+local StrokeKeys = {
+  width = true,
+  join = true,
+  miterLimit = true,
+  cap = true,
+  dashes = true,
+  dashOffset = true,
+  transform = true,
+  tolerance = true,
+}
+
+--- Adds a piece of a stroke: a polygon through flat points, wound as a shape.
+local function piece(out: Path, points: { number })
+  wound(out, points, false, pointCommands(points))
+end
+
+--- Adds a round piece about a center: a whole disc, or the wedge of an arc between two angles.
+local function roundPiece(out: Path, centerX: number, centerY: number, half: number, from: number?, to: number?)
+  if not from or not to then
+    out:circle(centerX, centerY, half)
+
+    return
+  end
+
+  local commands = { Point, centerX, centerY, Arc, centerX, centerY, half, half, from, to }
+
+  wound(out, flattenCommands(commands, nil, out.tolerance), false, commands)
+end
+
+--- The cap of one end of a stroke at a point, the stroke running along `alongX, alongY` away from it.
+local function capEnd(out: Path, cap: Cap, pointX: number, pointY: number, alongX: number, alongY: number, half: number)
+  if cap == 'round' then
+    roundPiece(out, pointX, pointY, half)
+  elseif cap == 'square' then
+    local sideX, sideY = -alongY * half, alongX * half
+    local backX, backY = pointX - alongX * half, pointY - alongY * half
+
+    piece(out, { pointX + sideX, pointY + sideY, pointX - sideX, pointY - sideY, backX - sideX, backY - sideY, backX + sideX, backY + sideY })
+  end
+end
+
+--- The join at a point between a segment arriving along `inX, inY` and one leaving along
+--- `outX, outY`, both unit vectors: a piece on the outside of the turn.
+local function joinAt(
+  out: Path,
+  join: Join,
+  limit: number,
+  pointX: number,
+  pointY: number,
+  inX: number,
+  inY: number,
+  outX: number,
+  outY: number,
+  half: number
+)
+  local cross, dot = inX * outY - inY * outX, inX * outX + inY * outY
+
+  if math.abs(cross) <= 1e-12 then
+    -- Straight on needs nothing; straight back is a half turn, which only a round join fills.
+    if dot > 0 then return end
+    if join == 'round' then roundPiece(out, pointX, pointY, half) end
+
+    return
+  end
+
+  -- The outside of a turn toward the left normal (-y, x) is its right, and the other way about.
+  local side = if cross > 0 then -half else half
+  local inSideX, inSideY = -inY * side, inX * side
+  local outSideX, outSideY = -outY * side, outX * side
+
+  if join == 'round' then
+    local from = math.atan2(inSideY, inSideX)
+    local turn = (math.atan2(outSideY, outSideX) - from + math.pi) % (2 * math.pi) - math.pi
+
+    roundPiece(out, pointX, pointY, half, from, from + turn)
+
+    return
+  end
+
+  -- The miter's length over the width is 1 / sin(interior / 2), which is 1 / cos(turn / 2).
+  local cosHalf = math.sqrt(math.max(0, (1 + dot) / 2))
+
+  if join == 'miter' and cosHalf > 0 and 1 / cosHalf <= limit then
+    local reach = 1 / (2 * cosHalf * cosHalf)
+    local tipX, tipY = pointX + (inSideX + outSideX) * reach, pointY + (inSideY + outSideY) * reach
+
+    piece(out, { pointX, pointY, pointX + inSideX, pointY + inSideY, tipX, tipY, pointX + outSideX, pointY + outSideY })
+
+    return
+  end
+
+  piece(out, { pointX, pointY, pointX + inSideX, pointY + inSideY, pointX + outSideX, pointY + outSideY })
+end
+
+--- Strokes a centerline of distinct points: a band along each segment, a join at each corner,
+--- and caps at the ends of an open one, or a lone point's cap where it has no length.
+local function strokeLine(out: Path, points: { number }, closed: boolean, half: number, join: Join, limit: number, cap: Cap)
+  local count = #points // 2
+
+  if count == 0 then return end
+
+  if count == 1 then
+    -- A point with no length draws both its caps about itself: a disc, or a square.
+    if cap ~= 'butt' then
+      capEnd(out, cap, points[1], points[2], 1, 0, half)
+      capEnd(out, cap, points[1], points[2], -1, 0, half)
+    end
+
+    return
+  end
+
+  local segments = if closed and count > 2 then count else count - 1
+  local directions: { number } = table.create(segments * 2) :: { number }
+
+  for segment = 1, segments do
+    local fromX, fromY = points[segment * 2 - 1], points[segment * 2]
+    local next = segment % count + 1
+    local toX, toY = points[next * 2 - 1], points[next * 2]
+    local length = math.sqrt((toX - fromX) ^ 2 + (toY - fromY) ^ 2)
+    local alongX, alongY = (toX - fromX) / length, (toY - fromY) / length
+    local sideX, sideY = -alongY * half, alongX * half
+
+    directions[segment * 2 - 1], directions[segment * 2] = alongX, alongY
+    piece(out, { fromX + sideX, fromY + sideY, toX + sideX, toY + sideY, toX - sideX, toY - sideY, fromX - sideX, fromY - sideY })
+  end
+
+  local isClosed = segments == count
+
+  for corner = if isClosed then 1 else 2, if isClosed then count else count - 1 do
+    local before = if corner == 1 then segments else corner - 1
+
+    joinAt(
+      out,
+      join,
+      limit,
+      points[corner * 2 - 1],
+      points[corner * 2],
+      directions[before * 2 - 1],
+      directions[before * 2],
+      directions[corner * 2 - 1],
+      directions[corner * 2],
+      half
+    )
+  end
+
+  if isClosed then return end
+
+  capEnd(out, cap, points[1], points[2], directions[1], directions[2], half)
+  capEnd(out, cap, points[count * 2 - 1], points[count * 2], -directions[segments * 2 - 1], -directions[segments * 2], half)
+end
+
+--- A centerline's points with every repeated point dropped, and its last point too when a closed
+--- line returns to its first.
+local function distinct(points: { number }, closed: boolean): { number }
+  local out: { number } = {}
+
+  for index = 1, #points - 1, 2 do
+    local count = #out
+
+    if count == 0 or points[index] ~= out[count - 1] or points[index + 1] ~= out[count] then
+      table.insert(out, points[index])
+      table.insert(out, points[index + 1])
+    end
+  end
+
+  if closed and #out >= 4 and out[1] == out[#out - 1] and out[2] == out[#out] then
+    table.remove(out)
+    table.remove(out)
+  end
+
+  return out
+end
+
+--- Cuts a centerline into dashes: open lines of distinct points, `on` lengths drawn and `off`
+--- lengths skipped by turns from `offset` into the pattern.
+local function dashed(points: { number }, closed: boolean, dashes: { number }, offset: number, budget: { number }): { { number } }
+  local lines: { { number } } = {}
+  local count = #points // 2
+  local segments = if closed then count else count - 1
+  local entry, remaining = 1, dashes[1]
+  local phase = offset
+
+  while phase > 0 do
+    if phase < remaining then
+      remaining -= phase
+      phase = 0
+    else
+      phase -= remaining
+      entry = entry % #dashes + 1
+      remaining = dashes[entry]
+    end
+  end
+
+  local current: { number }? = nil
+
+  local function begin(pointX: number, pointY: number)
+    budget[1] += 1
+    if budget[1] > Module.MaxDashesPerStroke then error(`magick: MaxDashesPerStroke {Module.MaxDashesPerStroke} exceeded`, 5) end
+
+    current = { pointX, pointY }
+    table.insert(lines, current :: { number })
+  end
+
+  if entry % 2 == 1 then begin(points[1], points[2]) end
+
+  for segment = 1, segments do
+    local fromX, fromY = points[segment * 2 - 1], points[segment * 2]
+    local next = segment % count + 1
+    local toX, toY = points[next * 2 - 1], points[next * 2]
+    local length = math.sqrt((toX - fromX) ^ 2 + (toY - fromY) ^ 2)
+    local travelled = 0
+
+    -- A dash boundary exactly at a segment's end is taken here, so a dash that starts at the very
+    -- end of the line is drawn, as a point.
+    while length - travelled >= remaining do
+      travelled += remaining
+
+      local along = travelled / length
+      local pointX, pointY = fromX + (toX - fromX) * along, fromY + (toY - fromY) * along
+      local drawing = current
+
+      if drawing then
+        table.insert(drawing, pointX)
+        table.insert(drawing, pointY)
+        current = nil
+      end
+
+      entry = entry % #dashes + 1
+      remaining = dashes[entry]
+      if entry % 2 == 1 then begin(pointX, pointY) end
+    end
+
+    remaining -= length - travelled
+
+    local drawing = current
+
+    if drawing then
+      table.insert(drawing, toX)
+      table.insert(drawing, toY)
+    end
+  end
+
+  local out: { { number } } = {}
+
+  for _, line in lines do
+    table.insert(out, distinct(line, false))
+  end
+
+  return out
+end
+
+local function checkDashes(dashes: { number }?): { number }?
+  if not dashes or #dashes == 0 then return nil end
+  if #dashes > Module.MaxDashEntries then error(`magick: MaxDashEntries {Module.MaxDashEntries} exceeded`, 4) end
+
+  local total = 0
+
+  for _, length in dashes do
+    if not finite(length) or length < 0 then error('magick: dash lengths must be finite and not negative', 4) end
+
+    total += length
+  end
+
+  if total <= 0 then return nil end
+
+  -- An odd pattern repeats twice over, so that on and off swap places the second time, as SVG has it.
+  if #dashes % 2 == 1 then
+    local doubled = table.clone(dashes)
+
+    table.move(dashes, 1, #dashes, #doubled + 1, doubled)
+
+    return doubled
+  end
+
+  return dashes
+end
+
+--- The outline of the path's stroke, as a new path of pieces that overlap: a band along each
+--- segment, a join at each corner, caps at the ends of open subpaths and dashes. Their union is
+--- the stroke, which is what `coverageIn` (nonzero) covers; the 0.1.3 `mask` sums overlaps and is
+--- not the call for it. Curves in the centerline are flattened to the tolerance over the most the
+--- options' transform stretches; round joins and caps stay arcs.
+function Path.stroked(self: Path, options: StrokeOptions): Path
+  for name in (options :: unknown) :: { [string]: unknown } do
+    if not StrokeKeys[name] then error(`magick: unknown option {name}`, 2) end
+  end
+
+  local width = options.width
+
+  if type(width) ~= 'number' or not finite(width) or width < 0 then error('magick: stroke width must be finite and not negative', 2) end
+  if width > transform.MaxCoordinate then error(`magick: MaxCoordinate {transform.MaxCoordinate} exceeded`, 2) end
+
+  local join, cap = options.join or 'miter', options.cap or 'butt'
+
+  if join ~= 'miter' and join ~= 'round' and join ~= 'bevel' then error(`magick: unknown join {join}`, 2) end
+  if cap ~= 'butt' and cap ~= 'round' and cap ~= 'square' then error(`magick: unknown cap {cap}`, 2) end
+
+  local limit = options.miterLimit or 4
+
+  if not finite(limit) or limit < 1 then error('magick: miterLimit must be finite and at least 1', 2) end
+
+  local offset = options.dashOffset or 0
+
+  if not finite(offset) then error('magick: dashOffset must be finite', 2) end
+
+  local dashes = checkDashes(options.dashes)
+  local matrix = options.transform
+
+  if matrix then transform.check(matrix) end
+
+  finish(self, false)
+  checkCommands(self)
+
+  local out = Module.new(self.tolerance)
+  local half = width / 2
+
+  if half == 0 then return out end
+
+  local tolerance = deviceTolerance(self, options.tolerance) / (if matrix then transform.sigmaMax(matrix) else 1)
+  local budget = { 0 }
+
+  local function strokeContour(contour: Retained)
+    local points = distinct(flattenCommands(contour.commands, contour.matrix, tolerance), contour.closed)
+
+    if not dashes then
+      strokeLine(out, points, contour.closed, half, join, limit, cap)
+
+      return
+    end
+
+    local period, travel = 0, 0
+
+    for _, length in dashes do
+      period += length
+    end
+
+    for index = 3, #points - 1, 2 do
+      travel += math.sqrt((points[index] - points[index - 2]) ^ 2 + (points[index + 1] - points[index - 1]) ^ 2)
+    end
+
+    if contour.closed and #points >= 4 then
+      travel += math.sqrt((points[1] - points[#points - 1]) ^ 2 + (points[2] - points[#points]) ^ 2)
+    end
+
+    -- Each period draws at most half its entries as dashes: refuse before building them.
+    if budget[1] + (travel / period + 2) * #dashes / 2 > Module.MaxDashesPerStroke then
+      error(`magick: MaxDashesPerStroke {Module.MaxDashesPerStroke} exceeded`, 3)
+    end
+
+    for _, line in dashed(points, contour.closed, dashes, offset % period, budget) do
+      strokeLine(out, line, false, half, join, limit, cap)
+    end
+  end
+
+  for _, contour in self.retained do
+    strokeContour(contour)
+  end
+
+  for _, line in self.lines do
+    strokeContour(line)
+  end
+
+  return out
 end
 
 --- Checks a window: whole numbers, its edges at most MaxImageEdge.
@@ -1012,7 +1431,7 @@ end
 --- The path's coverage over the pixels its bounds touch, and where that mask's top left corner
 --- is in the image the path was drawn for.
 function Path.mask(self: Path): (magick.Mask, number, number)
-  self:close()
+  finish(self, false)
 
   local minX, minY, maxX, maxY = self:bounds()
   local left, top = math.floor(minX), math.floor(minY)
