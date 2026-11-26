@@ -447,6 +447,13 @@ function Path.close(self: Path): Path
   return finish(self, true)
 end
 
+--- Ends the open contour, if there is one, without closing it: a stroke leaves its ends apart, and
+--- a fill closes it as fills always do. `mask`, `stroked` and the brush samples of /art do this
+--- first.
+function Path.finish(self: Path): Path
+  return finish(self, false)
+end
+
 --- What draws into a path through plain functions, for a caller that hands outlines to whatever
 --- it is given (a font reader, a vector format) and knows nothing of paths.
 export type Pen = {

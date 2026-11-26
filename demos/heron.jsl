@@ -1,0 +1,172 @@
+--!strict
+-- "Heron at Dusk", ink and watercolor: the Atelier showcase, and MAG-035's whole art script.
+--
+-- Everything is a scene node and a public API: a parchment sheet from @magick/material, washes laid
+-- with the watercolor preset (wet edges, granulation in the paper's grain, multiply glazes), reeds and
+-- a heron drawn with the ink preset along vector curves by `art.samples`, ripples, a monoline title
+-- and a seal. It is built at 800 by 1000 and renders at any size by its root transform.
+local art = require '@magick/art'
+local brush = require '@magick/brush'
+local material = require '@magick/material'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local scene = require '@magick/scene'
+local text = require '@magick/text'
+local transform = require '@magick/transform'
+
+local Width, Height = 800, 1000
+
+--- A watercolor wash: a few broad horizontal strokes across a band, glazing over one another.
+local function wash(document: scene.Document, parent: scene.Node, seed: number, top: number, bottom: number, tint: string, grain: unknown)
+  local band = bottom - top
+
+  for pass = 0, math.max(1, math.floor(band / 70)) do
+    local down = top + pass * 70 + 30
+    local stroke: { brush.Sample } = {}
+
+    for step = 0, 16 do
+      local across = -60 + step * (Width + 120) / 16
+
+      table.insert(stroke, { across, down + math.sin(step * 0.8 + pass * 2.1 + seed) * 14, 0.75 + 0.25 * math.sin(step * 0.5 + pass) })
+    end
+
+    local settings = brush.preset('watercolor', 150, tint, { grain = grain, flow = 0.32, edge = 0.3, spacing = 0.07 })
+
+    parent:add(document:stroke(stroke, settings, { seed = seed + pass }))
+  end
+end
+
+--- Builds the illustration at `width` by `height` pixels.
+local function build(width: number, height: number): scene.Document
+  local document = scene.new(width, height, { background = '#f3ead6', space = 'linear', seed = 1814 })
+  local sheet = document:add(document:group { name = 'sheet' })
+  local paper = brush.paper(17, 2.4)
+
+  sheet:set { transform = transform.scale(width / Width, height / Height) }
+
+  -- The sheet itself, stained a little at its edges.
+  sheet:add(document:shape(path.new():rect(0, 0, Width, Height), { fill = material.parchment { seed = 3, scale = 260 } }))
+
+  -- Washes: a warm sky into a cool distance, glazed one over another by the preset's multiply.
+  local washes = sheet:add(document:group { name = 'washes', opacity = 0.85 })
+
+  wash(document, washes, 10, 40, 420, '#f2c890', paper)
+  wash(document, washes, 30, 300, 560, '#c8a8c8', paper)
+  wash(document, washes, 50, 640, 980, '#9ab8c0', paper)
+
+  -- A pale sun, its edge softened into the sky.
+  washes:add(document:shape(path.new():circle(560, 260, 42), {
+    fill = paint.radial(560, 260, 42, paint.stops(0, '#f08a50e0', 0.7, '#f2a060c0', 1, '#f2b07000')),
+    blend = 'multiply',
+  }))
+
+  -- Far hills: one long wet stroke each, darker as they come nearer.
+  for index, hill in { { 540, '#b8a0c0' }, { 585, '#9a88b0' } } do
+    local ridge = path.new():moveTo(-20, hill[1] :: number)
+
+    for step = 1, 9 do
+      local across = step * 100 - 20
+      local down = (hill[1] :: number) - 40 * math.abs(math.sin(step * 0.9 + index)) - 10 * index
+
+      ridge:quadTo(across - 50, down - 18, across, down)
+    end
+
+    sheet:add(document:stroke(art.samples(ridge, function(): number
+      return 0.9
+    end, 4), brush.preset('watercolor', 80, hill[2] :: string, { grain = paper, flow = 0.5, edge = 0.6 }), { seed = 80 + index }))
+  end
+
+  -- Reeds: ink strokes rising from the water, pressing hard at the root and lifting at the tip.
+  local ink = brush.preset('ink', 6, '#1c1a20')
+  local reeds = sheet:add(document:group { name = 'reeds' })
+
+  for index, place in art.scatter(5, 48, { 20, 860, 780, 980 }) do
+    if place[1] > 300 and place[1] < 560 then continue end
+
+    local tall = 220 + place[3] * 260
+    local lean = (place[3] - 0.5) * 90
+    local reed = path.new():moveTo(place[1], place[2]):quadTo(place[1] + lean * 0.3, place[2] - tall * 0.6, place[1] + lean, place[2] - tall)
+
+    reeds:add(document:stroke(art.samples(reed, function(along: number): number
+      return 1 - along * 0.85
+    end), ink, { seed = 100 + index }))
+
+    if place[3] > 0.55 then
+      local tip = { { place[1] + lean, place[2] - tall - 4, 0.8 }, { place[1] + lean * 1.02, place[2] - tall - 34, 0.6 } }
+
+      reeds:add(document:stroke(tip, brush.preset('oil', 11, '#6a4a2a'), { seed = 200 + index }))
+    end
+  end
+
+  -- The heron: a gray wash for its body, then ink for its neck, crown, beak and legs.
+  local heron = sheet:add(document:group { name = 'heron' })
+  local body = path.new()
+    :moveTo(380, 492)
+    :cubicTo(430, 462, 540, 488, 640, 600)
+    :cubicTo(600, 612, 560, 618, 520, 640)
+    :cubicTo(470, 660, 420, 650, 400, 620)
+    :cubicTo(378, 588, 368, 540, 380, 492)
+    :close()
+
+  heron:add(document:shape(body, { fill = paint.linear(400, 480, 600, 660, paint.stops(0, '#b4b4c0', 0.5, '#8a8a9a', 1, '#5a5a6a')), opacity = 0.8 }))
+  heron:add(document:stroke(art.samples(body, function(along: number): number
+    return 0.45 + 0.55 * math.sin(along * math.pi)
+  end), brush.preset('ink', 6, '#1c1a20'), { seed = 300 }))
+
+  -- The folded wing and its long tail plumes, in quick lifting strokes.
+  for index = 0, 6 do
+    local startX, startY = 430 + index * 24, 520 + index * 9
+    local feather = path.new():moveTo(startX, startY):quadTo(startX + 60, startY + 20, startX + 120 - index * 6, startY + 56 - index * 2)
+
+    heron:add(document:stroke(art.samples(feather, function(along: number): number
+      return 0.9 - along * 0.8
+    end), brush.preset('ink', 3, '#2a2830'), { seed = 320 + index }))
+  end
+
+  for index = 0, 3 do
+    local plume = path.new():moveTo(600, 596 + index * 5):quadTo(650, 620 + index * 6, 690 - index * 8, 660 + index * 10)
+
+    heron:add(document:stroke(art.samples(plume, function(along: number): number
+      return 0.7 - along * 0.6
+    end), brush.preset('ink', 3, '#2a2830'), { seed = 340 + index }))
+  end
+
+  local neck = path.new():moveTo(384, 492):cubicTo(330, 450, 410, 400, 368, 352):cubicTo(350, 333, 330, 330, 322, 338)
+
+  heron:add(document:stroke(art.samples(neck, function(along: number): number
+    return 1 - along * 0.4
+  end), brush.preset('ink', 9, '#1c1a20'), { seed = 301 }))
+
+  local beak = { { 330, 334, 0.9 }, { 280, 344, 0.6 }, { 238, 352, 0.2 } }
+
+  heron:add(document:stroke(beak, ink, { seed = 302 }))
+  heron:add(document:stroke({ { 338, 328, 1 }, { 372, 322, 0.6 }, { 410, 334, 0.15 } }, brush.preset('ink', 4, '#1c1a20'), { seed = 303 }))
+  heron:add(document:shape(path.new():circle(334, 334, 2.6), { fill = paint.solid '#f0e0a0' }))
+
+  for index, leg in { { 446, 640, 456, 760, 444, 880 }, { 476, 640, 498, 752, 490, 874 } } do
+    local line = path.new():moveTo(leg[1], leg[2]):quadTo(leg[3], leg[4], leg[5], leg[6])
+
+    heron:add(document:stroke(art.samples(line), brush.preset('ink', 4, '#1c1a20'), { seed = 310 + index }))
+  end
+
+  -- Ripples about its legs, broken and thinning out.
+  for index, place in art.scatter(9, 14, { 380, 872, 560, 940 }) do
+    local half = 18 + place[3] * 40
+
+    sheet:add(document:stroke({ { place[1] - half, place[2], 0.2 }, { place[1], place[2] + 1, 0.7 }, { place[1] + half, place[2], 0.2 } }, brush.preset('ink', 3, '#3a3a48'), { seed = 400 + index }))
+  end
+
+  -- Title and seal.
+  local title = text.path(text.monoline(6), 'HERON AT DUSK', Width / 2, 960, 30, { align = 'center', tracking = 0.12 })
+
+  sheet:add(document:shape(title, { fill = paint.solid '#2a2830', opacity = 0.85 }))
+
+  local seal = sheet:add(document:group { name = 'seal', opacity = 0.9 })
+
+  seal:add(document:shape(path.new():roundRect(704, 900, 752, 948, 4), { fill = paint.solid '#b8302a' }))
+  seal:add(document:shape(text.path(text.monoline(9), 'MK', 728, 934, 24, { align = 'center' }), { fill = paint.solid '#f3ead6' }))
+
+  return document
+end
+
+return { name = 'heron', build = build, width = Width, height = Height }
