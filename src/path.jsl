@@ -16,17 +16,43 @@ one path join; `ring` and `frame` wind their inner contour the other way, and ar
 
 The coverage is accumulated as signed areas a row at a time, the technique Raph Levien's
 font-rs (MIT OR Apache-2.0) describes; this is a separate implementation of it.
+
+Since 0.2.0 a path also keeps what it was drawn with (RFC-0001 P1): each closed contour carries its
+commands (points, quadratic and cubic curves, elliptical arcs) and the matrix it has been moved by.
+`contours` stays what 0.1.3 made, the contours flattened at the path's tolerance, so every 0.1.x
+call reads the points it always did. `transformBy`, `flatten` and `deviceBounds`
+flatten the commands again under their matrix, to a tolerance in device pixels, so a curve drawn
+small and shown large is as smooth as one drawn large.
 ]]
 local magick = require '@magick'
+local transform = require '@magick/transform'
+
+type Matrix = transform.Matrix
 
 local Path = {}
 Path.__index = Path
 
+--- What a contour was drawn with: a flat list of commands, each an opcode and its numbers.
+--- `Point x y` adds a point; `Quad cx cy x y` and `Cubic ax ay bx by x y` a curve from the last
+--- point; `Arc cx cy rx ry from to` the points of an arc, its first included; `Ellipse cx cy rx ry`
+--- a whole ellipse.
+type Retained = {
+  commands: { number },
+  --- Where the commands have been moved to; nil where they are as drawn.
+  matrix: Matrix?,
+  --- Whether the flattened points are taken in the other order, as `wound` turns a shape.
+  reverse: boolean,
+}
+
 type Outline = {
   --- Each contour's points as x, y pairs in one flat list.
   contours: { { number } },
+  --- The commands each of `contours` was flattened from, one for one.
+  retained: { Retained },
   --- The contour lines and curves are being added to, until the next move or close.
   open: { number }?,
+  --- The commands of the open contour.
+  drawing: { number }?,
   --- The farthest a flattened curve strays from the curve, in pixels.
   tolerance: number,
 }
@@ -38,11 +64,25 @@ export type Path = typeof(setmetatable({} :: Outline, Path))
 --- past them.
 export type Cap = 'butt' | 'round' | 'square'
 
+local Point, Quad, Cubic, Arc, Ellipse = 1, 2, 3, 4, 5
+
 local Module = {}
+
+--- The most pieces one curve or arc is flattened into.
+Module.MaxPiecesPerCurve = 16384
+--- The most commands one path may hold when it is flattened by a 0.2.0 call.
+Module.MaxCommandsPerPath = 1048576
+
+--- A piece count, refused past the cap. NaN passes through, as 0.1.3 let it.
+local function capped(pieces: number): number
+  if pieces > Module.MaxPiecesPerCurve then error(`magick: MaxPiecesPerCurve {Module.MaxPiecesPerCurve} exceeded`, 4) end
+
+  return pieces
+end
 
 --- An empty path whose curves are flattened to within `tolerance` pixels, or a quarter pixel.
 function Module.new(tolerance: number?): Path
-  local outline: Outline = { contours = {}, open = nil, tolerance = tolerance or 0.25 }
+  local outline: Outline = { contours = {}, retained = {}, open = nil, drawing = nil, tolerance = tolerance or 0.25 }
 
   return setmetatable(outline, Path)
 end
@@ -76,54 +116,21 @@ local function reversed(points: { number }): { number }
   return out
 end
 
---- Adds a closed contour wound as a shape (`hole` false) or as a hole in one, whichever way its
---- points go.
-local function wound(self: Path, points: { number }, hole: boolean): Path
-  if #points < 6 then return self end
-
-  local area = signedArea(points)
-
-  if area == 0 then return self end
-
-  table.insert(self.contours, if (area < 0) ~= hole then reversed(points) else points)
-
-  return self
-end
-
---- Starts a contour at a point, closing the one before it.
-function Path.moveTo(self: Path, toX: number, toY: number): Path
-  self:close()
-  self.open = { toX, toY }
-
-  return self
-end
-
---- The open contour, or an error naming the drawing call that needs one.
-local function opened(self: Path, call: string): { number }
-  local points = self.open
-  if not points then error(`magick: path.{call} needs a moveTo first`, 3) end
-
-  return points
-end
-
---- Adds a straight line from the current point.
-function Path.lineTo(self: Path, toX: number, toY: number): Path
-  local points = opened(self, 'lineTo')
-
-  table.insert(points, toX)
-  table.insert(points, toY)
-
-  return self
-end
-
---- Adds a quadratic curve from the current point through a control point.
-function Path.quadTo(self: Path, controlX: number, controlY: number, toX: number, toY: number): Path
-  local points = opened(self, 'quadTo')
-  local fromX, fromY = points[#points - 1], points[#points]
-  -- A quadratic's chord strays by its second difference over eight, shrinking with the square of
-  -- the number of pieces.
+--- Appends a quadratic's points after its start, in pieces few enough that a chord strays from the
+--- curve by at most twice `tolerance`: its second difference over eight, shrinking with the square
+--- of the number of pieces.
+local function quadPoints(
+  points: { number },
+  fromX: number,
+  fromY: number,
+  controlX: number,
+  controlY: number,
+  toX: number,
+  toY: number,
+  tolerance: number
+)
   local bendX, bendY = fromX - 2 * controlX + toX, fromY - 2 * controlY + toY
-  local pieces = math.max(1, math.ceil(math.sqrt(math.sqrt(bendX * bendX + bendY * bendY) / (8 * self.tolerance))))
+  local pieces = capped(math.max(1, math.ceil(math.sqrt(math.sqrt(bendX * bendX + bendY * bendY) / (8 * tolerance)))))
 
   for piece = 1, pieces do
     local along = piece / pieces
@@ -132,6 +139,231 @@ function Path.quadTo(self: Path, controlX: number, controlY: number, toX: number
     table.insert(points, rest * rest * fromX + 2 * rest * along * controlX + along * along * toX)
     table.insert(points, rest * rest * fromY + 2 * rest * along * controlY + along * along * toY)
   end
+end
+
+--- Appends a cubic's points after its start: a chord strays by at most three quarters of the larger
+--- second difference, shrinking with the square of the number of pieces.
+local function cubicPoints(
+  points: { number },
+  fromX: number,
+  fromY: number,
+  firstX: number,
+  firstY: number,
+  secondX: number,
+  secondY: number,
+  toX: number,
+  toY: number,
+  tolerance: number
+)
+  local leadX, leadY = fromX - 2 * firstX + secondX, fromY - 2 * firstY + secondY
+  local tailX, tailY = firstX - 2 * secondX + toX, firstY - 2 * secondY + toY
+  local bend = math.max(math.sqrt(leadX * leadX + leadY * leadY), math.sqrt(tailX * tailX + tailY * tailY))
+  local pieces = capped(math.max(1, math.ceil(math.sqrt(0.75 * bend / tolerance))))
+
+  for piece = 1, pieces do
+    local along = piece / pieces
+    local rest = 1 - along
+    local start, early, late, finish = rest * rest * rest, 3 * rest * rest * along, 3 * rest * along * along, along * along * along
+
+    table.insert(points, start * fromX + early * firstX + late * secondX + finish * toX)
+    table.insert(points, start * fromY + early * firstY + late * secondY + finish * toY)
+  end
+end
+
+--- The points of an elliptical arc about a center, from one angle to another in radians,
+--- flattened to within a tolerance, appended to `points`.
+local function arc(
+  points: { number },
+  centerX: number,
+  centerY: number,
+  radiusX: number,
+  radiusY: number,
+  from: number,
+  to: number,
+  tolerance: number
+)
+  local radius = math.max(radiusX, radiusY)
+  -- A chord of angle `step` strays from its arc by radius * (1 - cos(step / 2)).
+  local step = if radius > tolerance then 2 * math.acos(1 - tolerance / radius) else math.pi / 2
+  local pieces = capped(math.max(2, math.ceil(math.abs(to - from) / step)))
+  local turn = math.abs(to - from) / pieces
+  -- Chords cut inside the arc, so the points between them are pushed out until the polygon
+  -- encloses the area the arc does: a whole circle's chords enclose r^2 * n * sin(turn) / 2. The
+  -- ends of an arc that isn't whole stay on it, where the straight edges it meets begin.
+  local outward = math.sqrt(turn / math.sin(turn))
+  local whole = math.abs(to - from) >= 2 * math.pi
+
+  for piece = 0, pieces do
+    local angle = from + (to - from) * piece / pieces
+    local reach = if whole or (piece > 0 and piece < pieces) then outward else 1
+
+    table.insert(points, centerX + radiusX * reach * math.cos(angle))
+    table.insert(points, centerY + radiusY * reach * math.sin(angle))
+  end
+end
+
+--- The points of an ellipse about a center.
+local function ellipsePoints(centerX: number, centerY: number, radiusX: number, radiusY: number, tolerance: number): { number }
+  local points: { number } = {}
+
+  arc(points, centerX, centerY, radiusX, radiusY, 0, 2 * math.pi, tolerance)
+  -- The last point is the first again.
+  table.remove(points)
+  table.remove(points)
+
+  return points
+end
+
+--- Flattens retained commands under `matrix` (nil for as drawn) to `tolerance` device pixels.
+--- Points and curve control points move first and curves flatten in device space; an arc
+--- flattens in its own space to the tolerance divided by the most the matrix stretches, and its
+--- points then move. With no matrix this is the arithmetic the 0.1.3 drawing calls do.
+local function flattenCommands(commands: { number }, matrix: Matrix?, tolerance: number): { number }
+  local points: { number } = {}
+  local index, count = 1, #commands
+  local userTolerance = if matrix then tolerance / transform.sigmaMax(matrix) else tolerance
+
+  while index <= count do
+    local command = commands[index]
+
+    if command == Point then
+      local pointX, pointY = commands[index + 1], commands[index + 2]
+
+      if matrix then pointX, pointY = transform.apply(matrix, pointX, pointY) end
+
+      table.insert(points, pointX)
+      table.insert(points, pointY)
+      index += 3
+    elseif command == Quad then
+      local controlX, controlY, toX, toY = commands[index + 1], commands[index + 2], commands[index + 3], commands[index + 4]
+
+      if matrix then
+        controlX, controlY = transform.apply(matrix, controlX, controlY)
+        toX, toY = transform.apply(matrix, toX, toY)
+      end
+
+      quadPoints(points, points[#points - 1], points[#points], controlX, controlY, toX, toY, tolerance)
+      index += 5
+    elseif command == Cubic then
+      local firstX, firstY = commands[index + 1], commands[index + 2]
+      local secondX, secondY = commands[index + 3], commands[index + 4]
+      local toX, toY = commands[index + 5], commands[index + 6]
+
+      if matrix then
+        firstX, firstY = transform.apply(matrix, firstX, firstY)
+        secondX, secondY = transform.apply(matrix, secondX, secondY)
+        toX, toY = transform.apply(matrix, toX, toY)
+      end
+
+      cubicPoints(points, points[#points - 1], points[#points], firstX, firstY, secondX, secondY, toX, toY, tolerance)
+      index += 7
+    else
+      local centerX, centerY = commands[index + 1], commands[index + 2]
+      local radiusX, radiusY = commands[index + 3], commands[index + 4]
+      local own: { number }
+
+      if command == Arc then
+        own = if matrix then {} else points
+        arc(own, centerX, centerY, radiusX, radiusY, commands[index + 5], commands[index + 6], userTolerance)
+        index += 7
+      else
+        assert(command == Ellipse, 'magick: unknown retained path command')
+        own = ellipsePoints(centerX, centerY, radiusX, radiusY, userTolerance)
+        if not matrix then table.move(own, 1, #own, #points + 1, points) end
+        index += 5
+      end
+
+      if matrix then
+        for at = 1, #own - 1, 2 do
+          local pointX, pointY = transform.apply(matrix, own[at], own[at + 1])
+
+          table.insert(points, pointX)
+          table.insert(points, pointY)
+        end
+      end
+    end
+  end
+
+  return points
+end
+
+--- The points a retained contour flattens to under an outer matrix (nil for none).
+local function flattenRetained(contour: Retained, outer: Matrix?, tolerance: number): { number }
+  local matrix = contour.matrix
+
+  if outer then matrix = if matrix then transform.multiply(outer, matrix) else outer end
+
+  local points = flattenCommands(contour.commands, matrix, tolerance)
+
+  return if contour.reverse then reversed(points) else points
+end
+
+--- Adds a closed contour wound as a shape (`hole` false) or as a hole in one, whichever way its
+--- points go, with the commands it was drawn with.
+local function wound(self: Path, points: { number }, hole: boolean, commands: { number }): Path
+  if #points < 6 then return self end
+
+  local area = signedArea(points)
+
+  if area == 0 then return self end
+
+  local reverse = (area < 0) ~= hole
+
+  table.insert(self.contours, if reverse then reversed(points) else points)
+  table.insert(self.retained, { commands = commands, matrix = nil, reverse = reverse })
+
+  return self
+end
+
+--- Commands that draw a polygon through flat points.
+local function pointCommands(points: { number }): { number }
+  local commands = table.create(#points // 2 * 3) :: { number }
+
+  for index = 1, #points - 1, 2 do
+    table.insert(commands, Point)
+    table.insert(commands, points[index])
+    table.insert(commands, points[index + 1])
+  end
+
+  return commands
+end
+
+--- Starts a contour at a point, closing the one before it.
+function Path.moveTo(self: Path, toX: number, toY: number): Path
+  self:close()
+  self.open = { toX, toY }
+  self.drawing = { Point, toX, toY }
+
+  return self
+end
+
+--- The open contour and its commands, or an error naming the drawing call that needs one.
+local function opened(self: Path, call: string): ({ number }, { number })
+  local points, commands = self.open, self.drawing
+  if not points or not commands then error(`magick: path.{call} needs a moveTo first`, 3) end
+
+  return points, commands
+end
+
+--- Adds a straight line from the current point.
+function Path.lineTo(self: Path, toX: number, toY: number): Path
+  local points, commands = opened(self, 'lineTo')
+
+  table.insert(points, toX)
+  table.insert(points, toY)
+  table.insert(commands, Point)
+  table.insert(commands, toX)
+  table.insert(commands, toY)
+
+  return self
+end
+
+--- Adds a quadratic curve from the current point through a control point.
+function Path.quadTo(self: Path, controlX: number, controlY: number, toX: number, toY: number): Path
+  local points, commands = opened(self, 'quadTo')
+
+  quadPoints(points, points[#points - 1], points[#points], controlX, controlY, toX, toY, self.tolerance)
+  table.move({ Quad, controlX, controlY, toX, toY }, 1, 5, #commands + 1, commands)
 
   return self
 end
@@ -146,23 +378,10 @@ function Path.cubicTo(
   toX: number,
   toY: number
 ): Path
-  local points = opened(self, 'cubicTo')
-  local fromX, fromY = points[#points - 1], points[#points]
-  -- A cubic's chord strays by at most three quarters of its larger second difference, shrinking
-  -- with the square of the number of pieces.
-  local leadX, leadY = fromX - 2 * firstX + secondX, fromY - 2 * firstY + secondY
-  local tailX, tailY = firstX - 2 * secondX + toX, firstY - 2 * secondY + toY
-  local bend = math.max(math.sqrt(leadX * leadX + leadY * leadY), math.sqrt(tailX * tailX + tailY * tailY))
-  local pieces = math.max(1, math.ceil(math.sqrt(0.75 * bend / self.tolerance)))
+  local points, commands = opened(self, 'cubicTo')
 
-  for piece = 1, pieces do
-    local along = piece / pieces
-    local rest = 1 - along
-    local start, early, late, finish = rest * rest * rest, 3 * rest * rest * along, 3 * rest * along * along, along * along * along
-
-    table.insert(points, start * fromX + early * firstX + late * secondX + finish * toX)
-    table.insert(points, start * fromY + early * firstY + late * secondY + finish * toY)
-  end
+  cubicPoints(points, points[#points - 1], points[#points], firstX, firstY, secondX, secondY, toX, toY, self.tolerance)
+  table.move({ Cubic, firstX, firstY, secondX, secondY, toX, toY }, 1, 7, #commands + 1, commands)
 
   return self
 end
@@ -170,10 +389,14 @@ end
 --- Closes the open contour, if there is one, back to where it started. A contour drawn here
 --- keeps its own winding.
 function Path.close(self: Path): Path
-  local points = self.open
+  local points, commands = self.open, self.drawing
 
-  self.open = nil
-  if points and #points >= 6 then table.insert(self.contours, points) end
+  self.open, self.drawing = nil, nil
+
+  if points and commands and #points >= 6 then
+    table.insert(self.contours, points)
+    table.insert(self.retained, { commands = commands, matrix = nil, reverse = false })
+  end
 
   return self
 end
@@ -218,63 +441,23 @@ function Path.polygon(self: Path, points: { { number } }): Path
     table.insert(flat, point[2])
   end
 
-  return wound(self, flat, false)
+  return wound(self, flat, false, pointCommands(flat))
 end
 
 --- Adds a rectangle between two corners.
 function Path.rect(self: Path, x0: number, y0: number, x1: number, y1: number): Path
-  return wound(self, { x0, y0, x1, y0, x1, y1, x0, y1 }, false)
-end
+  local points = { x0, y0, x1, y0, x1, y1, x0, y1 }
 
---- The points of an elliptical arc about a center, from one angle to another in radians,
---- flattened to within a tolerance, appended to `points`.
-local function arc(
-  points: { number },
-  centerX: number,
-  centerY: number,
-  radiusX: number,
-  radiusY: number,
-  from: number,
-  to: number,
-  tolerance: number
-)
-  local radius = math.max(radiusX, radiusY)
-  -- A chord of angle `step` strays from its arc by radius * (1 - cos(step / 2)).
-  local step = if radius > tolerance then 2 * math.acos(1 - tolerance / radius) else math.pi / 2
-  local pieces = math.max(2, math.ceil(math.abs(to - from) / step))
-  local turn = math.abs(to - from) / pieces
-  -- Chords cut inside the arc, so the points between them are pushed out until the polygon
-  -- encloses the area the arc does: a whole circle's chords enclose r^2 * n * sin(turn) / 2. The
-  -- ends of an arc that isn't whole stay on it, where the straight edges it meets begin.
-  local outward = math.sqrt(turn / math.sin(turn))
-  local whole = math.abs(to - from) >= 2 * math.pi
-
-  for piece = 0, pieces do
-    local angle = from + (to - from) * piece / pieces
-    local reach = if whole or (piece > 0 and piece < pieces) then outward else 1
-
-    table.insert(points, centerX + radiusX * reach * math.cos(angle))
-    table.insert(points, centerY + radiusY * reach * math.sin(angle))
-  end
-end
-
---- The points of an ellipse about a center.
-local function ellipse(self: Path, centerX: number, centerY: number, radiusX: number, radiusY: number): { number }
-  local points: { number } = {}
-
-  arc(points, centerX, centerY, radiusX, radiusY, 0, 2 * math.pi, self.tolerance)
-  -- The last point is the first again.
-  table.remove(points)
-  table.remove(points)
-
-  return points
+  return wound(self, points, false, pointCommands(points))
 end
 
 --- Adds an ellipse about a center, or a circle when `radiusY` is left out.
 function Path.circle(self: Path, centerX: number, centerY: number, radiusX: number, radiusY: number?): Path
-  if radiusX <= 0 or (radiusY or radiusX) <= 0 then return self end
+  local tall = radiusY or radiusX
 
-  return wound(self, ellipse(self, centerX, centerY, radiusX, radiusY or radiusX), false)
+  if radiusX <= 0 or tall <= 0 then return self end
+
+  return wound(self, ellipsePoints(centerX, centerY, radiusX, tall, self.tolerance), false, { Ellipse, centerX, centerY, radiusX, tall })
 end
 
 --- Adds a circle's outline: the band between an outer and an inner radius.
@@ -282,7 +465,7 @@ function Path.ring(self: Path, centerX: number, centerY: number, outer: number, 
   self:circle(centerX, centerY, outer)
   if inner <= 0 then return self end
 
-  return wound(self, ellipse(self, centerX, centerY, inner, inner), true)
+  return wound(self, ellipsePoints(centerX, centerY, inner, inner, self.tolerance), true, { Ellipse, centerX, centerY, inner, inner })
 end
 
 --- Adds a rectangle with its corners rounded to a radius, which is held to half the shorter
@@ -296,13 +479,20 @@ function Path.roundRect(self: Path, x0: number, y0: number, x1: number, y1: numb
 
   local points: { number } = {}
   local quarter = math.pi / 2
+  local corners = {
+    { right - corner, top + corner, -quarter, 0 },
+    { right - corner, bottom - corner, 0, quarter },
+    { left + corner, bottom - corner, quarter, 2 * quarter },
+    { left + corner, top + corner, 2 * quarter, 3 * quarter },
+  }
+  local commands: { number } = {}
 
-  arc(points, right - corner, top + corner, corner, corner, -quarter, 0, self.tolerance)
-  arc(points, right - corner, bottom - corner, corner, corner, 0, quarter, self.tolerance)
-  arc(points, left + corner, bottom - corner, corner, corner, quarter, 2 * quarter, self.tolerance)
-  arc(points, left + corner, top + corner, corner, corner, 2 * quarter, 3 * quarter, self.tolerance)
+  for _, each in corners do
+    arc(points, each[1], each[2], corner, corner, each[3], each[4], self.tolerance)
+    table.move({ Arc, each[1], each[2], corner, corner, each[3], each[4] }, 1, 7, #commands + 1, commands)
+  end
 
-  return wound(self, points, false)
+  return wound(self, points, false, commands)
 end
 
 --- Adds a rectangle's outline, `width` wide inside the corners it is given.
@@ -313,7 +503,9 @@ function Path.frame(self: Path, x0: number, y0: number, x1: number, y1: number, 
   self:rect(left, top, right, bottom)
   if right - left <= 2 * width or bottom - top <= 2 * width then return self end
 
-  return wound(self, { left + width, top + width, right - width, top + width, right - width, bottom - width, left + width, bottom - width }, true)
+  local inner = { left + width, top + width, right - width, top + width, right - width, bottom - width, left + width, bottom - width }
+
+  return wound(self, inner, true, pointCommands(inner))
 end
 
 --- Adds a straight line `width` wide between two points, each end drawn as its own cap says.
@@ -344,8 +536,9 @@ local function stroke(
   local before, after = if startCap == 'square' then half else 0, if endCap == 'square' then half else 0
   local startX, startY = x0 - alongX * before, y0 - alongY * before
   local endX, endY = x1 + alongX * after, y1 + alongY * after
+  local band = { startX + sideX, startY + sideY, endX + sideX, endY + sideY, endX - sideX, endY - sideY, startX - sideX, startY - sideY }
 
-  wound(self, { startX + sideX, startY + sideY, endX + sideX, endY + sideY, endX - sideX, endY - sideY, startX - sideX, startY - sideY }, false)
+  wound(self, band, false, pointCommands(band))
   if startCap == 'round' then self:circle(x0, y0, half) end
   if endCap == 'round' then self:circle(x1, y1, half) end
 
@@ -398,32 +591,206 @@ function Path.bounds(self: Path): (number, number, number, number)
   return left, top, right, bottom
 end
 
---- A copy of the path moved by an offset and scaled about the origin first: each point becomes
---- `point * scale + offset`.
-function Path.transformed(self: Path, scale: number, dx: number, dy: number): Path
+--- A new path: this one's closed contours under a matrix, applied after any it was moved by
+--- before. The commands are kept, so curves are flattened again for where they now are, to the
+--- path's tolerance in its new space; an open contour is left out. The source is unchanged.
+function Path.transformBy(self: Path, matrix: Matrix): Path
+  transform.check(matrix)
+
   local out = Module.new(self.tolerance)
 
-  for _, points in self.contours do
-    local moved = table.create(#points) :: { number }
+  for _, contour in self.retained do
+    local moved: Retained = {
+      commands = contour.commands,
+      matrix = if contour.matrix then transform.multiply(matrix, contour.matrix) else matrix,
+      reverse = contour.reverse,
+    }
 
-    for index = 1, #points - 1, 2 do
-      table.insert(moved, points[index] * scale + dx)
-      table.insert(moved, points[index + 1] * scale + dy)
-    end
-
-    table.insert(out.contours, moved)
+    table.insert(out.retained, moved)
+    table.insert(out.contours, flattenRetained(moved, nil, self.tolerance))
   end
 
   return out
 end
 
+--- A copy of the path moved by an offset and scaled about the origin first: each point becomes
+--- `point * scale + offset`. Curves are kept and flattened again where they land (an
+--- owner-approved change in 0.2.0, RFC-0001 P4); a path of lines gives the 0.1.3 points.
+function Path.transformed(self: Path, scale: number, dx: number, dy: number): Path
+  return self:transformBy(transform.matrix(scale, 0, 0, scale, dx, dy))
+end
+
 --- Adds each closed contour of another path to this one, as it winds.
 function Path.append(self: Path, other: Path): Path
-  for _, points in other.contours do
+  for index, points in other.contours do
     table.insert(self.contours, table.clone(points))
+    table.insert(self.retained, other.retained[index])
   end
 
   return self
+end
+
+local function finite(value: number): boolean
+  return value == value and value > -math.huge and value < math.huge
+end
+
+--- The tolerance a 0.2.0 call flattens to, checked.
+local function deviceTolerance(self: Path, tolerance: number?): number
+  local chosen = tolerance or self.tolerance
+
+  if not finite(chosen) or chosen <= 0 then error('magick: tolerance must be a positive finite number', 3) end
+
+  return chosen
+end
+
+--- Refuses a path a 0.2.0 call cannot flatten: too many commands, or a coordinate that is not
+--- finite or lies past MaxCoordinate.
+local function checkCommands(self: Path)
+  local total = 0
+  local limit = transform.MaxCoordinate
+
+  for _, contour in self.retained do
+    total += #contour.commands
+    if total > Module.MaxCommandsPerPath then error(`magick: MaxCommandsPerPath {Module.MaxCommandsPerPath} exceeded`, 4) end
+
+    for _, value in contour.commands do
+      if not finite(value) then error('magick: path coordinates must be finite', 4) end
+      if math.abs(value) > limit then error(`magick: MaxCoordinate {limit} exceeded`, 4) end
+    end
+  end
+end
+
+--- The closed contours flattened under a matrix (the identity when left out) to `tolerance`
+--- device pixels (the path's own when left out), as flat x, y lists in device space. Shapes keep
+--- the winding the drawing calls gave them; a reflection turns every contour over alike.
+function Module.flatten(self: Path, tolerance: number?, matrix: Matrix?): { { number } }
+  local chosen = deviceTolerance(self, tolerance)
+
+  if matrix then transform.check(matrix) end
+
+  checkCommands(self)
+
+  local out: { { number } } = {}
+
+  for _, contour in self.retained do
+    table.insert(out, flattenRetained(contour, matrix, chosen))
+  end
+
+  return out
+end
+
+--- The box a path covers in device space under a matrix: left, top, right, bottom, not rounded.
+--- It holds both the curves and the outline they flatten to, so it is a bound on any coverage the
+--- path gives there. `halfWidth` widens it by that much in user space, as a stroke would.
+function Path.deviceBounds(self: Path, matrix: Matrix?, halfWidth: number?): (number, number, number, number)
+  local chosen = matrix or transform.identity()
+  local left: number, top: number, right: number, bottom: number = math.huge, math.huge, -math.huge, -math.huge
+
+  for _, points in Module.flatten(self, nil, chosen) do
+    for index = 1, #points - 1, 2 do
+      left, right = math.min(left, points[index]), (math.max(right, points[index]))
+      top, bottom = math.min(top, points[index + 1]), (math.max(bottom, points[index + 1]))
+    end
+  end
+
+  --- Widens the box to hold a cubic Bezier under a matrix.
+  local function widen(
+    matrix: Matrix,
+    startX: number,
+    startY: number,
+    firstX: number,
+    firstY: number,
+    secondX: number,
+    secondY: number,
+    finishX: number,
+    finishY: number
+  )
+    local boxLeft, boxTop, boxRight, boxBottom = transform.cubicBox(matrix, startX, startY, firstX, firstY, secondX, secondY, finishX, finishY)
+
+    left, top = math.min(left, boxLeft), math.min(top, boxTop)
+    right, bottom = math.max(right, boxRight), (math.max(bottom, boxBottom))
+  end
+
+  for _, contour in self.retained do
+    local whole = if contour.matrix then transform.multiply(chosen, contour.matrix) else chosen
+    local commands = contour.commands
+    local index, lastX, lastY = 1, 0, 0
+
+    while index <= #commands do
+      local command = commands[index]
+
+      if command == Point then
+        lastX, lastY = commands[index + 1], commands[index + 2]
+        index += 3
+      elseif command == Quad then
+        -- A quadratic is the cubic whose inner controls lie two thirds of the way to its control.
+        local controlX, controlY = commands[index + 1], commands[index + 2]
+        local toX, toY = commands[index + 3], commands[index + 4]
+
+        widen(
+          whole,
+          lastX,
+          lastY,
+          lastX + 2 / 3 * (controlX - lastX),
+          lastY + 2 / 3 * (controlY - lastY),
+          toX + 2 / 3 * (controlX - toX),
+          toY + 2 / 3 * (controlY - toY),
+          toX,
+          toY
+        )
+        lastX, lastY = toX, toY
+        index += 5
+      elseif command == Cubic then
+        local toX, toY = commands[index + 5], commands[index + 6]
+
+        widen(whole, lastX, lastY, commands[index + 1], commands[index + 2], commands[index + 3], commands[index + 4], toX, toY)
+        lastX, lastY = toX, toY
+        index += 7
+      else
+        local centerX, centerY = commands[index + 1], commands[index + 2]
+        local radiusX, radiusY = commands[index + 3], commands[index + 4]
+        local from, to = 0, 2 * math.pi
+
+        if command == Arc then
+          from, to = commands[index + 5], commands[index + 6]
+          index += 7
+        else
+          index += 5
+        end
+
+        -- The ellipse's image is center + U cos(angle) + V sin(angle); each coordinate peaks at
+        -- the angle atan2(V, U) and is least half a turn on, where those lie on the arc.
+        local uX, uY = transform.applyVector(whole, radiusX, 0)
+        local vX, vY = transform.applyVector(whole, 0, radiusY)
+        local midX, midY = transform.apply(whole, centerX, centerY)
+        local sweep = to - from
+
+        for _, axis in { { uX, vX, 1 }, { uY, vY, 2 } } do
+          local peak = math.atan2(axis[2], axis[1])
+
+          for _, angle in { peak, peak + math.pi } do
+            if (angle - from) % (2 * math.pi) > sweep then continue end
+
+            local value = axis[1] * math.cos(angle) + axis[2] * math.sin(angle)
+
+            if axis[3] == 1 then
+              left, right = math.min(left, midX + value), (math.max(right, midX + value))
+            else
+              top, bottom = math.min(top, midY + value), (math.max(bottom, midY + value))
+            end
+          end
+        end
+
+        lastX, lastY = centerX + radiusX * math.cos(to), centerY + radiusY * math.sin(to)
+      end
+    end
+  end
+
+  if left > right then return 0, 0, 0, 0 end
+
+  local inflate = (halfWidth or 0) * transform.sigmaMax(chosen)
+
+  return left - inflate, top - inflate, right + inflate, bottom + inflate
 end
 
 --- Adds the signed area a line from one point to another sweeps over each cell it crosses, and
