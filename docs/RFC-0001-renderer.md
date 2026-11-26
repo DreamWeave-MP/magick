@@ -662,7 +662,7 @@ relations are tested, and their code is owned by the issue named in the row.
 | `MaxHaloPx` | `64` | `Render.plan`; boundary tested | Filter halo, per side, per pass (0.3.0, MAG-023). |
 | `MaxDecodedPixels` | `MaxImagePixels` | constant; relation tested; owned by MAG-012 (decoders) | Any new decoder. Legacy codecs keep their 0.1.x behaviour, which has no cap, because the contract is frozen (section 16). |
 | `MaxReferenceDepth` | `0` | constant; owned by MAG-016 | No references in 0.3.0, since scene structure is a tree (section 12). |
-| `MaxNodes` | `65536` | constant; owned by MAG-016 | Scene nodes (0.3.0). |
+| `MaxNodes` | `131072` | constant; owned by MAG-016, raised by MAG-044 | Scene nodes. 65,536 in 0.3.0; MAG-044 asks for 100,000-node scenes, measured at 4K: compile 1.5 s, one worker 45 s, 1.39 GB peak RSS (`tests/stress.jsl`). |
 | `MaxDabsPerStroke` | `65536` | constant; owned by MAG-030 | Brush dabs in one stroke (0.4.0). |
 | `MaxDabsPerScene` | `2^20` | constant; owned by MAG-030 | Brush dabs in one scene (0.4.0). |
 | `MaxStrokesPerPlan` | `16384` | constant; owned by MAG-038 | Strokes in one painter plan (0.5.0). |

@@ -32,7 +32,8 @@ were added in, never a table's.
   approximating a gaussian of that deviation, and `{ kind = 'shadow', radius, offsetX, offsetY, color }`, with offsets
   rounded to whole pixels. A filter sees only what lies on the canvas.
 - Refusals: cycles, a node of another document, a second parent, a mask node as a child, `MaxDepth` 32, `MaxNodes`
-  65536, unknown options, filters and kinds, out-of-range opacities, radii past 21, and shadow offsets past 64.
+  131072 (65536 in 0.3.0; raised for MAG-044's 100,000-node scenes), unknown options, filters and kinds,
+  out-of-range opacities, radii past 21, and shadow offsets past 64.
 
 ### `@magick/render`
 

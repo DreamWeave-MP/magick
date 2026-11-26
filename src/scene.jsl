@@ -28,7 +28,7 @@ local Module = {}
 
 --- The deepest a node may sit below the root, and the most nodes one document holds.
 Module.MaxDepth = 32
-Module.MaxNodes = 65536
+Module.MaxNodes = 131072
 
 --- How a shape's outline is stroked: `stroked`'s options, less its `transform`.
 export type StrokeStyle = {
