@@ -16,6 +16,7 @@ later stop winning at the shared offset). Past their ends, `spread` pads, repeat
 ]]
 local color = require '@magick/color'
 local magick = require '@magick'
+local noise = require '@magick/noise'
 local path = require '@magick/path'
 local transform = require '@magick/transform'
 
@@ -64,7 +65,7 @@ export type PatternOptions = { transform: Matrix?, sampling: Sampling?, edge: Ed
 
 --- A paint. Its fields are read-only; `kind` says which of the rest it uses.
 export type Paint = {
-  kind: 'solid' | 'linear' | 'radial' | 'conic' | 'pattern',
+  kind: 'solid' | 'linear' | 'radial' | 'conic' | 'pattern' | 'field' | 'mix' | 'masked' | 'shader',
   opacity: number,
   transform: Matrix,
   inverse: Matrix,
@@ -81,6 +82,12 @@ export type Paint = {
   source: PatternSource?,
   sampling: Sampling,
   edge: Edge,
+  --- Field, mix and masked paints: the field they read, in their own paint space.
+  field: noise.Field?,
+  --- Mix and masked paints: the paints they combine.
+  inputs: { Paint }?,
+  --- Shader paints: the function they call.
+  shader: ((x: number, y: number) -> (number, number, number, number))?,
 }
 
 --- How a fill composites: its operator and opacity, and how its path is covered.
@@ -381,6 +388,17 @@ function Module.moved(value: Paint, matrix: Matrix): Paint
   copy.transform = combined
   copy.inverse = inverse
 
+  -- A mix or mask moves its inputs with it.
+  if value.inputs then
+    local moved = {}
+
+    for _, inner in value.inputs do
+      table.insert(moved, Module.moved(inner, matrix))
+    end
+
+    copy.inputs = moved
+  end
+
   return table.freeze(copy) :: Paint
 end
 
@@ -399,6 +417,8 @@ export type Description = {
   sampling: string?,
   edge: string?,
   asset: number?,
+  field: noise.Field?,
+  inputs: { Description }?,
 }
 
 local function hexByte(value: number): string
@@ -412,6 +432,21 @@ function Module.describe(value: Paint, assetOf: ((source: PatternSource) -> numb
     opacity = value.opacity,
     transform = { matrix.scaleX, matrix.skewY, matrix.skewX, matrix.scaleY, matrix.offsetX, matrix.offsetY },
   }
+
+  if value.kind == 'shader' then error('magick: a shader paint is a function and cannot be saved; use a field paint', 2) end
+
+  if value.kind == 'mix' or value.kind == 'masked' then
+    out.field = value.field
+    out.inputs = {}
+
+    for _, inner in value.inputs or {} do
+      table.insert(out.inputs :: { Description }, Module.describe(inner, assetOf))
+    end
+
+    return out
+  end
+
+  if value.kind == 'field' then out.field = value.field end
 
   if value.kind == 'solid' then
     local channels = value.channels
@@ -471,6 +506,19 @@ function Module.fromDescription(description: Description, sourceOf: ((asset: num
     })
   end
 
+  if description.kind == 'mix' or description.kind == 'masked' then
+    local inputs = description.inputs
+
+    if type(inputs) ~= 'table' or type(description.field) ~= 'table' then error('magick: a mix or mask needs its inputs and field', 2) end
+
+    local first = Module.fromDescription(inputs[1], sourceOf)
+    local composite: { transform: Matrix?, opacity: number? } = { transform = matrix, opacity = opacity }
+
+    if description.kind == 'masked' then return Module.masked(first, description.field :: noise.Field, composite) end
+
+    return Module.mix(first, Module.fromDescription(inputs[2], sourceOf), description.field :: noise.Field, composite)
+  end
+
   local geometry = description.geometry
 
   if type(geometry) ~= 'table' then error('magick: a gradient needs its geometry', 2) end
@@ -501,6 +549,12 @@ function Module.fromDescription(description: Description, sourceOf: ((asset: num
     return Module.radial(geometry[1], geometry[2], geometry[3], stops, options)
   end
 
+  if description.kind == 'field' then
+    if type(description.field) ~= 'table' then error('magick: a field paint needs its field', 2) end
+
+    return Module.fieldPaint(description.field :: noise.Field, stops, options)
+  end
+
   if description.kind == 'conic' then
     if #geometry ~= 3 then error('magick: a conic gradient has three numbers of geometry', 2) end
 
@@ -512,6 +566,103 @@ function Module.fromDescription(description: Description, sourceOf: ((asset: num
   end
 
   error(`magick: unknown paint kind {description.kind}`, 2)
+end
+
+--- A user shader: straight sRGB red, green, blue and alpha in 0..1 at a point in paint space.
+export type Shader = (x: number, y: number) -> (number, number, number, number)
+
+local ProceduralKeys = { spread = true, interpolation = true, transform = true, opacity = true }
+
+--- A paint whose color at each point is a field's value there, read through stops as a gradient's
+--- parameter is (and spread past 0..1 as one is). The field is a description from @magick/noise,
+--- evaluated in paint space; being data, it renders the same on any worker and in any tile.
+function Module.fieldPaint(description: noise.Field, stops: { Stop }, options: GradientOptions?): Paint
+  checkKeys(options, ProceduralKeys, 2)
+
+  local made = table.clone(gradient('linear', { 0, 0, 1, 0 }, stops, options)) :: { [string]: unknown }
+
+  made.kind = 'field'
+  made.field = noise.field(description)
+
+  return table.freeze(made) :: Paint
+end
+
+local CompositeKeys = { transform = true, opacity = true }
+
+--- Two paints blended by a field: `first` where it is 0 or less, `second` where it is 1 or more,
+--- premultiplied and linearly between. The field is read in this paint's space; each input keeps
+--- its own transform.
+function Module.mix(first: Paint, second: Paint, weight: noise.Field, options: { transform: Matrix?, opacity: number? }?): Paint
+  checkKeys(options, CompositeKeys, 2)
+
+  local matrix, inverse = checkMatrix(if options then options.transform else nil, 2)
+
+  return table.freeze {
+    kind = 'mix',
+    opacity = checkOpacity(if options then options.opacity else nil, 2),
+    transform = matrix,
+    inverse = inverse,
+    channels = {},
+    offsets = {},
+    colors = {},
+    spread = 'pad',
+    interpolation = 'srgb',
+    geometry = {},
+    sampling = 'nearest',
+    edge = 'clamp',
+    field = noise.field(weight),
+    inputs = { first, second },
+  } :: Paint
+end
+
+--- A paint whose alpha is scaled by a field, clamped to 0..1: holes, grain or a fade cut into it.
+function Module.masked(inner: Paint, mask: noise.Field, options: { transform: Matrix?, opacity: number? }?): Paint
+  local made = table.clone(Module.mix(inner, inner, mask, options)) :: { [string]: unknown }
+
+  made.kind = 'masked'
+  made.inputs = { inner }
+
+  return table.freeze(made) :: Paint
+end
+
+--- A paint from a function of a point in paint space, returning straight sRGB channels in 0..1.
+--- It must be pure: the same point, the same color, with no clock, no generator and no reading of
+--- what it draws over. It is called once a pixel, so it is the slow path; a field paint is the
+--- fast one. A shader cannot cross to a worker or be saved, and an error in it fails the fill with
+--- the point and tile it was asked for.
+function Module.shader(evaluate: Shader, options: { transform: Matrix?, opacity: number? }?): Paint
+  checkKeys(options, CompositeKeys, 2)
+
+  if type(evaluate) ~= 'function' then error('magick: a shader is a function of x and y', 2) end
+
+  local matrix, inverse = checkMatrix(if options then options.transform else nil, 2)
+
+  return table.freeze {
+    kind = 'shader',
+    opacity = checkOpacity(if options then options.opacity else nil, 2),
+    transform = matrix,
+    inverse = inverse,
+    channels = {},
+    offsets = {},
+    colors = {},
+    spread = 'pad',
+    interpolation = 'srgb',
+    geometry = {},
+    sampling = 'nearest',
+    edge = 'clamp',
+    shader = evaluate,
+  } :: Paint
+end
+
+--- Whether a paint, or one inside it, is a shader, which cannot cross to a worker.
+function Module.hasShader(value: Paint): boolean
+  if value.kind == 'shader' then return true end
+
+  for _, inner in value.inputs or {} do
+    if Module.hasShader(inner) then return true end
+  end
+
+  return false
 end
 
 --- `t` brought into 0..1 by a spread.
@@ -590,6 +741,8 @@ local function parameter(paint: Paint, pointX: number, pointY: number): number?
 
     return ((pointX - geometry[1]) * deltaX + (pointY - geometry[2]) * deltaY) / length
   end
+
+  if paint.kind == 'field' then return noise.compile(paint.field :: noise.Field)(pointX, pointY) end
 
   if paint.kind == 'conic' then
     local turn = (math.atan2(pointY - geometry[2], pointX - geometry[1]) - geometry[3]) / (2 * math.pi)
@@ -771,6 +924,75 @@ function Module.span(paint: Paint, tile: Tile, row: number, first: number, count
 
   if paint.kind == 'pattern' then
     patternSpan(paint, tile, row, first, count, out, scale)
+
+    return
+  end
+
+  if paint.kind == 'mix' or paint.kind == 'masked' then
+    local inputs = paint.inputs :: { Paint }
+    local weight = noise.compile(paint.field :: noise.Field)
+    local inverse = paint.inverse
+    local centerY = tile.top + row + 0.5
+
+    Module.span(inputs[1], tile, row, first, count, out, scale)
+
+    local other: buffer? = nil
+
+    if paint.kind == 'mix' then
+      other = buffer.create(count * 32)
+      Module.span(inputs[2], tile, row, first, count, other :: buffer, scale)
+    end
+
+    for index = 0, count - 1 do
+      local centerX = tile.left + first + index + 0.5
+      local pointX = inverse.scaleX * centerX + inverse.skewX * centerY + inverse.offsetX
+      local pointY = inverse.skewY * centerX + inverse.scaleY * centerY + inverse.offsetY
+      local along = math.clamp(weight(pointX, pointY), 0, 1)
+      local at = index * 32
+
+      for channel = 0, 24, 8 do
+        local own = buffer.readf64(out, at + channel)
+        local blended = if other then own + (buffer.readf64(other, at + channel) - own) * along else own * along
+
+        buffer.writef64(out, at + channel, blended)
+      end
+    end
+
+    return
+  end
+
+  if paint.kind == 'shader' then
+    local evaluate = paint.shader :: Shader
+    local inverse = paint.inverse
+    local centerY = tile.top + row + 0.5
+    local linear = tile.space == 'linear'
+
+    for index = 0, count - 1 do
+      local centerX = tile.left + first + index + 0.5
+      local pointX = inverse.scaleX * centerX + inverse.skewX * centerY + inverse.offsetX
+      local pointY = inverse.skewY * centerX + inverse.scaleY * centerY + inverse.offsetY
+      -- pcall only around the user's shader, which may raise: its error is reported with the point
+      -- and tile it was asked for, and nothing of the half-drawn span is kept.
+      local ok, red, green, blue, alpha = pcall(evaluate, pointX, pointY)
+
+      if not ok then error(`magick: shader failed at ({pointX}, {pointY}) in the tile at ({tile.left}, {tile.top}): {red}`, 3) end
+
+      if type(red) ~= 'number' or type(green) ~= 'number' or type(blue) ~= 'number' or type(alpha) ~= 'number' then
+        error(`magick: a shader returns four numbers; at ({pointX}, {pointY}) it did not`, 3)
+      end
+
+      local cover = math.clamp(alpha, 0, 1) * scale
+      local at = index * 32
+      local channels = { math.clamp(red, 0, 1), math.clamp(green, 0, 1), math.clamp(blue, 0, 1) }
+
+      for channel = 1, 3 do
+        local value = channels[channel]
+
+        buffer.writef64(out, at + (channel - 1) * 8, (if linear then color.decode(value) else value) * cover)
+      end
+
+      buffer.writef64(out, at + 24, cover)
+    end
 
     return
   end

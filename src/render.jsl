@@ -901,6 +901,12 @@ end
 --- Replies come back in the order each worker was sent them, so the output does not depend on
 --- timing. Every worker is stopped and joined before an error, a failed worker or a cancel goes on.
 local function renderParallel(plan: Compiled, grid: Grid, output: magick.Image, workers: number, cancel: (() -> boolean)?, stats: Stats)
+  for _, op in plan.ops do
+    if op.paint and paint.hasShader(op.paint) then
+      error('magick: a shader paint renders on one worker only, since a function cannot cross to a worker; use a field paint', 3)
+    end
+  end
+
   local worker = require '@jess/worker'
   local spawned = {}
   local count = grid.columns * grid.rows
