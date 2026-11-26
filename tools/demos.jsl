@@ -15,6 +15,7 @@ local render = require '@magick/render'
 local valley = require '../demos/valley'
 local oil = require '../demos/oil'
 local heron = require '../demos/heron'
+local portrait = require '../demos/portrait'
 
 local Demos: { Demo } = {
   require '../demos/lighthouse',
@@ -35,6 +36,12 @@ local Demos: { Demo } = {
     name = 'oil',
     render = function(): magick.Image
       return (render.image((oil.build())))
+    end,
+  },
+  {
+    name = 'portrait',
+    render = function(): magick.Image
+      return (render.image(portrait.build()))
     end,
   },
 }
