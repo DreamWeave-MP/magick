@@ -10,13 +10,40 @@ The renderer design for 0.2.0 (coordinates, transforms, premultiplied working ti
 
 ## Gallery
 
-Every picture here is drawn by checked-in JSL source through the public modules, with no external
-media, no generative service and no retouching. `tools/demos.jsl` renders each one and holds its
-pixels to the CRC-32 in `demos/records.jsl`, so anyone can reproduce them byte for byte:
+Every picture here is drawn by checked-in JSL source through the public modules, with no generative
+service and no retouching. The only outside media is the Mona Lisa's reference, a public-domain
+photograph pinned by SHA-256 in [`gallery/references/PROVENANCE.md`](gallery/references/PROVENANCE.md);
+every pixel of the painting is Magick's. `tools/demos.jsl` renders each one and holds its pixels to
+the CRC-32 in `demos/records.jsl`, so anyone can reproduce them byte for byte (about five minutes on
+one core):
 
 ```sh
 jess run --package . --capability filesystem.read --capability filesystem.write tools/demos.jsl target/demos
 ```
+
+### Mona Lisa, after Leonardo (MAG-041)
+
+![Mona Lisa, painted by @magick/painter](gallery/monalisa.png)
+
+![The toned ground and each pass](gallery/monalisa-progress.png)
+
+[`demos/monalisa.jsl`](demos/monalisa.jsl) paints Leonardo's portrait with `painter.paint`. The canvas is toned a
+flat umber, then laid in with loaded oil strokes at radius 8, 4 and 2. The face and hands carry on to 1-pixel strokes
+with a soft, thin, low-flow brush (sfumato) and a tighter threshold; the bust sits between the two. Each region's
+strokes stay inside it. Every pass is planned against the canvas the brush engine actually rendered, and its error is
+measured against the reference itself (mean absolute difference of the colors, 0..1, at the reference's size):
+
+| Stage | Strokes | Error against the reference |
+|---|---|---|
+| Toned ground | 0 | 0.1490 |
+| Radius 8, everywhere | 5,922 | 0.0517 |
+| Radius 4 | 4,458 | 0.0418 |
+| Radius 2 | 7,960 | 0.0376 |
+| Radius 1, face and hands only | 3,492 | 0.0373 |
+
+The numbers report what happened; nothing promises they fall. They are not a score to chase either: the reference
+merely blurred by the largest brush measured 0.0343, lower than the finished painting, so the painter is judged by the
+pictures, with the numbers as evidence that every pass moved the canvas toward its subject.
 
 | | |
 |---|---|
@@ -29,33 +56,94 @@ jess run --package . --capability filesystem.read --capability filesystem.write 
 ### `@magick/painter`
 
 Painting a reference coarse to fine, after Hertzmann's curved-stroke method (SIGGRAPH 1998; an implementation of the
-idea, not of his code). `painter.analyze(image, radii)` makes the pyramid: the reference blurred for each brush and the
-Sobel gradient of its luminance. `painter.plan(image, { radii?, threshold?, curvature?, minimumLength?, maximumLength?,
-grid?, seed?, budget? })` lays strokes largest brush first wherever a fast estimate of the canvas still differs from that
-level by more than `threshold`, each starting at its cell's worst pixel and running along the edge until the reference
-leaves its color, and reports the mean error left after each level (`plan.levels`), which falls level by level.
-`painter.apply(document, group, plan, { preset?, widen?, overrides?, seed?, matrix?, underpaint? })` turns the plan into
-brush strokes in a scene, over a blurred underpainting of the reference. `painter.error(image, reference)` is the
-metric. Caps: `MaxStrokesPerPlan` 16384, `MaxPlanLevels` 8, `MaxStrokeLength` 64, `MaxReferencePixels` 1024 by 1024.
-A reference must be one the caller may use; the gallery paints only its own renders.
+idea, not of his code).
+
+**`painter.paint(reference, options?)`** paints an opaque reference against the brush engine's real renders and
+returns `{ image, ground, passes }`.
+- **Ground:** the canvas is toned one flat color (`ground`, the reference's mean by default), and the first pass covers
+  all of it.
+- **Passes:** each pass blurs the reference for its radius and starts a stroke in every cell (as wide as the radius)
+  where the *rendered* canvas misses that blur by more than `threshold`. Strokes run along the edge in the color there
+  and stop where the target leaves it. The starts are laid in a seeded order, and strokes are built only for what
+  `budget` has left.
+- **Rendering and measurement:** each pass's strokes are rendered over the canvas so far, and its `error` is measured
+  against the reference itself. Every `pass.image` is kept.
+- **Regions** (`{ name, shape, radii?, threshold?, curvature?, maximumLength?, preset?, overrides? }`, shapes in
+  reference pixels) paint parts of the picture with their own passes and brush, and their strokes stay inside them.
+- **Brush size:** the planned radius is a stroke's reach across its line even at its tapered ends.
+- **Other options:** `scale` (whole, 1..4), `workers`.
+- **Caps:** `MaxStrokesPerPainting` 131072.
+
+**`painter.plan` and `painter.apply`** are the earlier planner, kept as they were.
+- **`painter.plan(image, options?)`** plans strokes against a fast disc estimate of the canvas, one level at a time in
+  f64 planes (about 100 MB at `MaxReferencePixels`). It builds strokes only for the starts its budget takes, and refuses
+  options that are not finite or whole. `plan.levels[i].error` is that estimate against the level's own blur: a
+  planning diagnostic, not a measure of the painting.
+- **`painter.apply(document, group, plan, options?)`** turns a plan into brush strokes over an underpainting blurred in
+  place. (It once used a blur filter, which faded the underpainting toward the canvas edge and left a ragged unpainted
+  frame. Fixed, and the oil and portrait records retaken.)
+- **`painter.error(image, reference)`** is the mean absolute difference of the premultiplied colors plus that of the
+  alphas, over 255. It is 0..2 in general and 0..1 for opaque images, where it is the plain color difference. Empty
+  images are refused.
+- **Caps:** `MaxStrokesPerPlan` 16384, `MaxPlanLevels` 8, `MaxStrokeLength` 64, `MaxReferencePixels` 1024 by 1024.
 
 ### `@magick/svg`
 
-`svg.export(document)` writes a bounded SVG subset: retained path commands (arcs as SVG arcs), solid, linear and radial
-paints with every stroke setting, embedded PNG images, and groups with transform, opacity, blend, clip, mask and blur or
-shadow filters. Conic, field, pattern, mix and shader paints and brush strokes are refused by name. Checked by hand
-against ImageMagick's SVG renderer: mean absolute error 0.11%. `svg.import(text)` reads `svg` (with `viewBox`), `g`,
-`path` (every command, arcs to cubics), `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`, `linearGradient`,
-`radialGradient` (either unit system) and `clipPath`, with presentation attributes, `style`, transforms and inheritance,
-and returns the warnings for what it skipped. Input is untrusted: `MaxSvgBytes` 16 MiB, `MaxElements` 65536, `MaxDepth`
-32, `MaxPathCommands` 2^20, finite numbers within `MaxCoordinate`.
+**`svg.export(document)`** writes a bounded SVG subset:
+- retained path commands, with arcs as SVG arcs;
+- solid, linear and radial paints, with every stroke setting;
+- embedded PNG images;
+- groups with transform, opacity, blend, clip, mask, and blur or shadow filters.
 
-### Hardening
+Conic, field, pattern, mix and shader paints and brush strokes are refused by name.
 
-`tests/fuzz.jsl` drives seeded random geometry (scales from 1/64 to 4096, repeated and collinear points, crossings)
-through coverage and strokes and holds tile parity under both rules, evenodd within nonzero, finite outlines and the cap
-refusals. `jess package run --capability worker.spawn --target stress .` renders the valley at 7680 by 4320: 35.0 s on
-4 workers, 808 MB peak resident for the whole run (the output image is 132 MB of it), and refuses a canvas 8193 wide.
+**`svg.import(text)`** reads:
+- elements: `svg`, `g`, `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`, `linearGradient` and
+  `radialGradient` (with `href` inheritance and percentages), and `clipPath` on groups and shapes;
+- styling: presentation attributes and `style`, CSS colors (every keyword, `#rgb`, `rgb()` and `rgba()` with
+  percentages and alpha, `currentColor`), absolute units, `display` and `visibility`;
+- geometry: transforms, and a viewBox fitted by `preserveAspectRatio` (`xMidYMid meet` by default).
+
+Input is untrusted:
+- every number list is read in order to its last character;
+- a malformed number, a short argument group, a bad arc flag, or a size past 8192 pixels is refused by name, never
+  dropped or clamped;
+- caps: `MaxSvgBytes` 16 MiB, `MaxElements` 65536, `MaxDepth` 32, `MaxPathCommands` 2^20.
+
+`tests/svg` holds six fixtures to librsvg 2.63.2's renders, made once and committed. The mean absolute difference is
+0.02% to 0.12%, and 0.89% where a translucent radial stop interpolates slightly differently.
+
+### Hardening (MAG-044)
+
+**Package tests:**
+- `tests/fuzz.jsl` drives seeded random geometry through coverage and strokes.
+- `tests/adversarial.jsl` holds mutated PNGs, saved scenes and SVGs (400, 300 and 300) to a read or a named refusal.
+  Verified PNGs read back as exactly the picture written.
+- It also covers a PNG decompression bomb, refused by `readPNG(source, { maxPixels, verify })` before it is inflated.
+- Degenerate geometry, scales from 1e-300 to 1e300, and a 3000-edge zigzag in one row are drawn right or refused at
+  every tile size.
+
+**The stress target** is `jess package run --capability worker.spawn --target stress .`. On an i7-10870H, under a
+9 GB memory cap, with jess 0.4.0:
+- the valley at 7680 by 4320 on 4 workers: 35.5 s;
+- 100,000 shapes at 3840 by 2160: 21.3 s on 4 workers and 45.4 s on one, the same bytes;
+- 267,600 brush dabs at 4K: 5.7 s on 4 workers;
+- 113.9 s and **4.89 GB peak resident** for the whole run.
+
+The render budget (`memoryBudgetBytes`) counts working tiles, coverage cells, queued tiles, each worker's plan estimate
+and the output. It does not count the document, or Luau's own overhead on plans: the 100,000-node plan's estimate is
+121 MiB, while a serial run of it peaks at 1.39 GB resident. Budget a process with that in mind.
+
+### Downstream integration (MAG-045)
+
+The DreamWeave Mod Template uses Magick as its site generator's image backend: `read`, `Image:resize`, `write`.
+- **Its suite:** it passes 154 of 154 tests with its dependency moved to 0.5, on the local branch `deps/magick-0.5`,
+  which is not yet published.
+- **Its image output:** that same read, resize and write pipeline, run over three gallery images at three sizes each,
+  gives PNGs whose SHA-256 is the same under 0.1.3 and 0.5.0, all nine of them.
+
+The template pins Magick with a caret requirement, so publishing it waits on a Magick 0.5 release.
+[`docs/downstream.md`](docs/downstream.md) has the script and commands to check both claims again.
 
 ## 0.4.0 changes: Atelier
 
