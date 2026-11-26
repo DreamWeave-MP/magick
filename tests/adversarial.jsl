@@ -1,0 +1,218 @@
+--!strict
+-- Adversarial payloads (MAG-044): seeded mutations of a PNG, a saved scene and an SVG, each either
+-- read back or refused by name, never a hang, a crash or a silent bad image; decode bombs refused
+-- before they inflate; and degenerate or giant geometry drawn or refused within its caps.
+local bytes = require '@dream/bytes'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local svg = require '@magick/svg'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+--- A Park-Miller generator, so every mutation is the same on every run.
+local function generator(seed: number): () -> number
+  local state = seed
+
+  return function(): number
+    state = state * 48271 % 2147483647
+
+    return state / 2147483647
+  end
+end
+
+--- `text` with a few seeded mutations: bytes flipped, a span cut out, a span repeated.
+local function mutated(text: string, random: () -> number): string
+  local out = text
+
+  for _ = 1, 1 + math.floor(random() * 4) do
+    local at = 1 + math.floor(random() * #out)
+    local roll = random()
+
+    if roll < 0.5 then
+      out = string.sub(out, 1, at - 1) .. string.char(math.floor(random() * 256)) .. string.sub(out, at + 1)
+    elseif roll < 0.75 then
+      out = string.sub(out, 1, at - 1) .. string.sub(out, at + 1 + math.floor(random() * 16))
+    else
+      local span = string.sub(out, at, at + math.floor(random() * 16))
+
+      out = string.sub(out, 1, at - 1) .. span .. span .. string.sub(out, at)
+    end
+  end
+
+  return out
+end
+
+--- Calls `read` on `input`; a refusal must be an error with a message, and anything read must be
+--- usable. Returns whether it was read.
+local function survives(read: () -> (), what: string): boolean
+  -- pcall around readers handed hostile input on purpose: refusing it is their job.
+  local ok, problem = pcall(read)
+
+  if not ok then expect({ what, type(problem) == 'string' and #(problem :: string) > 0 }).toEqual { what, true } end
+
+  return ok
+end
+
+local function sample(): scene.Document
+  local document = scene.new(24, 16, { background = '#102030' })
+  local group = document:add(document:group { opacity = 0.75, filters = { { kind = 'blur', radius = 1 } } })
+
+  group:add(document:shape(path.new():rect(2, 2, 14, 12), { fill = paint.linear(2, 0, 14, 0, paint.stops(0, '#ff8040', 1, '#4080ff')) }))
+  group:add(document:shape(path.new():circle(16, 8, 5), { fill = paint.solid '#ffffff80', stroke = paint.solid '#000000', strokeStyle = { width = 1 } }))
+
+  return document
+end
+
+suite.describe('malformed payloads', function()
+  suite.it('reads or refuses 400 mutated PNGs when verifying, never decoding a wrong picture', function()
+    local image = render.image(sample())
+    local png = buffer.tostring(magick.png(image))
+    local random = generator(17)
+    local read, wrong = 0, 0
+
+    for index = 1, 400 do
+      local input = mutated(png, random)
+      local decoded: magick.Image? = nil
+
+      if survives(function()
+        decoded = magick.readPNG(buffer.fromstring(input), { maxPixels = 4096, verify = true })
+      end, `png {index}`) then
+        read += 1
+
+        -- What a verified read returns is the picture that was written, or nothing at all: a
+        -- mutation outside the chunks it reads (past IEND, say) may leave it readable.
+        if buffer.tostring((decoded :: magick.Image).data) ~= buffer.tostring(image.data) then wrong += 1 end
+      end
+    end
+
+    expect(wrong).toBe(0)
+    expect(read < 400).toBe(true)
+  end)
+
+  suite.it('reads or refuses 300 mutated saved scenes, and draws what it reads', function()
+    local text = scene.save(sample())
+    local random = generator(29)
+
+    for index = 1, 300 do
+      local input = mutated(text, random)
+
+      survives(function()
+        render.image(scene.load(input))
+      end, `scene {index}`)
+    end
+  end)
+
+  suite.it('reads or refuses 300 mutated SVGs, and draws what it reads', function()
+    local text = [[<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30" viewBox="0 0 40 30">
+      <defs><linearGradient id="g"><stop offset="0" stop-color="#f00"/><stop offset="1" stop-color="#00f"/></linearGradient>
+      <clipPath id="c"><circle cx="20" cy="15" r="10"/></clipPath></defs>
+      <rect width="40" height="30" fill="url(#g)" clip-path="url(#c)"/>
+      <path d="M2 2 L38 2 Q20 28 2 2 Z" fill="rgba(0,255,0,0.5)" stroke="black" stroke-width="1.5" stroke-dasharray="3 1"/>
+      <g transform="rotate(10 20 15) scale(0.5)" opacity="0.8"><polygon points="0,0 20,0 10 20" fill="#ff0"/></g>
+    </svg>]]
+    local random = generator(31)
+
+    for index = 1, 300 do
+      local input = mutated(text, random)
+
+      survives(function()
+        render.image(svg.import(input).document)
+      end, `svg {index}`)
+    end
+  end)
+
+  suite.it('refuses a decompression bomb before inflating it when given a pixel cap', function()
+    -- A header claiming 60000 square over a stream that inflates far past what any cap allows.
+    local header = buffer.create(13)
+
+    bytes.writeu32be(header, 0, 60000)
+    bytes.writeu32be(header, 4, 60000)
+    buffer.writeu8(header, 8, 8)
+    buffer.writeu8(header, 9, 6)
+
+    local function chunk(kind: string, payload: buffer): string
+      local size = buffer.create(4)
+
+      bytes.writeu32be(size, 0, buffer.len(payload))
+
+      local body = kind .. buffer.tostring(payload)
+      local check = buffer.create(4)
+
+      bytes.writeu32be(check, 0, bytes.crc32(buffer.fromstring(body)))
+
+      return buffer.tostring(size) .. body .. buffer.tostring(check)
+    end
+
+    local bomb = bytes.deflate(buffer.create(64 * 1024 * 1024), { format = 'zlib', level = 9 })
+    local file = '\137PNG\r\n\26\n' .. chunk('IHDR', header) .. chunk('IDAT', bomb) .. chunk('IEND', buffer.create(0))
+
+    expect(function()
+      magick.readPNG(buffer.fromstring(file), { maxPixels = 8192 * 8192 })
+    end).toThrow 'magick: PNG of 60000 by 60000 pixels is past maxPixels'
+  end)
+end)
+
+suite.describe('degenerate and giant geometry', function()
+  suite.it('draws zero-area, collinear and repeated-point outlines as nothing', function()
+    local document = scene.new(16, 16)
+    local white = paint.solid '#ffffff'
+
+    document:add(document:shape(path.new():moveTo(4, 4):lineTo(4, 4):lineTo(4, 4):close(), { fill = white }))
+    document:add(document:shape(path.new():moveTo(1, 1):lineTo(15, 15):lineTo(8, 8):close(), { fill = white }))
+    document:add(document:shape(path.new():rect(5, 5, 5, 12), { fill = white }))
+
+    local image = render.image(document)
+
+    expect(buffer.tostring(image.data)).toBe(string.rep('\0', 16 * 16 * 4))
+  end)
+
+  suite.it('draws a shape blown up past the canvas as the canvas covered, and a vanishing one as nothing', function()
+    -- Scales up to 1e300, stroked and filled: device coordinates far past any canvas, still finite.
+    for _, scale in { 1e7, 1e100, 1e300 } do
+      local document = scene.new(16, 16)
+
+      document:add(document:shape(path.new():rect(-5, -5, 10, 10), {
+        fill = paint.solid '#ffffff',
+        stroke = paint.solid '#ff0000',
+        strokeStyle = { width = 1 },
+        transform = transform.scale(scale),
+      }))
+
+      expect(buffer.tostring(render.image(document).data)).toBe(string.rep('\255', 16 * 16 * 4))
+    end
+
+    for _, scale in { 1e-9, 1e-300 } do
+      local tiny = scene.new(16, 16)
+
+      tiny:add(tiny:shape(path.new():rect(0, 0, 10, 10), { fill = paint.solid '#ffffff', transform = transform.scale(scale) }))
+      expect(buffer.tostring(render.image(tiny).data)).toBe(string.rep('\0', 16 * 16 * 4))
+    end
+  end)
+
+  suite.it('refuses a densely crossing shape inside a render by its per-row cap, the same at every tile size', function()
+    local random = generator(5)
+    local star = path.new():moveTo(0, 8.1)
+
+    for index = 1, 3000 do
+      star:lineTo(random() * 64, if index % 2 == 0 then 8.1 else 8.9)
+    end
+
+    local document = scene.new(64, 16)
+
+    document:add(document:shape(star:close(), { fill = paint.solid '#ffffff' }))
+
+    for _, size in { 16, 64 } do
+      expect(function()
+        render.image(document, { tileSize = size })
+      end).toThrow 'magick: MaxStripCrossings'
+    end
+  end)
+end)
+
+return suite
