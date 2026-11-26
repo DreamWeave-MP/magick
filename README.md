@@ -125,14 +125,20 @@ Input is untrusted:
 
 **The stress target** is `jess package run --capability worker.spawn --target stress .`. On an i7-10870H, under a
 9 GB memory cap, with jess 0.4.0:
-- the valley at 7680 by 4320 on 4 workers: 35.5 s;
-- 100,000 shapes at 3840 by 2160: 21.3 s on 4 workers and 45.4 s on one, the same bytes;
-- 267,600 brush dabs at 4K: 5.7 s on 4 workers;
-- 113.9 s and **4.89 GB peak resident** for the whole run.
+- the valley at 7680 by 4320 on 4 workers: 37.9 s;
+- 100,000 shapes at 3840 by 2160: 21.8 s on 4 workers and 45.7 s on one, the same bytes, under a 2 GiB budget;
+- 267,600 brush dabs at 4K: 6.3 s on 4 workers, under a 1 GiB budget (the default 512 MiB refuses it);
+- 118.0 s and **5.14 GB peak resident** for the whole run.
 
-The render budget (`memoryBudgetBytes`) counts working tiles, coverage cells, queued tiles, each worker's plan estimate
-and the output. It does not count the document, or Luau's own overhead on plans: the 100,000-node plan's estimate is
-121 MiB, while a serial run of it peaks at 1.39 GB resident. Budget a process with that in mind.
+The render budget (`memoryBudgetBytes`) is checked before any tile runs and refuses deterministically. It counts:
+- working tiles, coverage cells and queued tiles;
+- each worker's copy of the plan, by `plan.bytes`, an estimate from how Luau lays out its tables that is meant to err
+  high (the 100,000-node plan: 366 MiB);
+- the output image.
+
+It does not count the document the caller built, the caller's own copy of the plan, or garbage the collector has not
+reached yet. It is a ceiling on the render, not on the process: the serial 100,000-node run peaks at 1.39 GB resident
+with the document in hand. Budget a process with that in mind.
 
 ### Downstream integration (MAG-045)
 
