@@ -24,7 +24,16 @@ permissions:
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
+    # Every OS a Jess release ships for (MAG-044): the package is pure Luau, so its bytes must not
+    # depend on the platform under it.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
