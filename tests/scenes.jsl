@@ -260,6 +260,48 @@ scene('transformed pattern', function()
   return color.toImage(tile)
 end)
 
+-- MAG-014: each of the sixteen blend modes, in W3C order across rows of four, laying a vertical
+-- rainbow over a horizontal ramp from dark blue through gray to gold (gray alone would hide hue and
+-- saturation, which give a gray backdrop back), with a half-transparent white band across each cell.
+scene('blend modes', function()
+  local modes: { color.BlendMode } = {
+    'normal', 'multiply', 'screen', 'overlay',
+    'darken', 'lighten', 'color-dodge', 'color-burn',
+    'hard-light', 'soft-light', 'difference', 'exclusion',
+    'hue', 'saturation', 'color', 'luminosity',
+  }
+  local tile = color.tile(96, 96)
+  local ramp = paint.linear(0, 0, 24, 0, paint.stops(0, '#182860', 0.5, '#808080', 1, '#f0c060'), { spread = 'reflect' })
+  local rainbow = paint.linear(0, 0, 0, 24, paint.stops(0, '#ff3030', 0.33, '#30ff30', 0.67, '#3030ff', 1, '#ff30ff'), { spread = 'repeat' })
+
+  paint.fillMask(tile, ramp)
+
+  for index, mode in modes do
+    local left, top = (index - 1) % 4 * 24, (index - 1) // 4 * 24
+    local cell = path.new():rect(left + 2, top + 2, left + 22, top + 22)
+
+    paint.fillPath(tile, cell, rainbow, { blend = mode })
+    paint.fillPath(tile, path.new():rect(left + 2, top + 10, left + 22, top + 14), paint.solid '#ffffff80', { blend = mode })
+  end
+
+  return color.toImage(tile)
+end)
+
+-- Group opacity applied once: two overlapping discs drawn into an isolated group at 0.6 show no
+-- darker lens where they overlap; the same discs at 0.6 each, beside them, do.
+scene('isolated group', function()
+  local backdrop = color.fromImage(magick.new(64, 32, '#e8e4dc'))
+  local group = color.group(backdrop)
+
+  paint.fillPath(group, path.new():circle(12, 16, 10), paint.solid '#c03050')
+  paint.fillPath(group, path.new():circle(22, 16, 10), paint.solid '#3050c0')
+  color.compositeGroup(backdrop, group, { opacity = 0.6 })
+  paint.fillPath(backdrop, path.new():circle(42, 16, 10), paint.solid '#c03050', { opacity = 0.6 })
+  paint.fillPath(backdrop, path.new():circle(52, 16, 10), paint.solid '#3050c0', { opacity = 0.6 })
+
+  return color.toImage(backdrop)
+end)
+
 --- The scenes, in the order the gallery renders and the gate suite checks them.
 local Scenes: { Scene } = scenes
 
@@ -307,6 +349,10 @@ local Recorded: { [string]: string } = {
   ['repeated stripes png'] = '317:5e6e1573',
   ['transformed pattern pixels'] = '48x48:10f1049d',
   ['transformed pattern png'] = '3101:9f715988',
+  ['blend modes pixels'] = '96x96:0a894584',
+  ['blend modes png'] = '17167:eb53cda6',
+  ['isolated group pixels'] = '64x32:8f65ed7c',
+  ['isolated group png'] = '556:454e1c6b',
 }
 
 return table.freeze {
