@@ -6,7 +6,7 @@ ImageMagick is used only as a development oracle; this package does not spawn it
 
 What 0.1.x promises consumers, and what it keeps as it always did, is in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-The renderer design for 0.2.0 (coordinates, transforms, premultiplied working tiles, compositing and the API boundaries) is proposed for ratification by review in [RFC-0001](docs/RFC-0001-renderer.md), with its checked sketches in `docs/rfc/sketches/`.
+The renderer design for 0.2.0 (coordinates, transforms, premultiplied working tiles, compositing and the API boundaries) is set out in [RFC-0001](docs/RFC-0001-renderer.md), ratified by the owner on 2026-11-26, with its checked sketches in `docs/rfc/sketches/`.
 
 ## Gallery
 
@@ -52,7 +52,7 @@ pictures, with the numbers as evidence that every pass moved the canvas toward i
 
 | | |
 |---|---|
-| ![Heron at Dusk](gallery/heron.png) [Heron at Dusk](demos/heron.jsl): ink and watercolor | ![Portrait of a Reader](gallery/portrait.png) [Portrait of a Reader](demos/portrait.jsl): an original vector reference ([reference](gallery/portrait-reference.png)) painted in oil |
+| ![Heron at Dusk](gallery/heron.png) [Heron at Dusk](demos/heron.jsl): ink and watercolor | ![Portrait of a Reader](gallery/portrait.png) [Portrait of a Reader](demos/portrait.jsl): an original vector reference ([reference](gallery/portrait-reference.png)) painted by `painter.paint`, its face and neck in glazes |
 | ![The Valley, in Oil](gallery/oil.png) [The Valley, in Oil](demos/oil.jsl): the valley repainted by `painter.plan` and `apply`, its strokes larger than the ridges and sun they erase; compare [The Valley, Painted](gallery/valley-painted.png) ([source](demos/valleypainted.jsl)), the same reference painted by `painter.paint` against its real renders | ![Valley at First Light](gallery/valley.png) [Valley at First Light](demos/valley.jsl): 5,941 scene nodes, 4K and 8K targets |
 | ![Lighthouse at Dusk](gallery/lighthouse.png) [Lighthouse at Dusk](demos/lighthouse.jsl): a vector poster | ![Rosette](gallery/rosette.png) [Rosette](demos/rosette.jsl): engraved guilloche |
 
