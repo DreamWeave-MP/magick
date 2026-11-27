@@ -1,5 +1,5 @@
 {
-  "schema_version": "3",
+  "schema_version": "4",
   "document": "lock",
   "project": "4aefcc8f-913f-48f5-8980-2326173a7288",
   "note": "Written by CI when a release tag is pushed: what each published release's archive contains. Do not edit.",
@@ -62,6 +62,47 @@
             "package": "org.dreamweave.magick",
             "jess_api": "1",
             "content_digest": "08ef69240ae2a041651d94b67240149357733070f327f3085b944f6c814ddb6f",
+            "dependencies": {}
+          }
+        }
+      ],
+      "runtimes": {},
+      "platforms": [],
+      "provides": [],
+      "relationships": [],
+      "components": [
+        {
+          "id": "main",
+          "name": "Magick",
+          "path": ".",
+          "required": true,
+          "default": true,
+          "requires": [],
+          "conflicts": [],
+          "suggested_with": []
+        }
+      ],
+      "groups": [],
+      "extensions": {},
+      "critical_extensions": []
+    },
+    {
+      "version": "0.2.0",
+      "locked_from": "b96f99b3d260cfec23c7211fcc3291f1822964b0",
+      "artifacts": [
+        {
+          "id": "jpk",
+          "format": "jpk",
+          "filename": "org.dreamweave.magick-0.2.0.jpk",
+          "media_type": "application/vnd.jess.jpk",
+          "size": 289169,
+          "digests": {
+            "sha256": "099ebf7698bf68f3daa246bd27b6a4a5905230332f7e2306c8aff56a99908293"
+          },
+          "jess": {
+            "package": "org.dreamweave.magick",
+            "jess_api": "1",
+            "content_digest": "f2f7cd019fb5f6f4d347482b947efe4e7fda0a33cf62f24cd79380878694b9ff",
             "dependencies": {}
           }
         }
