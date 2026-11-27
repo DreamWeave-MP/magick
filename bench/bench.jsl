@@ -12,6 +12,7 @@ local bytes = require '@dream/bytes'
 local color = require '@magick/color'
 local fs = require '@dream/fs'
 local magick = require '@magick'
+local paint = require '@magick/paint'
 local path = require '@magick/path'
 
 -- A build without the verified toolchain runs Luau slower than a release does, so a number from
@@ -111,6 +112,9 @@ local Expected: { [string]: string } = {
   ['color round trip srgb'] = '256x256:697e4511',
   ['color round trip linear'] = '256x256:697e4511',
   ['color composite src-over'] = '256x256:96da56e7',
+  ['paint solid circle'] = '256x256:8de2b1ed',
+  ['paint linear circle'] = '256x256:787d88ac',
+  ['paint radial circle'] = '256x256:171707ec',
   ['coverageIn ring nonzero'] = '512x512:a92f984b',
   ['coverageIn ring evenodd'] = '512x512:a92f984b',
   ['coverageIn ring tiles 128'] = '512x512:a92f984b',
@@ -442,6 +446,23 @@ workload('color composite src-over', function()
   buffer.copy(destination.data, 0, otherTile.data)
 
   return color.toImage(color.composite(destination, halfTile, { opacity = 0.75 }))
+end)
+
+-- 0.2.0 paints: a four-stop linear and a focal radial gradient through a circle on a 256 tile, and
+-- a solid through the same circle.
+local Sky = paint.stops(0, '#0b1d3a', 0.55, '#c0587a', 0.8, '#f2a65a', 1, '#ffe3a0')
+local Disc = path.new():circle(128, 128, 120)
+
+workload('paint solid circle', function()
+  return color.toImage(paint.fillPath(color.tile(256, 256), Disc, paint.solid '#da96e0'))
+end)
+
+workload('paint linear circle', function()
+  return color.toImage(paint.fillPath(color.tile(256, 256), Disc, paint.linear(0, 0, 0, 256, Sky)))
+end)
+
+workload('paint radial circle', function()
+  return color.toImage(paint.fillPath(color.tile(256, 256), Disc, paint.radial(128, 128, 120, Sky, { focusX = 90, focusY = 80 })))
 end)
 
 -- The 0.2.0 coverage of the same ring, by each fill rule, single-shot and as 128-pixel tiles laid

@@ -109,6 +109,33 @@ browsers do) or `linear` (the sRGB transfer taken off on entry and put back on o
 Legacy `Image:over`, `Image:screen`, `Image:darken` and the rest keep their straight-alpha RGBA8 arithmetic and their
 goldens; the working tile is a separate, opt-in substrate.
 
+### `@magick/paint`: solids and gradients
+
+A paint is a frozen value (it cannot be changed, and one paint fills any number of shapes and tiles) evaluated a span
+of pixel centers at a time into premultiplied values in the target tile's space. Its `transform` maps paint space to
+device space; pixel centers are taken back through its inverse.
+
+- `paint.solid(color, { opacity? })`.
+- `paint.stops(offset, color, offset, color, ...)` builds a stop list (`{ offset, color }` records also work). At most
+  `MaxStops` 256, offsets in 0..1, sorted stably: at an offset two stops share, the later one wins, a hard edge.
+  Colors interpolate **premultiplied** (opaque red to clear blue is half-transparent red at the middle, never purple),
+  in `interpolation` `srgb` (default) or `linear` light.
+- `paint.linear(x0, y0, x1, y1, stops, options?)`: offset 0 at the first point, 1 at the second. No length gives the
+  last stop everywhere.
+- `paint.radial(cx, cy, radius, stops, options?)`: 0 at the focus (`focusX`, `focusY`; the center by default), 1 on
+  the circle. A focus on or past the circle is drawn in to 0.999 of the radius, as SVG 1.1 does; a radius of 0 gives
+  the last stop.
+- Gradient options: `spread` (`pad` default, `repeat`, `reflect`, the same rule for every gradient), `interpolation`,
+  `transform`, `opacity`. A single stop is a solid.
+- `paint.fillPath(tile, path, paint, { operator?, opacity?, fillRule?, transform?, tolerance?, clips? })`: covers the
+  path exactly over the tile's window and composites the paint through it. `paint.fillMask(tile, paint, mask?, left?,
+  top?, options?)` does the same through a coverage mask placed in device space, or over the whole tile.
+  `paint.span(paint, tile, row, first, count, out)` is the evaluation itself, for code that composites on its own.
+
+Nothing the size of the canvas is made for a paint: a fill allocates the coverage window and one row of span scratch.
+`Path:fill(image, color)` stays the legacy straight-alpha routine; a solid fill through `fillPath` gives the same bytes
+on whole pixels of opaque colors and is within one step elsewhere (premultiplied f32 rounds differently).
+
 ## Gates
 
 `tests/gate.jsl` holds the package to tiny exact fixtures (transparency, clipping, alpha, curves,

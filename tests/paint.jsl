@@ -1,0 +1,299 @@
+--!strict
+-- `@magick/paint` (MAG-009, MAG-010): solid paint against legacy fills, linear and radial gradients
+-- at pixel centers held to values worked out by hand, premultiplied stop interpolation, hard edges,
+-- spread, degenerate gradients, focal points, transforms, operators and refusals.
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+--- A paint over one row of `width` pixels from x = 0, as straight bytes, red channel by default.
+local function row(value: paint.Paint, width: number, channel: number?): { number }
+  local tile = color.tile(width, 1)
+
+  paint.fillMask(tile, value)
+
+  local image = color.toImage(tile)
+  local out: { number } = {}
+
+  for column = 0, width - 1 do
+    table.insert(out, (select(channel or 1, image:get(column, 0))))
+  end
+
+  return out
+end
+
+local Ramp = paint.stops(0, '#000000', 1, '#ffffff')
+
+suite.describe('solid', function()
+  suite.it('fills a whole-pixel rectangle with the bytes a legacy fill gives', function()
+    local legacy = magick.new(12, 8, '#203040')
+
+    path.new():rect(2, 1, 9, 6):fill(legacy, '#e0a030')
+
+    local tile = color.fromImage(magick.new(12, 8, '#203040'))
+
+    paint.fillPath(tile, path.new():rect(2, 1, 9, 6), paint.solid '#e0a030')
+    expect(buffer.tostring(color.toImage(tile).data) == buffer.tostring(legacy.data)).toBe(true)
+  end)
+
+  suite.it('agrees with a legacy fill within one step where edges are partly covered', function()
+    local legacy = magick.new(24, 24, '#203040')
+
+    path.new():circle(12, 12, 9.3):fill(legacy, '#e0a030')
+
+    local tile = color.fromImage(magick.new(24, 24, '#203040'))
+
+    paint.fillPath(tile, path.new():circle(12, 12, 9.3), paint.solid '#e0a030')
+
+    local image = color.toImage(tile)
+    local worst = 0
+
+    for offset = 0, 24 * 24 * 4 - 1 do
+      worst = math.max(worst, math.abs(buffer.readu8(image.data, offset) - buffer.readu8(legacy.data, offset)))
+    end
+
+    expect(worst <= 1).toBe(true)
+  end)
+
+  suite.it('multiplies its opacity by the fill opacity, once', function()
+    local tile = color.tile(1, 1)
+
+    paint.fillMask(tile, paint.solid('#ffffff', { opacity = 0.5 }), nil, nil, nil, { opacity = 0.5 })
+    expect(math.abs(select(4, color.pixel(tile, 0, 0)) - 0.25) < 1e-6).toBe(true)
+  end)
+
+  suite.it('is a frozen value, shared freely', function()
+    local value = paint.solid '#ff0000'
+
+    expect(table.isfrozen(value :: any)).toBe(true)
+    expect(function()
+      (value :: any).opacity = 0
+    end).toThrow 'attempt to modify a readonly table'
+  end)
+
+  suite.it('is frozen all the way down, every kind of paint', function()
+    local function unfrozen(value: unknown, where: string): string?
+      if type(value) ~= 'table' then return nil end
+      if not table.isfrozen(value :: { [unknown]: unknown }) then return where end
+
+      for key, inner in value :: { [unknown]: unknown } do
+        local found = unfrozen(inner, `{where}.{tostring(key)}`)
+
+        if found then return found end
+      end
+
+      return nil
+    end
+
+    local stops = paint.stops(0, '#000000', 1, '#ffffff')
+    local paints: { [string]: paint.Paint } = {
+      solid = paint.solid '#336699',
+      linear = paint.linear(0, 0, 10, 0, stops),
+      radial = paint.radial(5, 5, 5, stops, { focusX = 4 }),
+    }
+
+    for name, value in paints do
+      expect(unfrozen(value, name)).toBe(nil)
+    end
+  end)
+end)
+
+suite.describe('linear', function()
+  suite.it('takes each pixel at its center: t = 0.05, 0.15, ... across ten pixels', function()
+    -- round(t * 255) for t = (column + 0.5) / 10.
+    expect(row(paint.linear(0, 0, 10, 0, Ramp), 10)).toEqual { 13, 38, 64, 89, 115, 140, 166, 191, 217, 242 }
+  end)
+
+  suite.it('makes a hard edge at a shared offset, the later stop winning on it', function()
+    local hard = paint.linear(0, 0, 4, 0, paint.stops(0, '#ff0000', 0.5, '#ff0000', 0.5, '#0000ff', 1, '#0000ff'))
+
+    expect(row(hard, 4)).toEqual { 255, 255, 0, 0 }
+    expect(row(hard, 4, 3)).toEqual { 0, 0, 255, 255 }
+
+    -- A pixel center exactly on the shared offset takes the later stop.
+    local centered = paint.linear(-1.5, 0, 2.5, 0, paint.stops(0, '#ff0000', 0.5, '#ff0000', 0.5, '#0000ff', 1, '#0000ff'))
+
+    expect(row(centered, 1, 3)).toEqual { 255 }
+  end)
+
+  suite.it('interpolates premultiplied: opaque red to clear blue is half-transparent red, never purple', function()
+    local fade = paint.linear(-0.5, 0, 1.5, 0, paint.stops(0, '#ff0000ff', 1, '#0000ff00'))
+    local tile = color.tile(1, 1)
+
+    paint.fillMask(tile, fade)
+    expect({ color.toImage(tile):get(0, 0) }).toEqual { 255, 0, 0, 128 }
+  end)
+
+  suite.it('interpolates in linear light when asked: the middle of black to white is 188, not 128', function()
+    local around = { -0.5, 0, 1.5, 0 }
+    local srgb = paint.linear(around[1], around[2], around[3], around[4], Ramp)
+    local linear = paint.linear(around[1], around[2], around[3], around[4], Ramp, { interpolation = 'linear' })
+
+    -- encode(0.5) = 1.055 * 0.5 ^ (1 / 2.4) - 0.055 = 0.73536, 187.5 of 255.
+    expect(row(srgb, 1)).toEqual { 128 }
+    expect(row(linear, 1)).toEqual { 188 }
+  end)
+
+  suite.it('spreads past its ends by padding, repeating or reflecting', function()
+    expect({ paint.spreadOf('pad', 1.25), paint.spreadOf('repeat', 1.25), paint.spreadOf('reflect', 1.25) }).toEqual { 1, 0.25, 0.75 }
+    expect({ paint.spreadOf('pad', -0.25), paint.spreadOf('repeat', -0.25), paint.spreadOf('reflect', -0.25) }).toEqual { 0, 0.75, 0.25 }
+    expect(paint.spreadOf('reflect', 2.5)).toBe(0.5)
+
+    -- A ramp four pixels long: t = 0.125, 0.375, ... at the centers, past 1 from the fifth.
+    local function spread(kind: paint.Spread): { number }
+      return row(paint.linear(0, 0, 4, 0, Ramp, { spread = kind }), 8)
+    end
+
+    expect(spread 'pad').toEqual { 32, 96, 159, 223, 255, 255, 255, 255 }
+    expect(spread 'repeat').toEqual { 32, 96, 159, 223, 32, 96, 159, 223 }
+    expect(spread 'reflect').toEqual { 32, 96, 159, 223, 223, 159, 96, 32 }
+  end)
+
+  suite.it('gives the last stop where it has no length, and a single stop everywhere', function()
+    expect(row(paint.linear(3, 3, 3, 3, Ramp), 3)).toEqual { 255, 255, 255 }
+    expect(row(paint.linear(0, 0, 10, 0, paint.stops(0.3, '#808080')), 3)).toEqual { 128, 128, 128 }
+  end)
+
+  suite.it('runs along its transform: turned a quarter, it runs down', function()
+    local turned = paint.linear(0, 0, 10, 0, Ramp, { transform = transform.rotate(math.pi / 2) })
+    local tile = color.tile(1, 10)
+
+    paint.fillMask(tile, turned)
+
+    local image = color.toImage(tile)
+
+    expect({ (image:get(0, 0)), (image:get(0, 9)) }).toEqual { 13, 242 }
+  end)
+
+  suite.it('evaluates a span as it evaluates each pixel alone', function()
+    local value = paint.linear(1, 2, 37, 9, paint.stops(0, '#ff000080', 0.4, '#00ff00', 1, '#0000ff40'), { spread = 'reflect' })
+    local tile = color.tile(40, 3, { left = -3, top = 5 })
+    local whole, single = buffer.create(40 * 32), buffer.create(32)
+
+    paint.span(value, tile, 1, 0, 40, whole)
+
+    for column = 0, 39 do
+      paint.span(value, tile, 1, column, 1, single)
+      expect(buffer.readstring(whole, column * 32, 32)).toBe(buffer.tostring(single))
+    end
+  end)
+end)
+
+suite.describe('radial', function()
+  suite.it('runs from the center to the circle', function()
+    -- Pixel (k, 0) has its center at (k + 0.5, 0.5): distances 0.707, 1.581, 2.550, 3.536, 4.528,
+    -- 5.523, ... over the radius 10, as bytes 18.0, 40.3, 65.0, 90.2, 115.5, 140.8, ...
+
+    local value = paint.radial(0, 0, 10, Ramp)
+
+    expect(row(value, 12)).toEqual { 18, 40, 65, 90, 115, 141, 166, 192, 217, 243, 255, 255 }
+  end)
+
+  suite.it('starts from its focus: two thirds of the way from a focus at -5 to the edge at 10', function()
+    local value = paint.radial(0, 0, 10, Ramp, { focusX = -5, focusY = 0.5, transform = transform.translate(0, -0.5) })
+    local tile = color.tile(1, 1, { left = 4 })
+
+    -- The center of pixel 4 is x = 4.5; with the focus at -5 the ray meets the circle at 10, so
+    -- t = 9.5 / 15.
+    paint.fillMask(tile, value)
+    expect((color.toImage(tile):get(0, 0))).toBe(math.floor(9.5 / 15 * 255 + 0.5))
+  end)
+
+  suite.it('gives the last stop when its radius is 0', function()
+    expect(row(paint.radial(2, 0, 0, Ramp), 3)).toEqual { 255, 255, 255 }
+  end)
+
+  suite.it('draws a focus on the circle back inside it', function()
+    local value = paint.radial(0, 0, 10, Ramp, { focusX = 20 })
+
+    expect(value.geometry[4]).toBe(9.99)
+  end)
+end)
+
+suite.describe('filling', function()
+  suite.it('composites through a path by an operator', function()
+    local tile = color.fromImage(magick.new(4, 1, '#ffffff'))
+
+    paint.fillPath(tile, path.new():rect(1, 0, 3, 1), paint.solid '#ff0000', { operator = 'src-in' })
+
+    local image = color.toImage(tile)
+
+    expect({ image:get(0, 0) }).toEqual { 0, 0, 0, 0 }
+    expect({ image:get(1, 0) }).toEqual { 255, 0, 0, 255 }
+  end)
+
+  suite.it('fills through a mask placed in device space, and nothing outside it', function()
+    local tile = color.tile(4, 2, { left = 10, top = 20 })
+    local mask = magick.mask(2, 1, buffer.fromstring '\255\128')
+
+    paint.fillMask(tile, paint.solid '#ffffff', mask, 11, 21)
+
+    local image = color.toImage(tile)
+
+    expect({ image:get(1, 1) }).toEqual { 255, 255, 255, 255 }
+    expect({ image:get(2, 1) }).toEqual { 255, 255, 255, 128 }
+    expect({ image:get(1, 0) }).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('makes nothing the size of the canvas for a paint', function()
+    local tile = color.tile(512, 512)
+    local value = paint.linear(0, 0, 512, 512, Ramp)
+    local before = gcinfo()
+
+    paint.fillPath(tile, path.new():rect(0, 0, 512, 512), value)
+
+    -- The coverage window is 256 KiB and the span scratch 16 KiB; a 512 square RGBA8 image would
+    -- be 1 MiB and an f32 one 4 MiB.
+    expect(gcinfo() - before < 400).toBe(true)
+  end)
+end)
+
+suite.describe('refusals', function()
+  suite.it('refuses bad stops, spreads, spaces, options and transforms by name', function()
+    expect(function()
+      paint.linear(0, 0, 1, 0, {})
+    end).toThrow 'magick: a gradient needs at least one stop'
+
+    expect(function()
+      paint.linear(0, 0, 1, 0, paint.stops(1.5, '#000'))
+    end).toThrow 'magick: stop offsets must be numbers in 0..1'
+
+    local many: { paint.Stop } = table.create(257, { offset = 0, color = '#000' :: magick.Color })
+
+    expect(function()
+      paint.linear(0, 0, 1, 0, many)
+    end).toThrow 'magick: MaxStops 256 exceeded'
+
+    expect(function()
+      paint.linear(0, 0, 1, 0, Ramp, { spread = 'mirror' :: any })
+    end).toThrow 'magick: unknown spread mirror'
+
+    expect(function()
+      paint.linear(0, 0, 1, 0, Ramp, { interpolation = 'hsl' :: any })
+    end).toThrow 'magick: unknown color space hsl'
+
+    expect(function()
+      paint.linear(0, 0, 1, 0, Ramp, { transform = transform.scale(0, 1) })
+    end).toThrow 'magick: transform is singular'
+
+    expect(function()
+      paint.linear(0 / 0, 0, 1, 0, Ramp)
+    end).toThrow 'magick: gradient geometry must be finite'
+
+    expect(function()
+      paint.solid('#fff', { alpha = 1 } :: any)
+    end).toThrow 'magick: unknown option alpha'
+
+    expect(function()
+      paint.fillPath(color.tile(1, 1), path.new(), paint.solid '#fff', { operator = 'plus' :: any })
+    end).toThrow 'magick: unknown operator plus'
+  end)
+end)
+
+return suite
