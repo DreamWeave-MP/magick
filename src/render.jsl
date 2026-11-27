@@ -30,6 +30,7 @@ size (the parity tests hold this).
 Filters see the canvas only: what a group draws outside the canvas is not there for its blur or
 shadow to spread, as if the group had been drawn into a canvas-sized surface first.
 ]]
+local brush = require '@magick/brush'
 local color = require '@magick/color'
 local magick = require '@magick'
 local paint = require '@magick/paint'
@@ -50,7 +51,7 @@ Module.MaxHaloPx = 64
 
 --- One operation of a plan.
 export type Op = {
-  kind: 'fill' | 'push' | 'pop',
+  kind: 'fill' | 'push' | 'pop' | 'dabs',
   --- The node it came from, and that node's name.
   node: number,
   name: string?,
@@ -72,6 +73,8 @@ export type Op = {
   clip: { prepared: path.Prepared, rule: path.FillRule }?,
   mask: { ops: { Op }, kind: 'alpha' | 'luminance' }?,
   filters: { scene.Filter },
+  --- Dabs: the stroke, moved into device space.
+  stroke: brush.Stroke?,
 }
 
 --- A compiled document, as this module holds it: everything a render reads, fixed.
@@ -208,6 +211,7 @@ local function fillOp(node: scene.Node, prepared: path.Prepared, rule: path.Fill
     clip = nil,
     mask = nil,
     filters = {},
+    stroke = nil,
   }
 end
 
@@ -230,6 +234,7 @@ local function frameOp(kind: 'push' | 'pop', node: scene.Node): Op
     clip = nil,
     mask = nil,
     filters = {},
+    stroke = nil,
   }
 end
 
@@ -238,8 +243,25 @@ end
 local owning: { [buffer]: buffer }? = nil
 
 --- A paint the plan owns: a pattern reads a copy of its source's pixels made now, so writing the
---- source afterwards never reaches the plan. Every other paint holds no buffer.
+--- source afterwards never reaches the plan. A mix or mask owns its inputs the same way; every
+--- other paint holds no buffer.
 local function own(value: paint.Paint): paint.Paint
+  local inputs = value.inputs
+
+  if inputs then
+    local owned: { paint.Paint } = {}
+
+    for _, inner in inputs do
+      table.insert(owned, own(inner))
+    end
+
+    local copy = table.clone(value) :: { [string]: unknown }
+
+    copy.inputs = table.freeze(owned)
+
+    return table.freeze(copy) :: paint.Paint
+  end
+
   local source = value.source
 
   if value.kind ~= 'pattern' or not source then return value end
@@ -259,6 +281,32 @@ local function own(value: paint.Paint): paint.Paint
   copy.source = table.freeze(record)
 
   return table.freeze(copy) :: paint.Paint
+end
+
+--- A stroke the plan owns: an image tip's mask is copied now, as a pattern's source is, so writing
+--- the mask afterwards never reaches the plan. Round and bristle tips hold no buffer.
+local function ownStroke(stroke: brush.Stroke): brush.Stroke
+  local tip = stroke.brush.tip
+
+  if not tip or tip.kind ~= 'image' then return stroke end
+
+  local copies = owning :: { [buffer]: buffer }
+  local mask = tip.mask
+  local data = copies[mask.data]
+
+  if not data then
+    data = buffer.create(buffer.len(mask.data))
+    buffer.copy(data, 0, mask.data)
+    copies[mask.data] = data
+  end
+
+  local settings = table.clone(stroke.brush) :: { [string]: unknown }
+  local copy = table.clone(stroke) :: { [string]: unknown }
+
+  settings.tip = table.freeze { kind = 'image', mask = magick.mask(mask.width, mask.height, data) }
+  copy.brush = table.freeze(settings)
+
+  return table.freeze(copy) :: brush.Stroke
 end
 
 --- A copy of a group's filters, so the document's list and colors can change after a compile.
@@ -328,6 +376,18 @@ local function compileNode(node: scene.Node, outer: Matrix, ops: { Op }, toleran
     end
 
     return box
+  end
+
+  if node.kind == 'stroke' then
+    local made = ownStroke(brush.moved(brush.stroke(node.samples :: { brush.Sample }, node.brush :: brush.Brush, node.seed), matrix))
+    local op = frameOp('push', node)
+
+    op.kind = 'dabs'
+    op.stroke = made
+    op.left, op.top, op.right, op.bottom = made.left, made.top, made.right, made.bottom
+    table.insert(ops, op)
+
+    return { made.left, made.top, made.right, made.bottom }
   end
 
   if node.kind == 'image' then
@@ -402,6 +462,8 @@ end
 local SlotBytes = 16
 local RecordBytes = 2048
 local PreparedBytes = 1024
+--- A dab: a record of nine numbers, or fifteen and a four-slot array with a frame, in 16 nodes.
+local DabBytes = 640
 
 --- An estimate of the memory operations hold: a record each, a prepared outline's record, arrays and
 --- six slots an edge, and a mask's operations. Owned pixels are counted by `compile`, once per copy.
@@ -415,6 +477,10 @@ local function planBytes(ops: { Op }): number
     local prepared = op.prepared
 
     if prepared then total += PreparedBytes + prepared.count * 6 * SlotBytes end
+
+    local stroke = op.stroke
+
+    if stroke then total += #stroke.dabs * DabBytes end
 
     local clip = op.clip
 
@@ -503,7 +569,7 @@ function Module.dump(handle: Plan): string
 
     local offCanvas = op.right <= 0 or op.bottom <= 0 or op.left >= plan.width or op.top >= plan.height
     local box = if op.kind == 'pop' then '' else ` [{op.left}, {op.top}, {op.right}, {op.bottom}]`
-    local extra = if op.kind == 'fill' then ` {(op.paint :: paint.Paint).kind} {op.rule} {op.prepared and (op.prepared :: path.Prepared).count or 0} edges` else ''
+    local extra = if op.kind == 'fill' then ` {(op.paint :: paint.Paint).kind} {op.rule} {op.prepared and (op.prepared :: path.Prepared).count or 0} edges` elseif op.kind == 'dabs' then ` {#(op.stroke :: brush.Stroke).dabs} dabs` else ''
 
     table.insert(lines, `{string.format('%4d', index)} {string.rep('  ', depth)}{op.kind} #{op.node}{if op.name then ' ' .. op.name else ''}{box}{extra}{if offCanvas and op.kind ~= 'pop' then ' OFF-CANVAS' else ''}`)
 
@@ -753,7 +819,10 @@ runOps = function(plan: Compiled, ops: { Op }, base: Tile, pool: Pool, depth: nu
       continue
     end
 
-    if op.kind == 'fill' then
+    if op.kind == 'dabs' then
+      stats.rendered += 1
+      brush.paint(top, op.stroke :: brush.Stroke, { opacity = op.opacity, blend = op.blend })
+    elseif op.kind == 'fill' then
       stats.rendered += 1
       paint.fillPrepared(top, op.prepared :: path.Prepared, op.paint :: paint.Paint, {
         fillRule = op.rule,
@@ -901,6 +970,12 @@ end
 --- Replies come back in the order each worker was sent them, so the output does not depend on
 --- timing. Every worker is stopped and joined before an error, a failed worker or a cancel goes on.
 local function renderParallel(plan: Compiled, grid: Grid, output: magick.Image, workers: number, cancel: (() -> boolean)?, stats: Stats)
+  for _, op in plan.ops do
+    if op.paint and paint.hasShader(op.paint) then
+      error('magick: a shader paint renders on one worker only, since a function cannot cross to a worker; use a field paint', 3)
+    end
+  end
+
   local worker = require '@jess/worker'
   local spawned = {}
   local count = grid.columns * grid.rows

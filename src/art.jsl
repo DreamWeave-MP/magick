@@ -1,0 +1,151 @@
+--!strict
+--[[
+@magick/art: authoring helpers (MAG-035), sugar over the scene, brush and noise modules with no
+rendering of their own.
+
+- `palette(name)`: curated colors, dark to light, for a mood.
+- `scatter(seed, count, box, spacing?)`: points spread evenly but irregularly over a box, the same
+  for a seed: a jittered grid, never clumped.
+- `samples(path, pressure?)`: brush samples along a path's first contour, so a brush can paint
+  any vector line, with pressure as a function of the way along it.
+- `symbol(build)`: a reusable motif, placed as a group wherever it is wanted.
+]]
+local brush = require '@magick/brush'
+local magick = require '@magick'
+local noise = require '@magick/noise'
+local path = require '@magick/path'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+
+local Module = {}
+
+local Palettes: { [string]: { string } } = {
+  dusk = { '#141a33', '#3b3466', '#7a4f7a', '#c46a6a', '#f0a868', '#fbe0a8' },
+  forest = { '#0f1f14', '#1f3a22', '#3a5a2e', '#6a8a3e', '#a8b860', '#e0e0a8' },
+  ocean = { '#081624', '#123050', '#1f5a80', '#3a8aa8', '#7ac0c8', '#d0ecec' },
+  ember = { '#1a0a08', '#4a140c', '#8a2a10', '#c85a1a', '#f09a3a', '#ffe0a0' },
+  ink = { '#0e0e12', '#2a2a30', '#5a5a60', '#9a968e', '#d8d2c4', '#f4eee0' },
+  meadow = { '#2a3a1a', '#4e6a2a', '#8aa040', '#d8c860', '#f0a0a8', '#fdf4dc' },
+}
+
+--- The names of the palettes.
+Module.paletteNames = table.freeze { 'dusk', 'forest', 'ocean', 'ember', 'ink', 'meadow' }
+
+--- A palette's colors, dark to light.
+function Module.palette(name: string): { magick.Color }
+  local colors = Palettes[name]
+
+  if not colors then error(`magick: unknown palette {name}`, 2) end
+
+  return table.clone(colors) :: { magick.Color }
+end
+
+--- The most points one scatter makes.
+Module.MaxScatter = 65536
+
+--- `count` points over the box (left, top, right, bottom): one in each cell of a grid fitted to the
+--- box, jittered within it by a seed, so they spread evenly but never in rows. Each point is
+--- `{ x, y, unit }`, `unit` a value in 0..1 of its own for choosing sizes or colors.
+function Module.scatter(seed: number, count: number, box: { number }): { { number } }
+  if count ~= math.floor(count) or count < 0 then error('magick: a scatter count must be a whole number', 2) end
+  if count > Module.MaxScatter then error(`magick: MaxScatter {Module.MaxScatter} exceeded`, 2) end
+
+  local left, top, right, bottom = box[1], box[2], box[3], box[4]
+  local width, height = right - left, bottom - top
+
+  if not (width > 0 and height > 0) then error('magick: a scatter box needs area', 2) end
+
+  local columns = math.max(1, math.floor(math.sqrt(count * width / height) + 0.5))
+  local rows = math.max(1, math.ceil(count / columns))
+  local points: { { number } } = {}
+  -- The cells in a seeded order (a Fisher-Yates shuffle by `hash`), so each point has a cell of its
+  -- own and a count short of the grid is a spread subset, not a strip.
+  local cells = table.create(columns * rows) :: { number }
+
+  for index = 1, columns * rows do
+    cells[index] = index - 1
+  end
+
+  for index = columns * rows, 2, -1 do
+    local other = noise.hash(seed, index, 0) % index + 1
+
+    cells[index], cells[other] = cells[other], cells[index]
+  end
+
+  for index = 0, count - 1 do
+    local cell = cells[index + 1]
+    local column, row = cell % columns, cell // columns
+
+    table.insert(points, {
+      left + (column + noise.random(seed, index, 1)) / columns * width,
+      top + (row + noise.random(seed, index, 2)) / rows * height,
+      noise.random(seed, index, 3),
+    })
+  end
+
+  return points
+end
+
+--- Brush samples along a path's first contour, as drawn (an open one is finished first), every `step` pixels of
+--- the flattened line (2 by default), with `pressure(along)` for `along` from 0 at its start to 1
+--- at its end (full pressure when left out).
+function Module.samples(line: path.Path, pressure: ((along: number) -> number)?, step: number?): { brush.Sample }
+  local spacing = step or 2
+
+  if spacing ~= spacing or spacing <= 0 then error('magick: a sample step must be positive', 2) end
+
+  local contour = path.describe(line:finish())
+  local first = contour.contours[1] or contour.lines[1]
+
+  if not first then error('magick: the path has no contour to sample', 2) end
+
+  local single = path.fromDescription { tolerance = contour.tolerance, contours = { { commands = first.commands, matrix = first.matrix, reverse = false, closed = first.closed } }, lines = {} }
+  local points = path.flatten(single)[1]
+  local lengths = { 0 }
+
+  for index = 3, #points - 1, 2 do
+    table.insert(lengths, lengths[#lengths] + math.sqrt((points[index] - points[index - 2]) ^ 2 + (points[index + 1] - points[index - 1]) ^ 2))
+  end
+
+  local total = lengths[#lengths]
+  local out: { brush.Sample } = {}
+  local segment = 1
+
+  for distance = 0, total, spacing do
+    while segment < #lengths - 1 and lengths[segment + 1] < distance do
+      segment += 1
+    end
+
+    local share = if lengths[segment + 1] > lengths[segment] then (distance - lengths[segment]) / (lengths[segment + 1] - lengths[segment]) else 0
+    local at = segment * 2 - 1
+    local along = if total > 0 then distance / total else 0
+
+    table.insert(out, {
+      points[at] + (points[at + 2] - points[at]) * share,
+      points[at + 1] + (points[at + 3] - points[at + 1]) * share,
+      if pressure then math.clamp(pressure(along), 0, 1) else 1,
+    })
+  end
+
+  return out
+end
+
+--- A reusable motif: `build(document, group)` adds the motif's nodes to `group`. The returned
+--- function places one copy as a new group under `parent`, moved by `matrix`, and returns it.
+export type Symbol = (document: scene.Document, parent: scene.Node, matrix: transform.Matrix, options: scene.GroupOptions?) -> scene.Node
+
+function Module.symbol(build: (document: scene.Document, group: scene.Node) -> ()): Symbol
+  return function(document: scene.Document, parent: scene.Node, matrix: transform.Matrix, options: scene.GroupOptions?): scene.Node
+    local settings = table.clone(options or {}) :: scene.GroupOptions
+
+    settings.transform = if settings.transform then transform.multiply(matrix, settings.transform) else matrix
+
+    local group = parent:add(document:group(settings))
+
+    build(document, group)
+
+    return group
+  end
+end
+
+return Module

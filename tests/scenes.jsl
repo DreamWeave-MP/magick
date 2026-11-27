@@ -10,11 +10,16 @@
 -- `clipped circle` by area alone, and the rest at the points listed there. Every other pixel of a
 -- scene is held by its fingerprint alone, so the fingerprint says the tree drew this, not that it
 -- drew the right thing. A change that moves one is a visual change and needs a reviewed rebaseline.
+local brush = require '@magick/brush'
 local color = require '@magick/color'
 local magick = require '@magick'
+local material = require '@magick/material'
 local paint = require '@magick/paint'
 local path = require '@magick/path'
+local render = require '@magick/render'
+local sceneModule = require '@magick/scene'
 local transform = require '@magick/transform'
+local text = require '@magick/text'
 local support = require './support'
 
 type Image = support.Image
@@ -302,6 +307,82 @@ scene('isolated group', function()
   return color.toImage(backdrop)
 end)
 
+-- MAG-032, MAG-033: the five media presets, one stroke each over paper, and below them one brush
+-- under each accumulation: buildup piling up, constant staying even, wet pooling at its edges.
+scene('brush media', function()
+  local document = sceneModule.new(160, 150, { background = '#f2ead8', space = 'linear' })
+  local paper = brush.paper(21)
+
+  local function wave(top: number, pressure: (along: number) -> number): { brush.Sample }
+    local samples: { brush.Sample } = {}
+
+    for step = 0, 24 do
+      local along = step / 24
+
+      table.insert(samples, { 10 + along * 140, top + math.sin(along * 6) * 6, pressure(along) })
+    end
+
+    return samples
+  end
+
+  local media: { { name: string, size: number, color: string } } = {
+    { name = 'ink', size = 5, color = '#151520' },
+    { name = 'oil', size = 12, color = '#b04428' },
+    { name = 'watercolor', size = 14, color = '#2a68b8' },
+    { name = 'graphite', size = 3, color = '#303030' },
+    { name = 'airbrush', size = 16, color = '#d04080' },
+  }
+
+  for index, medium in media do
+    local settings = brush.preset(medium.name, medium.size, medium.color, { grain = paper })
+
+    document:add(document:stroke(wave(10 + (index - 1) * 20, function(along: number): number
+      return 0.3 + 0.7 * math.sin(along * math.pi)
+    end), settings, { seed = index }))
+  end
+
+  for index, accumulation in { 'buildup', 'constant', 'wet' } :: { 'buildup' | 'constant' | 'wet' } do
+    document:add(document:stroke({ { 12 + (index - 1) * 50, 140 }, { 30 + (index - 1) * 50, 112 }, { 48 + (index - 1) * 50, 140 } }, {
+      size = 12,
+      color = '#802060',
+      flow = 0.35,
+      spacing = 0.15,
+      tip = { kind = 'round', hardness = 0.3 },
+      accumulation = accumulation,
+      edge = 1,
+    }))
+  end
+
+  return (render.image(document))
+end)
+
+-- MAG-034: every material recipe at seed 7 and its default scale, one swatch each, in the order
+-- `material.names` lists them.
+scene('materials', function()
+  local tile = color.tile(150, 96, { space = 'linear' })
+
+  for index, name in material.names do
+    local column, row = (index - 1) % 3, (index - 1) // 3
+
+    paint.fillPath(tile, path.new():roundRect(column * 50 + 2, row * 32 + 2, column * 50 + 48, row * 32 + 30, 4), material.make(name, { seed = 7 }))
+  end
+
+  return color.toImage(tile)
+end)
+
+-- MAG-035: the monoline face at three weights, capitals, small capitals, digits and punctuation,
+-- filled with a gradient.
+scene('monoline specimen', function()
+  local tile = color.tile(220, 92)
+
+  paint.fillMask(tile, paint.solid '#14161c')
+  paint.fillPath(tile, text.path(text.monoline(12), 'MAGICK', 110, 30, 30, { align = 'center' }), paint.linear(0, 8, 0, 30, paint.stops(0, '#ffe0a0', 1, '#e06040')))
+  paint.fillPath(tile, text.path(text.monoline(), 'Atelier & Canvas 0.4', 8, 56, 16), paint.solid '#e8e4dc')
+  paint.fillPath(tile, text.path(text.monoline(4), '"QUICK, BROWN FOX?" (1/2+3)!', 8, 80, 13), paint.solid '#a0c8ff')
+
+  return color.toImage(tile)
+end)
+
 --- The scenes, in the order the gallery renders and the gate suite checks them.
 local Scenes: { Scene } = scenes
 
@@ -353,6 +434,12 @@ local Recorded: { [string]: string } = {
   ['blend modes png'] = '17167:eb53cda6',
   ['isolated group pixels'] = '64x32:8f65ed7c',
   ['isolated group png'] = '556:454e1c6b',
+  ['brush media pixels'] = '160x150:18a2b638',
+  ['brush media png'] = '16365:ecf64b5a',
+  ['materials pixels'] = '150x96:6bf684c7',
+  ['materials png'] = '15156:229435a7',
+  ['monoline specimen pixels'] = '220x92:a4989d4f',
+  ['monoline specimen png'] = '7452:9fd950d9',
 }
 
 return table.freeze {

@@ -1,0 +1,711 @@
+--!strict
+--[[
+@magick/brush: strokes as stamped dabs (MAG-030 to MAG-033).
+
+A stroke is a line of samples (points with a pressure) and a brush. `stroke` turns them into dabs:
+the samples are smoothed, the line between them is walked by arc length, and a dab is stamped every
+`spacing` of the dab's own diameter, its size and opacity following the pressure. Each dab's jitter
+(size, angle, scatter, opacity, hue, lightness) comes from `noise.hash(seed, dab, channel)`, never
+from a generator, so the same stroke gives the same dabs everywhere.
+
+`paint` draws a stroke's dabs onto a working tile, through a layer of the tile's size: `buildup`
+lays each dab over the last (pigment piling up where they overlap), `constant` keeps the most any
+dab covered (an even stroke with no darker seams), and `wet` does that and then darkens the
+stroke's edges, as pooled watercolor does. Tips are a round dab of some hardness, a tuft of
+bristles whose tracks run along the stroke, or a mask image. A grain field, fixed to the canvas,
+scales each dab's alpha, and `dryness` keeps only the grain's peaks, as a dry brush skips the
+paper's hollows. These are stylized approximations; nothing here simulates fluid or pigment.
+]]
+local color = require '@magick/color'
+local magick = require '@magick'
+local noise = require '@magick/noise'
+local transform = require '@magick/transform'
+
+type Matrix = transform.Matrix
+type Tile = color.Tile
+
+local Module = {}
+
+Module.MaxSamplesPerStroke = 65536
+Module.MaxDabsPerStroke = 65536
+
+--- A point of a stroke: `{ x, y, pressure? }`, the pressure in 0..1 and 1 when left out.
+export type Sample = { number }
+
+type Point = { pointX: number, pointY: number, pressure: number }
+
+export type Tip =
+  { kind: 'round', hardness: number? }
+  | { kind: 'bristles', count: number?, hardness: number? }
+  | { kind: 'image', mask: magick.Mask }
+
+--- How much each dab may vary, each 0..1: size and opacity by that fraction, angle by that part of
+--- a half turn, scatter by that part of the diameter, hue by that part of a turn, lightness by that
+--- part of the way to black or white.
+export type Jitter = { size: number?, angle: number?, scatter: number?, opacity: number?, hue: number?, lightness: number? }
+
+export type Brush = {
+  --- The dab diameter at full pressure, in pixels.
+  size: number,
+  --- The diameter at no pressure, as a fraction of `size` (0.15 by default).
+  minimumSize: number?,
+  --- The distance between dabs as a fraction of their diameter (0.12).
+  spacing: number?,
+  --- Each dab's opacity (1) and whether pressure scales it (false).
+  flow: number?,
+  pressureFlow: boolean?,
+  color: magick.Color,
+  tip: Tip?,
+  --- The tip's roundness (1 a circle, toward 0 a flat blade), its angle, and whether the angle
+  --- follows the stroke's direction (true).
+  aspect: number?,
+  angle: number?,
+  followDirection: boolean?,
+  accumulation: ('buildup' | 'constant' | 'wet')?,
+  jitter: Jitter?,
+  --- 0..1: how strongly the samples are pulled toward their neighbours before dabs are laid.
+  smoothing: number?,
+  --- A field in canvas space scaling each dab's alpha, by `grainStrength` (0..1).
+  grain: noise.Field?,
+  grainStrength: number?,
+  --- 0..1: how much of the grain's low ground a dry brush skips.
+  dryness: number?,
+  --- 0..1: how much a wet stroke darkens at its edges.
+  edge: number?,
+  --- How the stroke lays on what is under it: `normal`, or `multiply` for a transparent glaze.
+  blend: color.BlendMode?,
+}
+
+--- One stamp: center, radius, angle, aspect, alpha, and straight color in 0..1. A dab moved by a
+--- matrix that is not a rotation and uniform scale also carries `shape`, the inverse of its full
+--- frame: the four entries (row by row) taking an offset from its center to the tip's own along and
+--- across, in units of the tip's radius; and `extentX`, `extentY`, how far it reaches each way. Its
+--- `radius` is then the tip radius times the matrix's smaller stretch, which sets its edge softness.
+export type Dab = {
+  centerX: number,
+  centerY: number,
+  radius: number,
+  angle: number,
+  aspect: number,
+  alpha: number,
+  red: number,
+  green: number,
+  blue: number,
+  shape: { number }?,
+  extentX: number?,
+  extentY: number?,
+}
+
+--- A stroke ready to draw: its dabs, its brush, and the box they cover.
+export type Stroke = {
+  dabs: { Dab },
+  brush: Brush,
+  seed: number,
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+}
+
+local function finite(value: unknown): boolean
+  return type(value) == 'number' and value == value and value > -math.huge and value < math.huge
+end
+
+local function unit(value: number?, default: number, name: string): number
+  local chosen = if not value then default else value
+
+  if not finite(chosen) or chosen < 0 or chosen > 1 then error(`magick: brush {name} must be in 0..1`, 4) end
+
+  return chosen
+end
+
+--- A brush with every setting checked and given its default.
+local function settle(brush: Brush): Brush
+  if not finite(brush.size) or brush.size <= 0 or brush.size > 4096 then error('magick: brush size must be in (0, 4096]', 3) end
+
+  local spacing = if brush.spacing == nil then 0.12 else brush.spacing
+
+  if not finite(spacing) or spacing < 0.02 or spacing > 10 then error('magick: brush spacing must be in 0.02..10', 3) end
+
+  local accumulation = brush.accumulation or 'buildup'
+
+  if accumulation ~= 'buildup' and accumulation ~= 'constant' and accumulation ~= 'wet' then error(`magick: unknown accumulation {accumulation}`, 3) end
+
+  local tip: Tip = brush.tip or { kind = 'round', hardness = 0.6 }
+
+  if tip.kind ~= 'round' and tip.kind ~= 'bristles' and tip.kind ~= 'image' then error(`magick: unknown brush tip {(tip :: { kind: string }).kind}`, 3) end
+
+  local jitter: Jitter = brush.jitter or {}
+
+  magick.color(brush.color)
+
+  return {
+    size = brush.size,
+    minimumSize = unit(brush.minimumSize, 0.15, 'minimumSize'),
+    spacing = spacing,
+    flow = unit(brush.flow, 1, 'flow'),
+    pressureFlow = brush.pressureFlow == true,
+    color = brush.color,
+    tip = tip,
+    aspect = math.max(0.05, unit(brush.aspect, 1, 'aspect')),
+    angle = if finite(brush.angle) then brush.angle else 0,
+    followDirection = brush.followDirection ~= false,
+    accumulation = accumulation,
+    jitter = {
+      size = unit(jitter.size, 0, 'jitter.size'),
+      angle = unit(jitter.angle, 0, 'jitter.angle'),
+      scatter = unit(jitter.scatter, 0, 'jitter.scatter'),
+      opacity = unit(jitter.opacity, 0, 'jitter.opacity'),
+      hue = unit(jitter.hue, 0, 'jitter.hue'),
+      lightness = unit(jitter.lightness, 0, 'jitter.lightness'),
+    },
+    smoothing = unit(brush.smoothing, 0, 'smoothing'),
+    grain = if brush.grain then noise.field(brush.grain) else nil,
+    grainStrength = unit(brush.grainStrength, if brush.grain then 0.5 else 0, 'grainStrength'),
+    dryness = unit(brush.dryness, 0, 'dryness'),
+    edge = unit(brush.edge, 0, 'edge'),
+    blend = color.checkBlend(brush.blend or 'normal'),
+  }
+end
+
+--- Points pulled toward the mean of their neighbours, `amount` of the way, twice: a stabilizer that
+--- keeps the ends where they were.
+local function smooth(points: { Point }, amount: number): { Point }
+  if amount <= 0 or #points < 3 then return points end
+
+  local current = points
+
+  for _ = 1, 2 do
+    local next: { Point } = { current[1] }
+
+    for index = 2, #current - 1 do
+      local before, here, after = current[index - 1], current[index], current[index + 1]
+      local meanX, meanY = (before.pointX + after.pointX) / 2, (before.pointY + after.pointY) / 2
+
+      table.insert(next, {
+        pointX = here.pointX + (meanX - here.pointX) * amount,
+        pointY = here.pointY + (meanY - here.pointY) * amount,
+        pressure = here.pressure,
+      })
+    end
+
+    table.insert(next, current[#current])
+    current = next
+  end
+
+  return current
+end
+
+--- A color turned around the hue circle by `turn` and moved toward white (positive `light`) or
+--- black (negative), straight channels in 0..1. The hue turn rotates about the gray axis.
+local function shift(red: number, green: number, blue: number, turn: number, light: number): (number, number, number)
+  if turn ~= 0 then
+    local angle = turn * 2 * math.pi
+    local cosine, sine = math.cos(angle), math.sin(angle)
+    local third, root = 1 / 3, math.sqrt(1 / 3)
+    local mixA = cosine + (1 - cosine) * third
+    local mixB = third * (1 - cosine) - root * sine
+    local mixC = third * (1 - cosine) + root * sine
+
+    red, green, blue = red * mixA + green * mixB + blue * mixC, red * mixC + green * mixA + blue * mixB, red * mixB + green * mixC + blue * mixA
+  end
+
+  if light > 0 then
+    red, green, blue = red + (1 - red) * light, green + (1 - green) * light, blue + (1 - blue) * light
+  elseif light < 0 then
+    red, green, blue = red * (1 + light), green * (1 + light), blue * (1 + light)
+  end
+
+  return math.clamp(red, 0, 1), math.clamp(green, 0, 1), math.clamp(blue, 0, 1)
+end
+
+--- A stroke's dabs from its samples, a brush and a seed (an integer in 1..2^31 - 2). Samples are
+--- `{ x, y, pressure? }`, finite, with pressures in 0..1; a stroke that would need more than
+--- MaxDabsPerStroke dabs is refused before any is made.
+function Module.stroke(samples: { Sample }, brush: Brush, seed: number?): Stroke
+  local chosen = settle(brush)
+  local strokeSeed = seed or 1
+
+  noise.hash(strokeSeed, 0)
+
+  if #samples == 0 then error('magick: a stroke needs at least one sample', 2) end
+  if #samples > Module.MaxSamplesPerStroke then error(`magick: MaxSamplesPerStroke {Module.MaxSamplesPerStroke} exceeded`, 2) end
+
+  local given: { Point } = table.create(#samples) :: { Point }
+
+  for _, sample in samples do
+    local pointX, pointY, pressure = sample[1], sample[2], sample[3]
+
+    if not finite(pointX) or not finite(pointY) or math.abs(pointX) > transform.MaxCoordinate or math.abs(pointY) > transform.MaxCoordinate then
+      error('magick: stroke samples must be finite and within MaxCoordinate', 2)
+    end
+
+    if pressure ~= nil and (not finite(pressure) or pressure < 0 or pressure > 1) then error('magick: a sample pressure must be in 0..1', 2) end
+
+    table.insert(given, { pointX = pointX, pointY = pointY, pressure = pressure or 1 })
+  end
+
+  local points = smooth(given, chosen.smoothing :: number)
+  local size, minimum = chosen.size, chosen.minimumSize :: number
+  local spacing = chosen.spacing :: number
+  local length = 0
+
+  for index = 2, #points do
+    length += math.sqrt((points[index].pointX - points[index - 1].pointX) ^ 2 + (points[index].pointY - points[index - 1].pointY) ^ 2)
+  end
+
+  local smallest = math.max(0.5, size * minimum * spacing)
+
+  if length / smallest + 2 > Module.MaxDabsPerStroke then error(`magick: MaxDabsPerStroke {Module.MaxDabsPerStroke} exceeded`, 2) end
+
+  local base = magick.color(chosen.color)
+  local baseRed, baseGreen, baseBlue, baseAlpha = base[1] / 255, base[2] / 255, base[3] / 255, base[4] / 255
+  local jitter = chosen.jitter :: Jitter
+  local dabs: { Dab } = {}
+  local left, top, right, bottom = math.huge, math.huge, -math.huge, -math.huge
+
+  local function stamp(atX: number, atY: number, pressure: number, heading: number)
+    local index = #dabs + 1
+    local function random(channel: number): number
+      return noise.random(strokeSeed, index, channel) * 2 - 1
+    end
+    local diameter = size * (minimum + (1 - minimum) * pressure) * (1 + random(1) * (jitter.size :: number) * 0.5)
+    local radius = math.max(0.25, diameter / 2)
+    local scatter = (jitter.scatter :: number) * diameter
+    local centerX, centerY = atX + random(2) * scatter, atY + random(3) * scatter
+    local angle = (chosen.angle :: number) + (if chosen.followDirection then heading else 0) + random(4) * (jitter.angle :: number) * math.pi / 2
+    local alpha = (chosen.flow :: number) * baseAlpha * (if chosen.pressureFlow then pressure else 1)
+
+    alpha *= math.clamp(1 + random(5) * (jitter.opacity :: number), 0, 1)
+
+    local red, green, blue = shift(baseRed, baseGreen, baseBlue, random(6) * (jitter.hue :: number) * 0.5, random(7) * (jitter.lightness :: number))
+
+    table.insert(dabs, {
+      centerX = centerX,
+      centerY = centerY,
+      radius = radius,
+      angle = angle,
+      aspect = chosen.aspect :: number,
+      alpha = alpha,
+      red = red,
+      green = green,
+      blue = blue,
+    })
+    left, right = math.min(left, centerX - radius), (math.max(right, centerX + radius))
+    top, bottom = math.min(top, centerY - radius), (math.max(bottom, centerY + radius))
+  end
+
+  local first = points[1]
+
+  if #points == 1 then
+    stamp(first.pointX, first.pointY, first.pressure, 0)
+  else
+    -- Walk the line by arc length: the next dab is `spacing` of the current diameter on.
+    local travelled, nextAt = 0, 0
+
+    for index = 2, #points do
+      local from, to = points[index - 1], points[index]
+      local deltaX, deltaY = to.pointX - from.pointX, to.pointY - from.pointY
+      local segment = math.sqrt(deltaX * deltaX + deltaY * deltaY)
+
+      if segment == 0 then continue end
+
+      local heading = math.atan2(deltaY, deltaX)
+
+      while nextAt <= travelled + segment do
+        local along = (nextAt - travelled) / segment
+        local pressure = from.pressure + (to.pressure - from.pressure) * along
+
+        stamp(from.pointX + deltaX * along, from.pointY + deltaY * along, pressure, heading)
+        nextAt += math.max(0.5, size * (minimum + (1 - minimum) * pressure) * spacing)
+      end
+
+      travelled += segment
+    end
+
+    -- The end of the line always gets a dab, so a stroke covers its last sample.
+    local last, before = points[#points], points[#points - 1]
+
+    stamp(last.pointX, last.pointY, last.pressure, math.atan2(last.pointY - before.pointY, last.pointX - before.pointX))
+  end
+
+  local made: Stroke = {
+    dabs = dabs,
+    brush = chosen,
+    seed = strokeSeed,
+    left = math.floor(left),
+    top = math.floor(top),
+    right = math.ceil(right),
+    bottom = math.ceil(bottom),
+  }
+
+  table.freeze((made :: unknown) :: { [string]: unknown })
+
+  return made
+end
+
+--- Whether a matrix's linear part is a rotation and a uniform scale, which a dab's radius and angle
+--- carry exactly.
+local function isSimilarity(matrix: Matrix): boolean
+  return matrix.scaleX == matrix.scaleY and matrix.skewY == -matrix.skewX
+end
+
+--- A dab's frame: the 2x2 matrix (row by row) taking the tip's own along and across, in units of its
+--- radius, to an offset from its center.
+local function frameOf(dab: Dab): (number, number, number, number)
+  local shape = dab.shape
+
+  if shape then
+    local determinant = shape[1] * shape[4] - shape[2] * shape[3]
+
+    return shape[4] / determinant, -shape[2] / determinant, -shape[3] / determinant, shape[1] / determinant
+  end
+
+  local cosine, sine = math.cos(dab.angle), math.sin(dab.angle)
+  local along, across = dab.radius, dab.radius * dab.aspect
+
+  return cosine * along, -sine * across, sine * along, cosine * across
+end
+
+--- A stroke moved by a matrix: dab centers through it. Under a rotation and uniform scale a dab's
+--- radius scales and its angle turns; under any other matrix (a stretch, a shear, a reflection) its
+--- whole frame goes through the matrix, so a round dab stretched two to one is an ellipse two to one
+--- and a reflected image tip is drawn reflected. The brush and seed stay.
+function Module.moved(stroke: Stroke, matrix: Matrix): Stroke
+  local scale = math.sqrt(math.abs(transform.determinant(matrix)))
+  local turn = math.atan2(matrix.skewY, matrix.scaleX)
+  local similar = isSimilarity(matrix)
+  local least = scale * scale / math.max(transform.sigmaMax(matrix), 1e-300)
+  local dabs: { Dab } = table.create(#stroke.dabs) :: { Dab }
+  local left, top, right, bottom = math.huge, math.huge, -math.huge, -math.huge
+
+  for _, dab in stroke.dabs do
+    local centerX, centerY = transform.apply(matrix, dab.centerX, dab.centerY)
+    local moved: Dab
+
+    if similar and not dab.shape then
+      moved = ({
+        centerX = centerX,
+        centerY = centerY,
+        radius = dab.radius * scale,
+        angle = dab.angle + turn,
+        aspect = dab.aspect,
+        alpha = dab.alpha,
+        red = dab.red,
+        green = dab.green,
+        blue = dab.blue,
+      } :: Dab)
+    else
+      local first, second, third, fourth = frameOf(dab)
+      -- The matrix's linear part after the dab's frame.
+      local frameA = matrix.scaleX * first + matrix.skewX * third
+      local frameB = matrix.scaleX * second + matrix.skewX * fourth
+      local frameC = matrix.skewY * first + matrix.scaleY * third
+      local frameD = matrix.skewY * second + matrix.scaleY * fourth
+      local determinant = frameA * frameD - frameB * frameC
+
+      if determinant == 0 then error('magick: a stroke cannot be moved by a singular matrix', 2) end
+
+      moved = ({
+        centerX = centerX,
+        centerY = centerY,
+        radius = dab.radius * least,
+        angle = dab.angle + turn,
+        aspect = dab.aspect,
+        alpha = dab.alpha,
+        red = dab.red,
+        green = dab.green,
+        blue = dab.blue,
+        shape = { frameD / determinant, -frameB / determinant, -frameC / determinant, frameA / determinant },
+        extentX = math.sqrt(frameA * frameA + frameB * frameB),
+        extentY = math.sqrt(frameC * frameC + frameD * frameD),
+      } :: Dab)
+    end
+
+    local reachX, reachY = moved.extentX or moved.radius, moved.extentY or moved.radius
+
+    table.insert(dabs, moved)
+    left, right = math.min(left, centerX - reachX), (math.max(right, centerX + reachX))
+    top, bottom = math.min(top, centerY - reachY), (math.max(bottom, centerY + reachY))
+  end
+
+  local made: Stroke = {
+    dabs = dabs,
+    brush = stroke.brush,
+    seed = stroke.seed,
+    left = math.floor(left),
+    top = math.floor(top),
+    right = math.ceil(right),
+    bottom = math.ceil(bottom),
+  }
+
+  table.freeze((made :: unknown) :: { [string]: unknown })
+
+  return made
+end
+
+--- The profile across a bristle tip: `count` bristles of hashed strengths, so their tracks run
+--- along the stroke.
+local function bristleProfile(seed: number, count: number): { number }
+  local profile = table.create(count) :: { number }
+
+  for index = 1, count do
+    profile[index] = 0.15 + 0.85 * noise.random(seed, index, 99) ^ 0.7
+  end
+
+  return profile
+end
+
+--- A tip's alpha at a point in the dab's own frame, `along` and `across` in units of its radius.
+local function tipAlpha(tip: Tip, along: number, across: number, radius: number, profile: { number }?): number
+  if tip.kind == 'image' then
+    local mask = tip.mask
+    local column = math.floor((along + 1) / 2 * mask.width)
+    local row = math.floor((across + 1) / 2 * mask.height)
+
+    if column < 0 or row < 0 or column >= mask.width or row >= mask.height then return 0 end
+
+    return buffer.readu8(mask.data, row * mask.width + column) / 255
+  end
+
+  local distance = math.sqrt(along * along + across * across)
+  local hardness = tip.hardness or 0.6
+  -- The edge is never sharper than a pixel, so even a hard dab is antialiased.
+  local soft = math.max(1 - hardness, 1 / math.max(radius, 1))
+
+  if distance >= 1 then return 0 end
+
+  local edge = math.clamp((1 - distance) / soft, 0, 1)
+  local alpha = edge * edge * (3 - 2 * edge)
+
+  if tip.kind == 'bristles' and profile then
+    local place = (across + 1) / 2 * #profile
+    local index = math.clamp(math.floor(place), 0, #profile - 1)
+
+    alpha *= profile[index + 1]
+  end
+
+  return alpha
+end
+
+--- Draws a stroke's dabs onto a working tile, through a layer of the tile's size, then lays the layer
+--- on with `opacity` and `blend`. Only dabs that reach the tile are stamped, and only over the pixels
+--- they reach. The same stroke gives the same bytes in any tile.
+function Module.paint(tile: Tile, stroke: Stroke, options: { opacity: number?, blend: color.BlendMode? }?)
+  if stroke.right <= tile.left or stroke.bottom <= tile.top or stroke.left >= tile.left + tile.width or stroke.top >= tile.top + tile.height then
+    return
+  end
+
+  local brush = stroke.brush
+  local tip = brush.tip :: Tip
+  local layer = color.group(tile)
+  local data, width, height = layer.data, layer.width, layer.height
+  local linear = tile.space == 'linear'
+  local profile = if tip.kind == 'bristles' then bristleProfile(stroke.seed, tip.count or 12) else nil
+  local grain = if brush.grain then noise.compile(brush.grain) else nil
+  local grainStrength, dryness = brush.grainStrength :: number, brush.dryness :: number
+  local accumulation = brush.accumulation
+
+  for _, dab in stroke.dabs do
+    local radius = dab.radius
+    local shape = dab.shape
+    local reachX, reachY = dab.extentX or radius, dab.extentY or radius
+    local fromX, toX = math.max(tile.left, math.floor(dab.centerX - reachX)), math.min(tile.left + width, math.ceil(dab.centerX + reachX))
+    local fromY, toY = math.max(tile.top, math.floor(dab.centerY - reachY)), math.min(tile.top + height, math.ceil(dab.centerY + reachY))
+
+    if fromX >= toX or fromY >= toY then continue end
+
+    local cosine, sine = math.cos(dab.angle), math.sin(dab.angle)
+    local red = if linear then color.decode(dab.red) else dab.red
+    local green = if linear then color.decode(dab.green) else dab.green
+    local blue = if linear then color.decode(dab.blue) else dab.blue
+
+    for row = fromY, toY - 1 do
+      for column = fromX, toX - 1 do
+        local offsetX, offsetY = column + 0.5 - dab.centerX, row + 0.5 - dab.centerY
+        local along, across
+        -- The radius that sets the edge's softness: the dab's own, or for a framed dab the one that
+        -- makes the edge one device pixel wide across it here, from the gradient of the tip distance.
+        local edgeRadius = radius
+
+        if shape then
+          along, across = shape[1] * offsetX + shape[2] * offsetY, shape[3] * offsetX + shape[4] * offsetY
+
+          local distance = math.sqrt(along * along + across * across)
+
+          if distance > 1e-9 then
+            local slopeX = (shape[1] * along + shape[3] * across) / distance
+            local slopeY = (shape[2] * along + shape[4] * across) / distance
+
+            edgeRadius = 1 / math.max(math.sqrt(slopeX * slopeX + slopeY * slopeY), 1e-9)
+          end
+        else
+          along, across = (offsetX * cosine + offsetY * sine) / radius, (-offsetX * sine + offsetY * cosine) / (radius * dab.aspect)
+        end
+
+        -- A wet stroke keeps its tip coverage alone, the flow coming in once at the end; the other
+        -- accumulations take each dab's own alpha now.
+        local alpha = tipAlpha(tip, along, across, edgeRadius, profile) * (if accumulation == 'wet' then 1 else dab.alpha)
+
+        if alpha <= 0 then continue end
+
+        if grain then
+          local texture = math.clamp(grain(column + 0.5, row + 0.5), 0, 1)
+
+          if dryness > 0 then
+            local edge = math.clamp((texture - dryness) / 0.15 + 0.5, 0, 1)
+
+            texture *= edge * edge * (3 - 2 * edge)
+          end
+
+          alpha *= 1 - grainStrength + grainStrength * texture
+        end
+
+        local at = ((row - layer.top) * width + (column - layer.left)) * 16
+        local held = buffer.readf32(data, at + 12)
+
+        if accumulation == 'buildup' then
+          local keep = 1 - alpha
+
+          buffer.writef32(data, at, red * alpha + buffer.readf32(data, at) * keep)
+          buffer.writef32(data, at + 4, green * alpha + buffer.readf32(data, at + 4) * keep)
+          buffer.writef32(data, at + 8, blue * alpha + buffer.readf32(data, at + 8) * keep)
+          buffer.writef32(data, at + 12, alpha + held * keep)
+        elseif alpha > held then
+          buffer.writef32(data, at, red * alpha)
+          buffer.writef32(data, at + 4, green * alpha)
+          buffer.writef32(data, at + 8, blue * alpha)
+          buffer.writef32(data, at + 12, alpha)
+        end
+      end
+    end
+  end
+
+  -- A wet stroke pools at its edges: where its coverage passes from full to empty it is raised
+  -- above the interior and darkened, most in the middle of that band, and the flow is laid on.
+  local edge, flow = brush.edge :: number, brush.flow :: number
+
+  if accumulation == 'wet' then
+    for at = 0, width * height * 16 - 16, 16 do
+      local cover = buffer.readf32(data, at + 12)
+
+      if cover <= 0 then continue end
+
+      local rim = 4 * cover * (1 - cover) * edge
+      local alpha = math.min(1, flow * cover ^ 0.6 * (1 + rim * 0.8))
+      local tint = (1 - rim * 0.35) * alpha / cover
+
+      buffer.writef32(data, at, buffer.readf32(data, at) * tint)
+      buffer.writef32(data, at + 4, buffer.readf32(data, at + 4) * tint)
+      buffer.writef32(data, at + 8, buffer.readf32(data, at + 8) * tint)
+      buffer.writef32(data, at + 12, alpha)
+    end
+  end
+
+  color.compositeGroup(tile, layer, {
+    opacity = if options and options.opacity then options.opacity else 1,
+    blend = if options and options.blend then options.blend else brush.blend,
+  })
+end
+
+-- Presets -----------------------------------------------------------------------------------------
+
+--- The media presets: stylized brushes, not simulations. Each is a full Brush less its color and
+--- size, which `preset` takes.
+local Presets: { [string]: Brush } = {
+  -- Even, pressure-shaped lines with crisp edges and no buildup.
+  ink = {
+    size = 1,
+    color = '#000000',
+    minimumSize = 0.1,
+    spacing = 0.08,
+    tip = { kind = 'round', hardness = 0.9 },
+    accumulation = 'constant',
+    grainStrength = 0,
+    smoothing = 0.5,
+  },
+  -- Opaque, bristled, color varying from dab to dab, laid thick.
+  oil = {
+    size = 1,
+    color = '#000000',
+    minimumSize = 0.6,
+    spacing = 0.06,
+    tip = { kind = 'bristles', count = 18, hardness = 0.55 },
+    grainStrength = 0.2,
+    aspect = 0.5,
+    accumulation = 'buildup',
+    flow = 0.5,
+    jitter = { hue = 0.05, lightness = 0.18, angle = 0.04, size = 0.08 },
+    smoothing = 0.3,
+  },
+  -- Transparent, soft, pooling at its edges, with granulation in the paper's grain.
+  watercolor = {
+    size = 1,
+    color = '#000000',
+    minimumSize = 0.7,
+    spacing = 0.1,
+    tip = { kind = 'round', hardness = 0.2 },
+    accumulation = 'wet',
+    flow = 0.8,
+    edge = 1,
+    blend = 'multiply',
+    grainStrength = 0.18,
+    jitter = { size = 0.12, scatter = 0.04, lightness = 0.04 },
+    smoothing = 0.4,
+  },
+  -- Fine, pressure-faded, broken by the paper's tooth.
+  graphite = {
+    size = 1,
+    color = '#000000',
+    minimumSize = 0.6,
+    spacing = 0.15,
+    tip = { kind = 'round', hardness = 0.7 },
+    accumulation = 'buildup',
+    flow = 0.35,
+    pressureFlow = true,
+    grainStrength = 0.9,
+    dryness = 0.35,
+    jitter = { opacity = 0.2 },
+  },
+  -- Very soft and low in flow, building up slowly.
+  airbrush = {
+    size = 1,
+    color = '#000000',
+    minimumSize = 0.8,
+    spacing = 0.05,
+    tip = { kind = 'round', hardness = 0 },
+    accumulation = 'buildup',
+    flow = 0.09,
+    grainStrength = 0.15,
+    pressureFlow = true,
+  },
+}
+
+--- The names of the presets.
+Module.presetNames = table.freeze { 'ink', 'oil', 'watercolor', 'graphite', 'airbrush' }
+
+--- A preset brush of a size and color, with `overrides` laid over it (a jitter table replaces the
+--- preset's whole). The presets themselves never change.
+function Module.preset(name: string, size: number, fill: magick.Color, overrides: { [string]: unknown }?): Brush
+  local base = Presets[name]
+
+  if not base then error(`magick: unknown brush preset {name}`, 2) end
+
+  local made = table.clone(base) :: { [string]: unknown }
+
+  made.size = size
+  made.color = fill
+
+  for key, value in overrides or {} do
+    made[key] = value
+  end
+
+  return made :: Brush
+end
+
+--- The paper texture the dry media read by default: fine turbulence at a seed.
+function Module.paper(seed: number, scale: number?): noise.Field
+  return noise.turbulenceField(seed, 1 / (scale or 2.2), { octaves = 3, gain = 0.6 })
+end
+
+return Module

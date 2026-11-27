@@ -5,7 +5,7 @@ id = "org.dreamweave.magick"
 version = "0.3.0"
 jess_api = "1"
 include = ["src", "LICENSES", "README.md", "COMPATIBILITY.md", "tests", "demos"]
-tests = ["tests/basic.jsl", "tests/compat.jsl", "tests/gate.jsl", "tests/property.jsl", "tests/png.jsl", "tests/path.jsl", "tests/resample.jsl", "tests/rfc.jsl", "tests/rfc_contracts.jsl", "tests/transform.jsl", "tests/coverage.jsl", "tests/stroke.jsl", "tests/color.jsl", "tests/paint.jsl", "tests/pattern.jsl", "tests/blend.jsl", "tests/scene.jsl", "tests/serialize.jsl", "tests/style.jsl"]
+tests = ["tests/basic.jsl", "tests/compat.jsl", "tests/gate.jsl", "tests/property.jsl", "tests/png.jsl", "tests/path.jsl", "tests/resample.jsl", "tests/rfc.jsl", "tests/rfc_contracts.jsl", "tests/transform.jsl", "tests/coverage.jsl", "tests/stroke.jsl", "tests/color.jsl", "tests/paint.jsl", "tests/pattern.jsl", "tests/blend.jsl", "tests/scene.jsl", "tests/serialize.jsl", "tests/noise.jsl", "tests/brush.jsl", "tests/material.jsl", "tests/text.jsl", "tests/art.jsl", "tests/style.jsl"]
 
 [modules]
 "@magick" = "src/init.jsl"
@@ -15,11 +15,16 @@ tests = ["tests/basic.jsl", "tests/compat.jsl", "tests/gate.jsl", "tests/propert
 "@magick/paint" = "src/paint.jsl"
 "@magick/scene" = "src/scene.jsl"
 "@magick/render" = "src/render.jsl"
+"@magick/noise" = "src/noise.jsl"
+"@magick/brush" = "src/brush.jsl"
+"@magick/material" = "src/material.jsl"
+"@magick/text" = "src/text.jsl"
+"@magick/art" = "src/art.jsl"
 
 [[layer]]
 id = "org.dreamweave.magick"
 requires = []
-exports = ["@magick", "@magick/path", "@magick/transform", "@magick/color", "@magick/paint", "@magick/scene", "@magick/render"]
+exports = ["@magick", "@magick/path", "@magick/transform", "@magick/color", "@magick/paint", "@magick/scene", "@magick/render", "@magick/noise", "@magick/brush", "@magick/material", "@magick/text", "@magick/art"]
 
 [targets.workers-check]
 kind = "application"

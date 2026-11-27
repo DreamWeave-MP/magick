@@ -1,0 +1,328 @@
+--!strict
+-- `@magick/brush` (MAG-030 to MAG-033): dab spacing by arc length and pressure, endpoints and
+-- bends covered, jitter repeatable by seed, the three accumulations, strokes in scenes the same in
+-- every tile and after a save, and refusals that stop runaway strokes.
+local brush = require '@magick/brush'
+local color = require '@magick/color'
+local magick = require '@magick'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+local function alphaAt(tile: color.Tile, column: number, row: number): number
+  return (select(4, color.pixel(tile, column, row)))
+end
+
+local Round: brush.Brush = { size = 10, color = '#000000', spacing = 0.1, tip = { kind = 'round', hardness = 0.8 } }
+
+suite.describe('dabs', function()
+  suite.it('stamps one dab every spacing of the diameter along the line, and one on its end', function()
+    local stroke = brush.stroke({ { 0, 0 }, { 100, 0 } }, Round)
+
+    -- Diameter 10 at full pressure, spacing 0.1: a dab every pixel from 0 to 100, and the end again.
+    expect(#stroke.dabs).toBe(102)
+    expect({ stroke.dabs[1].centerX, stroke.dabs[51].centerX, stroke.dabs[101].centerX, stroke.dabs[102].centerX }).toEqual { 0, 50, 100, 100 }
+    expect({ stroke.left, stroke.top, stroke.right, stroke.bottom }).toEqual { -5, -5, 105, 5 }
+  end)
+
+  suite.it('spaces dabs by the diameter the pressure gives, so a pressure ramp leaves no gaps', function()
+    local stroke = brush.stroke({ { 0, 0, 0 }, { 200, 0, 1 } }, { size = 20, color = '#000000', spacing = 0.25, minimumSize = 0.1 })
+    local last = -math.huge
+
+    for index = 2, #stroke.dabs do
+      local dab, before = stroke.dabs[index], stroke.dabs[index - 1]
+
+      expect(dab.radius >= last).toBe(true)
+      -- Each step is a quarter of the earlier dab's diameter, so neighbours always overlap.
+      expect(dab.centerX - before.centerX <= before.radius * 2 * 0.25 + 1e-9).toBe(true)
+      last = dab.radius
+    end
+  end)
+
+  suite.it('covers both ends and every pixel of a sharp bend', function()
+    local tile = color.tile(60, 60)
+
+    brush.paint(tile, brush.stroke({ { 5, 5 }, { 50, 5 }, { 8, 50 } }, Round))
+
+    expect(alphaAt(tile, 5, 5) > 0.9).toBe(true)
+    expect(alphaAt(tile, 8, 50) > 0.9).toBe(true)
+
+    for step = 0, 40 do
+      local along = step / 40
+
+      expect(alphaAt(tile, math.floor(50 - 42 * along), math.floor(5 + 45 * along)) > 0.9).toBe(true)
+    end
+  end)
+
+  suite.it('repeats its jitter for a seed, and changes it for another', function()
+    local jittery = brush.preset('oil', 30, '#c05030')
+    local samples = { { 0, 0, 0.5 }, { 80, 30, 1 }, { 160, 0, 0.7 } }
+    local first, again, other = brush.stroke(samples, jittery, 11), brush.stroke(samples, jittery, 11), brush.stroke(samples, jittery, 12)
+
+    expect(#first.dabs).toBe(#again.dabs)
+
+    for index, dab in first.dabs do
+      expect(dab.red == again.dabs[index].red and dab.radius == again.dabs[index].radius and dab.angle == again.dabs[index].angle).toBe(true)
+    end
+
+    expect(first.dabs[3].red ~= other.dabs[3].red).toBe(true)
+  end)
+end)
+
+suite.describe('accumulation', function()
+  local function line(accumulation: 'buildup' | 'constant' | 'wet', flow: number): color.Tile
+    local tile = color.tile(40, 11)
+
+    brush.paint(tile, brush.stroke({ { 5, 5.5 }, { 35, 5.5 } }, {
+      size = 8,
+      color = '#ff0000',
+      flow = flow,
+      spacing = 0.1,
+      tip = { kind = 'round', hardness = 1 },
+      accumulation = accumulation,
+      edge = 1,
+    }))
+
+    return tile
+  end
+
+  suite.it('builds pigment up where dabs overlap, without darkening its color', function()
+    local tile = line('buildup', 0.2)
+    local alpha = alphaAt(tile, 20, 5)
+
+    -- About ten dabs at 0.2 overlap the middle, 1 - 0.8 ^ 10 = 0.89, and it is still pure red.
+    expect(alpha > 0.85).toBe(true)
+    expect({ color.toImage(tile):get(20, 5) }).toEqual { 255, 0, 0, math.floor(alpha * 255 + 0.5) }
+  end)
+
+  suite.it('keeps a constant stroke at its flow, however many dabs overlap', function()
+    local tile = line('constant', 0.4)
+
+    for column = 10, 30 do
+      expect(math.abs(alphaAt(tile, column, 5) - 0.4) < 1e-6).toBe(true)
+    end
+  end)
+
+  suite.it('pools a wet stroke at its edges: the rim is denser than the middle', function()
+    local tile = color.tile(40, 31)
+
+    brush.paint(tile, brush.stroke({ { 5, 15.5 }, { 35, 15.5 } }, {
+      size = 24,
+      color = '#2060c0',
+      flow = 0.5,
+      tip = { kind = 'round', hardness = 0.2 },
+      accumulation = 'wet',
+      edge = 1,
+    }))
+
+    -- Coverage is about a half 7 pixels from the middle, where the pooling peaks.
+    expect(alphaAt(tile, 20, 8) > alphaAt(tile, 20, 15)).toBe(true)
+  end)
+end)
+
+suite.describe('scenes', function()
+  local function painted(): scene.Document
+    local document = scene.new(90, 60, { background = '#f4ecd8', space = 'linear' })
+
+    document:add(document:stroke({ { 6, 50, 0.2 }, { 40, 10, 1 }, { 84, 46, 0.4 } }, brush.preset('oil', 16, '#a03020'), { seed = 5 }))
+    document:add(document:stroke({ { 6, 10 }, { 84, 20 } }, brush.preset('watercolor', 22, '#2060c0', { grain = brush.paper(3) }), { seed = 6 }))
+    document:add(document:stroke({ { 10, 30, 0.5 }, { 80, 32, 1 } }, brush.preset('graphite', 4, '#202020', { grain = brush.paper(3) }), { seed = 7, opacity = 0.8 }))
+    document:add(document:stroke({ { 45, 2 }, { 45, 58 } }, brush.preset('ink', 3, '#101010'), { seed = 8 }))
+
+    return document
+  end
+
+  suite.it('renders strokes the same in every tile and as the reference', function()
+    local document = painted()
+    local reference = render.image(document, { reference = true })
+
+    for _, size in { 9, 32, 64 } do
+      expect(buffer.tostring(render.image(document, { tileSize = size }).data) == buffer.tostring(reference.data)).toBe(true)
+    end
+  end)
+
+  suite.it('saves strokes as their samples, brush and seed, and replays them exactly', function()
+    local document = painted()
+
+    expect(buffer.tostring(render.image(scene.load(scene.save(document))).data) == buffer.tostring(render.image(document).data)).toBe(true)
+  end)
+
+  suite.it('draws ten thousand dabs with tile-sized scratch only', function()
+    local document = scene.new(256, 256)
+    local samples: { brush.Sample } = {}
+
+    -- Twelve turns from radius 20 to 120, about 5,300 pixels long: a dab every half pixel, the
+    -- closest dabs ever sit.
+    for step = 0, 800 do
+      local angle = step / 800 * 24 * math.pi
+
+      table.insert(samples, { 128 + math.cos(angle) * (20 + step * 0.125), 128 + math.sin(angle) * (20 + step * 0.125) })
+    end
+
+    local settings: brush.Brush = { size = 6, color = '#000000', spacing = 0.04 }
+
+    document:add(document:stroke(samples, settings))
+
+    local plan = render.compile(document)
+    local dabs = #brush.stroke(samples, settings, 1).dabs
+    local _, stats = render.image(plan, { tileSize = 64 })
+
+    expect(dabs > 10000).toBe(true)
+    -- The base tile and one stroke layer.
+    expect(stats.peakTileBytes <= 64 * 64 * 16 * 2).toBe(true)
+  end)
+end)
+
+suite.describe('refusals', function()
+  suite.it('refuses bad samples, brushes and runaway strokes before drawing', function()
+    expect(function()
+      brush.stroke({ { 0, 0 / 0 } }, Round)
+    end).toThrow 'magick: stroke samples must be finite and within MaxCoordinate'
+
+    expect(function()
+      brush.stroke({ { 0, 0, 1.5 } }, Round)
+    end).toThrow 'magick: a sample pressure must be in 0..1'
+
+    expect(function()
+      brush.stroke({}, Round)
+    end).toThrow 'magick: a stroke needs at least one sample'
+
+    expect(function()
+      brush.stroke({ { 0, 0 }, { 4000000, 0 } }, { size = 1, color = '#000000', spacing = 0.02 })
+    end).toThrow 'magick: MaxDabsPerStroke 65536 exceeded'
+
+    expect(function()
+      brush.stroke({ { 0, 0 } }, { size = 0, color = '#000000' })
+    end).toThrow 'magick: brush size must be in (0, 4096]'
+
+    expect(function()
+      brush.stroke({ { 0, 0 } }, { size = 5, color = '#000000', accumulation = 'smear' :: any })
+    end).toThrow 'magick: unknown accumulation smear'
+
+    expect(function()
+      brush.preset('crayon', 5, '#000000')
+    end).toThrow 'magick: unknown brush preset crayon'
+
+    expect(function()
+      brush.stroke({ { 0, 0 } }, Round, 0)
+    end).toThrow 'magick: seed must be an integer in 1..2147483646'
+  end)
+
+  suite.it('keeps the presets unchanged by what is laid over them', function()
+    local first = brush.preset('ink', 4, '#000000', { flow = 0.2 })
+    local second = brush.preset('ink', 4, '#000000')
+
+    expect(first.flow).toBe(0.2)
+    expect(second.flow).toBe(nil)
+    expect(#brush.presetNames).toBe(5)
+    expect(magick.color(second.color)[1]).toBe(0)
+  end)
+end)
+
+suite.describe('affine moves', function()
+  --- One hard round dab at (0, 0), moved by `matrix` and painted on a 64 square tile around the
+  --- origin: its covered pixels, and the box they span.
+  local function painted(matrix: transform.Matrix, settings: brush.Brush?): (color.Tile, number, { number })
+    local hard: brush.Brush = { size = 20, color = '#000000', tip = { kind = 'round', hardness = 1 } }
+    local stroke = brush.moved(brush.stroke({ { 0, 0 } }, settings or hard), matrix)
+    local tile = color.tile(64, 64, { left = -32, top = -32 })
+    local covered, box = 0, { math.huge, math.huge, -math.huge, -math.huge }
+
+    brush.paint(tile, stroke)
+
+    for row = -32, 31 do
+      for column = -32, 31 do
+        local alpha = alphaAt(tile, column + 32, row + 32)
+
+        covered += alpha
+
+        if alpha > 0.5 then
+          box = { math.min(box[1], column), math.min(box[2], row), math.max(box[3], column + 1), math.max(box[4], row + 1) }
+        end
+      end
+    end
+
+    return tile, covered, box
+  end
+
+  -- A hard dab's edge is one device pixel wide, so its half-covered outline sits half a pixel inside
+  -- its geometry: a circle of radius 10 covers about pi * 9.5^2, and an ellipse of semi-axes a and b
+  -- about pi * (a - 0.5) * (b - 0.5).
+  local function near(actual: number, expected: number): boolean
+    return math.abs(actual / expected - 1) < 0.015
+  end
+
+  suite.it('stretches a round dab into an ellipse of the same proportions', function()
+    local _, plain, round = painted(transform.identity())
+    local _, stretched, box = painted(transform.scale(2, 1))
+
+    expect(near(plain, math.pi * 9.5 * 9.5)).toBe(true)
+    expect(near(stretched, math.pi * 19.5 * 9.5)).toBe(true)
+    -- Twice as wide, and exactly as tall, as the round dab's half-covered pixels.
+    expect(box[3] - box[1]).toBe(2 * (round[3] - round[1]) + 2)
+    expect(box[4] - box[2]).toBe(round[4] - round[2])
+  end)
+
+  suite.it('keeps a dab the area the matrix gives it under a shear and an uneven scale', function()
+    local _, sheared = painted(transform.skew(0.75))
+    local _, squashed = painted(transform.scale(1.5, 0.5))
+
+    -- A shear keeps area; its ellipse's edge is a pixel wide all the way round.
+    expect(near(sheared, math.pi * 9.5 * 9.5)).toBe(true)
+    expect(near(squashed, math.pi * 14.5 * 4.5)).toBe(true)
+  end)
+
+  suite.it('draws a reflected image tip reflected', function()
+    local data = buffer.create(16)
+
+    -- An L: the left column and the bottom row of a 4 by 4 mask.
+    for index = 0, 3 do
+      buffer.writeu8(data, index * 4, 255)
+      buffer.writeu8(data, 12 + index, 255)
+    end
+
+    local settings: brush.Brush = {
+      size = 16,
+      color = '#000000',
+      tip = { kind = 'image', mask = magick.mask(4, 4, data) } :: brush.Tip,
+      followDirection = false,
+    }
+    local plain = painted(transform.identity(), settings)
+    local mirrored = painted(transform.scale(-1, 1), settings)
+
+    for row = 0, 63 do
+      for column = 0, 63 do
+        expect(alphaAt(mirrored, column, row)).toBe(alphaAt(plain, 63 - column, row))
+      end
+    end
+  end)
+
+  suite.it('keeps the radius and angle form, bytes and all, under a rotation and uniform scale', function()
+    local stroke = brush.moved(brush.stroke({ { 0, 0 }, { 30, 10 } }, Round), transform.compose(transform.rotate(0.4), transform.scale(1.5)))
+
+    for _, dab in stroke.dabs do
+      expect(dab.shape).toBe(nil)
+    end
+  end)
+
+  suite.it('lets a plan own an image tip: writing the mask after a compile changes nothing', function()
+    local data = buffer.create(16)
+
+    buffer.fill(data, 0, 255)
+    local document = scene.new(32, 32)
+
+    document:add(document:stroke({ { 8, 16 }, { 24, 16 } }, { size = 12, color = '#204080', tip = { kind = 'image', mask = magick.mask(4, 4, data) } }))
+
+    local plan = render.compile(document)
+    local before = render.image(plan)
+
+    buffer.fill(data, 0, 0)
+    expect(buffer.tostring(render.image(plan).data)).toBe(buffer.tostring(before.data))
+  end)
+end)
+
+return suite

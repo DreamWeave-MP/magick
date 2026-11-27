@@ -1,0 +1,252 @@
+--!strict
+--[[
+@magick/text: text as paths (MAG-035).
+
+A font is a table that turns characters into outlines. `monoline` is the font this package ships: a
+geometric face of single strokes (capitals, digits and common punctuation, lowercase set as small
+capitals), drawn as centerlines and stroked to its weight, so it needs no file and no platform
+service. `outline` adapts any font that draws through a pen, as `@truetype`'s `Font:outline` does,
+without this package depending on it: give it the font, and its glyphs come into a path through
+`Path:pen()`.
+
+`path` sets a line of text at a size (the em, in pixels) from a baseline point, with tracking and
+alignment, as one path to fill with any paint or to stroke. Layout is one line, left to right, with
+the font's advances and, where it has them, its kerning; shaping (ligatures, bidirectional text,
+complex scripts) is out of scope.
+]]
+local path = require '@magick/path'
+
+local Module = {}
+
+--- What draws a run of text into a pen and measures it. For an `@truetype` font:
+---   text.outline {
+---     outline = function(pen, text, size, x, y, options) return font:outline(pen, text, size, x, y, options) end,
+---     measure = function(text, size, options) return font:measure(text, size, options) end,
+---   }
+export type Outliner = {
+  outline: (pen: path.Pen, text: string, size: number, originX: number, originY: number, options: { tracking: number?, kerning: boolean? }?) -> unknown,
+  measure: (text: string, size: number, options: { tracking: number?, kerning: boolean? }?) -> { width: number },
+}
+
+export type Font = {
+  kind: 'monoline' | 'outline',
+  --- Monoline: its stroke weight in units of a hundredth of the em.
+  weight: number,
+  outliner: Outliner?,
+}
+
+export type Options = {
+  --- Extra space between characters, in ems (0).
+  tracking: number?,
+  --- Where the point is: `left` (default), `center` or `right` of the line.
+  align: ('left' | 'center' | 'right')?,
+  kerning: boolean?,
+}
+
+-- The monoline face: each glyph is strokes on a grid 10 units tall from the cap line (0) to the
+-- baseline (10), and an advance. A stroke is a list of points; `arc` adds the points of an
+-- elliptical arc, angles in degrees, y down, so a growing angle turns clockwise on screen.
+
+type Strokes = { { number } }
+
+local function arc(points: { number }, centerX: number, centerY: number, radiusX: number, radiusY: number, from: number, to: number): { number }
+  local steps = math.max(4, math.ceil(math.abs(to - from) / 10))
+
+  for step = 0, steps do
+    local angle = math.rad(from + (to - from) * step / steps)
+
+    table.insert(points, centerX + radiusX * math.cos(angle))
+    table.insert(points, centerY + radiusY * math.sin(angle))
+  end
+
+  return points
+end
+
+local function line(...: number): { number }
+  return { ... }
+end
+
+--- Points, then an arc, then more points, as one stroke.
+local function join(...: { number }): { number }
+  local out: { number } = {}
+
+  for index = 1, select('#', ...) do
+    for _, value in (select(index, ...)) do
+      table.insert(out, value)
+    end
+  end
+
+  return out
+end
+
+local Glyphs: { [string]: { advance: number, strokes: Strokes } } = {
+  ['A'] = { advance = 7, strokes = { line(0, 10, 3, 0, 6, 10), line(1.1, 6.6, 4.9, 6.6) } },
+  ['B'] = { advance = 6.5, strokes = { join(line(3.2, 5, 0, 5, 0, 0, 3.2, 0), arc({}, 3.2, 2.5, 2.4, 2.5, -90, 90), line(3.2, 5, 3.6, 5), arc({}, 3.6, 7.5, 2.4, 2.5, -90, 90), line(3.6, 10, 0, 10, 0, 5)) } },
+  ['C'] = { advance = 7, strokes = { arc({}, 3.4, 5, 3.4, 5, -45, -315) } },
+  ['D'] = { advance = 7, strokes = { join(line(1.5, 0, 0, 0, 0, 10, 1.5, 10), arc({}, 1.5, 5, 4.5, 5, 90, -90)) } },
+  ['E'] = { advance = 6, strokes = { line(5.5, 0, 0, 0, 0, 10, 5.5, 10), line(0, 5, 4.2, 5) } },
+  ['F'] = { advance = 6, strokes = { line(5.5, 0, 0, 0, 0, 10), line(0, 5, 4.2, 5) } },
+  ['G'] = { advance = 7.4, strokes = { join(arc({}, 3.4, 5, 3.4, 5, -45, -360), line(6.8, 5, 4, 5)) } },
+  ['H'] = { advance = 6.8, strokes = { line(0, 0, 0, 10), line(6, 0, 6, 10), line(0, 5, 6, 5) } },
+  ['I'] = { advance = 1.6, strokes = { line(0, 0, 0, 10) } },
+  ['J'] = { advance = 6, strokes = { join(line(5, 0, 5, 7), arc({}, 2.5, 7, 2.5, 3, 0, 180)) } },
+  ['K'] = { advance = 6.4, strokes = { line(0, 0, 0, 10), line(5.8, 0, 0, 6.2), line(2, 4.4, 5.8, 10) } },
+  ['L'] = { advance = 5.6, strokes = { line(0, 0, 0, 10, 5.2, 10) } },
+  ['M'] = { advance = 8.2, strokes = { line(0, 10, 0, 0, 3.7, 7.4, 7.4, 0, 7.4, 10) } },
+  ['N'] = { advance = 6.8, strokes = { line(0, 10, 0, 0, 6, 10, 6, 0) } },
+  ['O'] = { advance = 7.6, strokes = { arc({}, 3.5, 5, 3.5, 5, 0, 360) } },
+  ['P'] = { advance = 6.2, strokes = { join(line(0, 10, 0, 0, 3.2, 0), arc({}, 3.2, 2.75, 2.6, 2.75, -90, 90), line(3.2, 5.5, 0, 5.5)) } },
+  ['Q'] = { advance = 7.6, strokes = { arc({}, 3.5, 5, 3.5, 5, 0, 360), line(4.2, 7.2, 7.2, 10.6) } },
+  ['R'] = { advance = 6.4, strokes = { join(line(0, 10, 0, 0, 3.2, 0), arc({}, 3.2, 2.75, 2.6, 2.75, -90, 90), line(3.2, 5.5, 0, 5.5)), line(3, 5.5, 5.9, 10) } },
+  ['S'] = { advance = 6.4, strokes = { join(arc({}, 3, 2.55, 2.8, 2.55, -20, -270), arc({}, 3, 7.5, 3, 2.5, -90, 160)) } },
+  ['T'] = { advance = 6.2, strokes = { line(0, 0, 6, 0), line(3, 0, 3, 10) } },
+  ['U'] = { advance = 6.8, strokes = { join(line(0, 0, 0, 7), arc({}, 3, 7, 3, 3, 180, 0), line(6, 7, 6, 0)) } },
+  ['V'] = { advance = 6.8, strokes = { line(0, 0, 3.2, 10, 6.4, 0) } },
+  ['W'] = { advance = 9.4, strokes = { line(0, 0, 2.2, 10, 4.5, 2.6, 6.8, 10, 9, 0) } },
+  ['X'] = { advance = 6.6, strokes = { line(0, 0, 6, 10), line(6, 0, 0, 10) } },
+  ['Y'] = { advance = 6.6, strokes = { line(0, 0, 3, 5.2, 6, 0), line(3, 5.2, 3, 10) } },
+  ['Z'] = { advance = 6.4, strokes = { line(0.2, 0, 6, 0, 0, 10, 6, 10) } },
+  ['0'] = { advance = 6.6, strokes = { arc({}, 3, 5, 3, 5, 0, 360) } },
+  ['1'] = { advance = 4.6, strokes = { line(0.6, 2, 3, 0, 3, 10) } },
+  ['2'] = { advance = 6.4, strokes = { join(arc({}, 3, 3, 2.9, 3, -165, 10), line(5.6, 4.4, 0, 10, 6, 10)) } },
+  ['3'] = { advance = 6.4, strokes = { join(arc({}, 3, 2.6, 2.7, 2.6, -165, 90), arc({}, 3, 7.4, 3, 2.6, -90, 165)) } },
+  ['4'] = { advance = 6.6, strokes = { line(4.6, 10, 4.6, 0, 0, 7, 6.2, 7) } },
+  ['5'] = { advance = 6.4, strokes = { join(line(5.6, 0, 0.6, 0, 0.3, 4.6), arc({}, 3, 6.9, 3, 3.1, -130, 150)) } },
+  ['6'] = { advance = 6.4, strokes = { join(line(4.6, 0, 1.3, 3.6), arc({}, 3, 7, 3, 3, -150, 210)) } },
+  ['7'] = { advance = 6, strokes = { line(0, 0, 6, 0, 2, 10) } },
+  ['8'] = { advance = 6.4, strokes = { arc({}, 3, 2.5, 2.6, 2.5, 0, 360), arc({}, 3, 7.4, 3, 2.6, 0, 360) } },
+  ['9'] = { advance = 6.4, strokes = { join(arc({}, 3, 3, 3, 3, 30, 390), line(5.9, 3.6, 1.6, 10)) } },
+  ['.'] = { advance = 1.6, strokes = { line(0, 10, 0, 10) } },
+  [','] = { advance = 1.8, strokes = { line(0.4, 9.6, -0.4, 11.6) } },
+  [':'] = { advance = 1.6, strokes = { line(0, 3.6, 0, 3.6), line(0, 10, 0, 10) } },
+  [';'] = { advance = 1.8, strokes = { line(0.2, 3.6, 0.2, 3.6), line(0.4, 9.6, -0.4, 11.6) } },
+  ['!'] = { advance = 1.6, strokes = { line(0, 0, 0, 7), line(0, 10, 0, 10) } },
+  ['?'] = { advance = 5.6, strokes = { join(arc({}, 2.8, 2.6, 2.8, 2.6, -160, 70), line(3, 5.4, 2.8, 7)), line(2.8, 10, 2.8, 10) } },
+  ['-'] = { advance = 4.6, strokes = { line(0, 6, 4, 6) } },
+  ["'"] = { advance = 1.6, strokes = { line(0, 0, 0, 2.6) } },
+  ['"'] = { advance = 3, strokes = { line(0, 0, 0, 2.6), line(1.6, 0, 1.6, 2.6) } },
+  ['/'] = { advance = 5, strokes = { line(0, 10.5, 4.6, -0.5) } },
+  ['('] = { advance = 3, strokes = { arc({}, 3.4, 5, 3, 6.4, 135, 225) } },
+  [')'] = { advance = 3, strokes = { arc({}, -1, 5, 3, 6.4, -45, 45) } },
+  ['+'] = { advance = 6, strokes = { line(0, 5.6, 5.6, 5.6), line(2.8, 2.8, 2.8, 8.4) } },
+  ['&'] = { advance = 7.4, strokes = { join(line(7, 10, 1.4, 4), arc({}, 2.8, 2.2, 2, 2.2, 140, -120), line(3.9, 4.1, 0.8, 6.8), arc({}, 3.2, 7.6, 2.6, 2.4, 200, 60), line(4.5, 9.7, 6.8, 6.6)) } },
+  [' '] = { advance = 3.6, strokes = {} },
+}
+
+local Tracking, SmallCaps = 1.6, 0.74
+
+--- The built-in geometric monoline face at a stroke weight in hundredths of the em (7.5 by default,
+--- a regular weight; 4 is light, 12 bold).
+function Module.monoline(weight: number?): Font
+  local chosen = weight or 7.5
+
+  if chosen ~= chosen or chosen <= 0 or chosen > 40 then error('magick: a monoline weight must be in (0, 40]', 2) end
+
+  return table.freeze { kind = 'monoline', weight = chosen, outliner = nil } :: Font
+end
+
+--- A font that draws through a pen: an `outline(pen, text, size, x, y, options)` function and a
+--- `measure(text, size, options)` one, wrapping any font reader.
+function Module.outline(outliner: Outliner): Font
+  if type(outliner) ~= 'table' and type(outliner) ~= 'userdata' then error('magick: an outline font is a table with outline and measure', 2) end
+
+  return table.freeze { kind = 'outline', weight = 0, outliner = outliner } :: Font
+end
+
+--- The characters a monoline line can set, and the glyph of one; lowercase letters are capitals
+--- set small. Unknown characters are refused rather than dropped.
+local function monolineGlyph(character: string): ({ advance: number, strokes: Strokes }, number)
+  local glyph = Glyphs[character]
+
+  if glyph then return glyph, 1 end
+
+  local upper = Glyphs[string.upper(character)]
+
+  if upper then return upper, SmallCaps end
+
+  error(`magick: the monoline face has no glyph for {string.format('%q', character)}`, 4)
+end
+
+--- A line's width in pixels at an em `size`.
+function Module.measure(font: Font, text: string, size: number, options: Options?): number
+  local tracking = if options and options.tracking then options.tracking else 0
+
+  if font.kind == 'outline' then
+    local outliner = font.outliner :: Outliner
+
+    return outliner.measure(text, size, { tracking = tracking, kerning = if options then options.kerning else nil }).width
+  end
+
+  -- A unit is a tenth of the cap height, and the cap height is 0.7 em.
+  local unit = size * 0.07
+  local width = 0
+
+  for _, codepoint in utf8.codes(text) do
+    local glyph, scale = monolineGlyph(utf8.char(codepoint))
+
+    width += (glyph.advance * scale + Tracking) * unit + tracking * size
+  end
+
+  return math.max(0, width - Tracking * unit - tracking * size)
+end
+
+local function checkSize(size: number)
+  if size ~= size or size <= 0 or size > 100000 then error('magick: a text size must be in (0, 100000]', 3) end
+end
+
+--- A line of text as a path: `size` is the em in pixels, (`x`, `y`) the point on the baseline the
+--- line is aligned to (`originX`, `originY`). Fill it with any paint; monoline glyphs are already stroked outlines, whose
+--- overlaps the nonzero coverage of `coverageIn` and the scene renderer joins.
+function Module.path(font: Font, text: string, originX: number, originY: number, size: number, options: Options?): path.Path
+  checkSize(size)
+
+  local align = if options and options.align then options.align else 'left'
+
+  if align ~= 'left' and align ~= 'center' and align ~= 'right' then error(`magick: unknown alignment {align}`, 2) end
+
+  local width = Module.measure(font, text, size, options)
+  local start = if align == 'center' then originX - width / 2 elseif align == 'right' then originX - width else originX
+  local tracking = if options and options.tracking then options.tracking else 0
+
+  if font.kind == 'outline' then
+    local out = path.new()
+    local outliner = font.outliner :: Outliner
+
+    outliner.outline(out:pen(), text, size, start, originY, { tracking = tracking, kerning = if options then options.kerning else nil })
+    out:close()
+
+    return out
+  end
+
+  local unit = size * 0.07
+  local centerline = path.new()
+  local cursor = start
+
+  for _, codepoint in utf8.codes(text) do
+    local glyph, scale = monolineGlyph(utf8.char(codepoint))
+    local glyphUnit = unit * scale
+    -- Small capitals sit on the baseline: their top is lowered by what they lost.
+    local top = originY - 10 * glyphUnit
+
+    for _, stroke in glyph.strokes do
+      for index = 1, #stroke - 1, 2 do
+        local pointX, pointY = cursor + stroke[index] * glyphUnit, top + stroke[index + 1] * glyphUnit
+
+        if index == 1 then
+          centerline:moveTo(pointX, pointY)
+        else
+          centerline:lineTo(pointX, pointY)
+        end
+      end
+
+      -- A one-point stroke is a dot: the stroker draws its round cap.
+      if #stroke == 2 then centerline:lineTo(cursor + stroke[1] * glyphUnit, top + stroke[2] * glyphUnit) end
+    end
+
+    cursor += (glyph.advance * scale + Tracking) * unit + tracking * size
+  end
+
+  return centerline:stroked { width = font.weight / 100 * size, cap = 'round', join = 'round' }
+end
+
+return Module

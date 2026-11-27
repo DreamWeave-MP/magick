@@ -1,0 +1,619 @@
+--!strict
+--[[
+@magick/noise: seeded, deterministic noise and coordinate fields (RFC-0001 D2).
+
+Everything here is a pure function of a seed and coordinates: no generator state, no clock, no
+`math.random`. The same seed and point give the same value in any tile, on any worker, in any
+order, so a texture never seams where tiles meet. Seeds are integers in 1..2^31 - 2.
+
+Lattice noise uses a permutation of 1024 entries derived from the seed (made once a seed and
+kept), so a pattern repeats only every 1024 lattice cells. `hash` and `random` mix integers with
+the murmur3 finalizer, for keys such as (seed, stroke, dab).
+
+A field is a description: a plain table naming an operation and its inputs (`{ op = 'fbm', seed =
+7, frequency = 0.01 }`), built by the constructors here. Descriptions are data, so they can be
+saved and sent to workers; `compile` turns one into a function of (across, down) where it is used.
+]]
+local Module = {}
+
+Module.MaxOctaves = 12
+--- The most operations one field description holds, and how deeply they nest.
+Module.MaxFieldNodes = 256
+Module.MaxFieldDepth = 32
+
+local Size = 1024
+local Mask = Size - 1
+
+local function checkSeed(seed: number): number
+  if type(seed) ~= 'number' or seed ~= math.floor(seed) or seed < 1 or seed > 2147483646 then
+    error('magick: seed must be an integer in 1..2147483646', 3)
+  end
+
+  return seed
+end
+
+--- The low 32 bits of a product of two 32-bit integers, exactly: a 16 by 32-bit product fits f64.
+local function multiply(first: number, second: number): number
+  local high, low = bit32.rshift(first, 16), bit32.band(first, 0xffff)
+
+  return (bit32.lshift((high * second) % 65536, 16) + low * second) % 4294967296
+end
+
+local function mix(value: number): number
+  value = multiply(bit32.bxor(value, bit32.rshift(value, 16)), 0x85ebca6b)
+  value = multiply(bit32.bxor(value, bit32.rshift(value, 13)), 0xc2b2ae35)
+
+  return bit32.bxor(value, bit32.rshift(value, 16))
+end
+
+--- A 32-bit hash of a seed and up to three integers (each taken modulo 2^32), by the murmur3
+--- finalizer applied after each.
+function Module.hash(seed: number, first: number, second: number?, third: number?): number
+  local value = mix(bit32.bxor(checkSeed(seed), 0x9e3779b9))
+
+  value = mix(bit32.bxor(value, first % 4294967296))
+  if second then value = mix(bit32.bxor(value, second % 4294967296)) end
+  if third then value = mix(bit32.bxor(value, third % 4294967296)) end
+
+  return value
+end
+
+--- A value in 0..1 from a seed and up to three integers.
+function Module.random(seed: number, first: number, second: number?, third: number?): number
+  return Module.hash(seed, first, second, third) / 4294967296
+end
+
+type Lattice = { permutation: { number }, values: { number }, angles: { number } }
+
+local lattices: { [number]: Lattice } = {}
+
+--- The permutation and per-entry values of a seed, made once: a Fisher-Yates shuffle driven by
+--- `hash`, so it is the same everywhere.
+local function lattice(seed: number): Lattice
+  local known = lattices[seed]
+
+  if known then return known end
+
+  local permutation = table.create(Size * 2) :: { number }
+  local values, angles = table.create(Size) :: { number }, table.create(Size) :: { number }
+
+  for index = 0, Mask do
+    permutation[index + 1] = index
+  end
+
+  for index = Mask, 1, -1 do
+    local other = Module.hash(seed, index, 1) % (index + 1)
+
+    permutation[index + 1], permutation[other + 1] = permutation[other + 1], permutation[index + 1]
+  end
+
+  for index = 0, Mask do
+    permutation[Size + index + 1] = permutation[index + 1]
+    values[index + 1] = Module.random(seed, index, 2)
+    angles[index + 1] = Module.random(seed, index, 3) * 2 * math.pi
+  end
+
+  local made: Lattice = { permutation = permutation, values = values, angles = angles }
+
+  lattices[seed] = made
+
+  return made
+end
+
+--- The lattice entry of a cell.
+local function cell(permutation: { number }, column: number, row: number): number
+  return permutation[permutation[(column % Size) + 1] + (row % Size) + 1] + 1
+end
+
+--- Perlin's quintic fade.
+local function fade(along: number): number
+  return along * along * along * (along * (along * 6 - 15) + 10)
+end
+
+--- Value noise at a point: a random value at each lattice point, blended by the quintic fade.
+--- In 0..1.
+function Module.value(seed: number, across: number, down: number): number
+  local permutation, values = lattice(checkSeed(seed)).permutation, lattice(seed).values
+  local column, row = math.floor(across), math.floor(down)
+  local across, down = fade(across - column), fade(down - row)
+  local topLeft, topRight = values[cell(permutation, column, row)], values[cell(permutation, column + 1, row)]
+  local bottomLeft, bottomRight = values[cell(permutation, column, row + 1)], values[cell(permutation, column + 1, row + 1)]
+  local top = topLeft + (topRight - topLeft) * across
+  local bottom = bottomLeft + (bottomRight - bottomLeft) * across
+
+  return top + (bottom - top) * down
+end
+
+--- Gradient (Perlin) noise at a point: a random unit gradient at each lattice point, its dot with
+--- the offset, blended by the quintic fade. In about -0.71..0.71, 0 on every lattice point.
+@native
+local function perlin(lattice: Lattice, across: number, down: number): number
+  local permutation, angles = lattice.permutation, lattice.angles
+  local column, row = math.floor(across), math.floor(down)
+  local offsetX, offsetY = across - column, down - row
+  local across, down = fade(offsetX), fade(offsetY)
+
+  local function corner(dx: number, dy: number): number
+    local angle = angles[cell(permutation, column + dx, row + dy)]
+
+    return math.cos(angle) * (offsetX - dx) + math.sin(angle) * (offsetY - dy)
+  end
+
+  local top = corner(0, 0) + (corner(1, 0) - corner(0, 0)) * across
+  local bottom = corner(0, 1) + (corner(1, 1) - corner(0, 1)) * across
+
+  return top + (bottom - top) * down
+end
+
+function Module.perlin(seed: number, across: number, down: number): number
+  return perlin(lattice(checkSeed(seed)), across, down)
+end
+
+--- What the fractal sums take.
+export type FractalOptions = {
+  --- 1..MaxOctaves, 5 by default.
+  octaves: number?,
+  --- How much each octave's frequency grows (2) and its amplitude shrinks (0.5).
+  lacunarity: number?,
+  gain: number?,
+}
+
+local function fractal(options: FractalOptions?): (number, number, number)
+  local octaves = if options and options.octaves then options.octaves else 5
+  local lacunarity = if options and options.lacunarity then options.lacunarity else 2
+  local gain = if options and options.gain then options.gain else 0.5
+
+  if octaves ~= math.floor(octaves) or octaves < 1 then error('magick: octaves must be a whole number of at least 1', 4) end
+  if octaves > Module.MaxOctaves then error(`magick: MaxOctaves {Module.MaxOctaves} exceeded`, 4) end
+  if lacunarity ~= lacunarity or lacunarity < 1 or lacunarity > 8 then error('magick: lacunarity must be in 1..8', 4) end
+  if gain ~= gain or gain < 0 or gain > 1 then error('magick: gain must be in 0..1', 4) end
+
+  return octaves, lacunarity, gain
+end
+
+--- Fractal Brownian motion: octaves of Perlin noise, each at a seed of its own, summed and
+--- normalized by their amplitudes. In about -0.71..0.71.
+function Module.fbm(seed: number, across: number, down: number, options: FractalOptions?): number
+  local octaves, lacunarity, gain = fractal(options)
+  local total, amplitude, weight, frequency = 0, 1, 0, 1
+
+  checkSeed(seed)
+
+  for octave = 1, octaves do
+    total += perlin(lattice((seed + octave * 7919 - 1) % 2147483646 + 1), across * frequency, down * frequency) * amplitude
+    weight += amplitude
+    amplitude *= gain
+    frequency *= lacunarity
+  end
+
+  return total / weight
+end
+
+--- Turbulence: the fbm of the absolute value of each octave, in 0..1 about.
+function Module.turbulence(seed: number, across: number, down: number, options: FractalOptions?): number
+  local octaves, lacunarity, gain = fractal(options)
+  local total, amplitude, weight, frequency = 0, 1, 0, 1
+
+  checkSeed(seed)
+
+  for octave = 1, octaves do
+    total += math.abs(perlin(lattice((seed + octave * 7919 - 1) % 2147483646 + 1), across * frequency, down * frequency)) * amplitude
+    weight += amplitude
+    amplitude *= gain
+    frequency *= lacunarity
+  end
+
+  return math.clamp(total / weight * 1.6, 0, 1)
+end
+
+--- Ridged noise: one minus the absolute value of each octave, squared and summed, sharp crests
+--- like mountain ridges. In 0..1.
+function Module.ridged(seed: number, across: number, down: number, options: FractalOptions?): number
+  local octaves, lacunarity, gain = fractal(options)
+  local total, amplitude, weight, frequency = 0, 1, 0, 1
+
+  checkSeed(seed)
+
+  for octave = 1, octaves do
+    local crest = 1 - math.abs(perlin(lattice((seed + octave * 7919 - 1) % 2147483646 + 1), across * frequency, down * frequency)) * 1.4
+
+    total += math.clamp(crest, 0, 1) ^ 2 * amplitude
+    weight += amplitude
+    amplitude *= gain
+    frequency *= lacunarity
+  end
+
+  return total / weight
+end
+
+--- Worley (cellular) noise: one feature point in each lattice cell, `jitter` (0..1, 1 by default)
+--- of the way to a random place in it; returns the distances to the nearest and second nearest.
+function Module.worley(seed: number, across: number, down: number, jitter: number?): (number, number)
+  local permutation, values, angles = lattice(checkSeed(seed)).permutation, lattice(seed).values, lattice(seed).angles
+  local amount = jitter or 1
+  local column, row = math.floor(across), math.floor(down)
+  local nearest, second = math.huge, math.huge
+
+  for dy = -1, 1 do
+    for dx = -1, 1 do
+      local entry = cell(permutation, column + dx, row + dy)
+      local pointX = column + dx + 0.5 + (values[entry] - 0.5) * amount
+      local pointY = row + dy + 0.5 + (angles[entry] / (2 * math.pi) - 0.5) * amount
+      local distance = math.sqrt((pointX - across) ^ 2 + (pointY - down) ^ 2)
+
+      if distance < nearest then
+        nearest, second = distance, nearest
+      elseif distance < second then
+        second = distance
+      end
+    end
+  end
+
+  return nearest, second
+end
+
+-- Fields ------------------------------------------------------------------------------------------
+
+--- A field description: an operation and its inputs. See the constructors for each operation's
+--- fields; every number must be finite.
+export type Field = { [string]: unknown }
+
+local Unary = { abs = true, sin = true, negate = true }
+local Binary = { add = true, subtract = true, multiply = true, min = true, max = true }
+
+local function finite(value: unknown): boolean
+  return type(value) == 'number' and value == value and value > -math.huge and value < math.huge
+end
+
+--- Checks a description from an untrusted source: known operations, finite numbers, seeds in
+--- range, and at most MaxFieldNodes operations nested at most MaxFieldDepth deep.
+local function checkField(field: Field, depth: number, budget: { number })
+  if type(field) ~= 'table' then error('magick: a field is a table with an op', 4) end
+  if depth > Module.MaxFieldDepth then error(`magick: MaxFieldDepth {Module.MaxFieldDepth} exceeded`, 4) end
+
+  budget[1] += 1
+  if budget[1] > Module.MaxFieldNodes then error(`magick: MaxFieldNodes {Module.MaxFieldNodes} exceeded`, 4) end
+
+  local op = field.op
+
+  for name, value in field do
+    if name == 'op' then continue end
+
+    if name == 'matrix' then
+      local fields = value :: { unknown }
+
+      if type(value) ~= 'table' or #fields ~= 6 then error('magick: a field matrix is six numbers', 4) end
+
+      for _, entry in fields do
+        if not finite(entry) then error('magick: a field matrix must be finite', 4) end
+      end
+    elseif type(value) == 'table' then
+      checkField(value :: Field, depth + 1, budget)
+    elseif type(value) == 'number' then
+      if not finite(value) then error(`magick: field {op} {name} must be finite`, 4) end
+    elseif type(value) ~= 'string' then
+      error(`magick: field {op} {name} must be a number, a name or a field`, 4)
+    end
+  end
+
+  if op == 'perlin' or op == 'value' or op == 'fbm' or op == 'turbulence' or op == 'ridged' or op == 'worley' then
+    checkSeed(field.seed :: number)
+  elseif op == 'constant' or op == 'x' or op == 'y' or op == 'checker' or op == 'stripes' or op == 'rings' then
+    return
+  elseif op == 'scale' or op == 'offset' or op == 'clamp' or op == 'smoothstep' or op == 'power' or op == 'mix' or op == 'warp' or op == 'transform' then
+    return
+  elseif not Unary[op :: string] and not Binary[op :: string] then
+    error(`magick: unknown field op {tostring(op)}`, 4)
+  end
+end
+
+--- Freezes a table and every table inside it.
+local function freezeAll(value: { [unknown]: unknown })
+  for _, inner in value do
+    if type(inner) == 'table' and not table.isfrozen(inner :: { [unknown]: unknown }) then freezeAll(inner :: { [unknown]: unknown }) end
+  end
+
+  if not table.isfrozen(value) then table.freeze(value) end
+end
+
+--- A field description checked and frozen all the way down, ready to compile or save: its inputs
+--- given as plain tables are frozen too, so nothing a paint keeps can change after it is made.
+function Module.field(description: Field): Field
+  checkField(description, 1, { 0 })
+  freezeAll((description :: unknown) :: { [unknown]: unknown })
+
+  return description
+end
+
+--- Constructors. Each returns a description; `frequency` scales the coordinates going in.
+function Module.constant(value: number): Field
+  return Module.field { op = 'constant', value = value }
+end
+
+function Module.coordinate(axis: 'x' | 'y'): Field
+  return Module.field { op = axis }
+end
+
+function Module.noiseField(kind: 'perlin' | 'value', seed: number, frequency: number?): Field
+  return Module.field { op = kind, seed = seed, frequency = frequency or 1 }
+end
+
+function Module.fbmField(seed: number, frequency: number?, options: FractalOptions?): Field
+  fractal(options)
+
+  return Module.field {
+    op = 'fbm',
+    seed = seed,
+    frequency = frequency or 1,
+    octaves = if options then options.octaves else nil,
+    lacunarity = if options then options.lacunarity else nil,
+    gain = if options then options.gain else nil,
+  }
+end
+
+function Module.turbulenceField(seed: number, frequency: number?, options: FractalOptions?): Field
+  local made = table.clone(Module.fbmField(seed, frequency, options))
+
+  made.op = 'turbulence'
+
+  return Module.field(made)
+end
+
+function Module.ridgedField(seed: number, frequency: number?, options: FractalOptions?): Field
+  local made = table.clone(Module.fbmField(seed, frequency, options))
+
+  made.op = 'ridged'
+
+  return Module.field(made)
+end
+
+--- Worley distances: `output` is `f1` (default), `f2` or `edges` (f2 - f1, bright cell walls).
+function Module.worleyField(seed: number, frequency: number?, output: ('f1' | 'f2' | 'edges')?, jitter: number?): Field
+  return Module.field { op = 'worley', seed = seed, frequency = frequency or 1, output = output or 'f1', jitter = jitter or 1 }
+end
+
+--- A checkerboard of squares `size` wide: 0 and 1.
+function Module.checker(size: number): Field
+  return Module.field { op = 'checker', size = size }
+end
+
+--- Stripes `period` apart at `angle` radians: a sine from 0 to 1.
+function Module.stripes(period: number, angle: number?): Field
+  return Module.field { op = 'stripes', period = period, angle = angle or 0 }
+end
+
+--- Rings about a center `period` apart: a sine from 0 to 1 of the distance.
+function Module.rings(centerX: number, centerY: number, period: number): Field
+  return Module.field { op = 'rings', centerX = centerX, centerY = centerY, period = period }
+end
+
+function Module.combine(op: 'add' | 'subtract' | 'multiply' | 'min' | 'max', first: Field, second: Field): Field
+  return Module.field { op = op, input = first, other = second }
+end
+
+function Module.apply(op: 'abs' | 'sin' | 'negate', input: Field): Field
+  return Module.field { op = op, input = input }
+end
+
+--- `input * by + plus`.
+function Module.scale(input: Field, by: number, plus: number?): Field
+  return Module.field { op = 'scale', input = input, by = by, plus = plus or 0 }
+end
+
+function Module.clamp(input: Field, low: number, high: number): Field
+  return Module.field { op = 'clamp', input = input, low = low, high = high }
+end
+
+--- 0 below `low`, 1 above `high`, Hermite smooth between.
+function Module.smoothstep(input: Field, low: number, high: number): Field
+  return Module.field { op = 'smoothstep', input = input, low = low, high = high }
+end
+
+--- The input, clamped to 0..1, to a power.
+function Module.power(input: Field, exponent: number): Field
+  return Module.field { op = 'power', input = input, exponent = exponent }
+end
+
+--- `first` where `weight` is 0, `second` where it is 1, between them linearly.
+function Module.blend(first: Field, second: Field, weight: Field): Field
+  return Module.field { op = 'mix', input = first, other = second, weight = weight }
+end
+
+--- The input read at a displaced point: across moved by `amount * byX` and down by `amount * byY`.
+function Module.warp(input: Field, byX: Field, byY: Field, amount: number): Field
+  return Module.field { op = 'warp', input = input, byX = byX, byY = byY, amount = amount }
+end
+
+--- The input read through an affine map of the coordinates: SVG's six numbers.
+function Module.transform(input: Field, scaleX: number, skewY: number, skewX: number, scaleY: number, offsetX: number, offsetY: number): Field
+  return Module.field { op = 'transform', input = input, matrix = { scaleX, skewY, skewX, scaleY, offsetX, offsetY } }
+end
+
+export type Compiled = (across: number, down: number) -> number
+
+local compiledCache = (setmetatable({}, { __mode = 'k' }) :: unknown) :: { [Field]: Compiled }
+
+local function number(field: Field, name: string, default: number): number
+  local value = field[name]
+
+  return if type(value) == 'number' then value else default
+end
+
+--- A field as a function of (across, down). Each description compiles once per Luau state; the closures
+--- call each other, with no table lookups by name while they run.
+function Module.compile(field: Field): Compiled
+  local known = compiledCache[field]
+
+  if known then return known end
+
+  local op = field.op
+  local made: Compiled
+
+  if op == 'constant' then
+    local value = number(field, 'value', 0)
+
+    made = function(): number
+      return value
+    end
+  elseif op == 'x' then
+    made = function(across: number): number
+      return across
+    end
+  elseif op == 'y' then
+    made = function(_: number, down: number): number
+      return down
+    end
+  elseif op == 'perlin' or op == 'value' then
+    local seed, frequency = field.seed :: number, number(field, 'frequency', 1)
+    local grid = lattice(seed)
+
+    if op == 'perlin' then
+      made = function(across: number, down: number): number
+        return perlin(grid, across * frequency, down * frequency)
+      end
+    else
+      made = function(across: number, down: number): number
+        return Module.value(seed, across * frequency, down * frequency)
+      end
+    end
+  elseif op == 'fbm' or op == 'turbulence' or op == 'ridged' then
+    local seed, frequency = field.seed :: number, number(field, 'frequency', 1)
+    local options: FractalOptions = { octaves = field.octaves :: number?, lacunarity = field.lacunarity :: number?, gain = field.gain :: number? }
+    local sum = if op == 'fbm' then Module.fbm elseif op == 'turbulence' then Module.turbulence else Module.ridged
+
+    made = function(across: number, down: number): number
+      return sum(seed, across * frequency, down * frequency, options)
+    end
+  elseif op == 'worley' then
+    local seed, frequency, jitter = field.seed :: number, number(field, 'frequency', 1), number(field, 'jitter', 1)
+    local output = field.output
+
+    made = function(across: number, down: number): number
+      local nearest, second = Module.worley(seed, across * frequency, down * frequency, jitter)
+
+      if output == 'f2' then return second end
+      if output == 'edges' then return second - nearest end
+
+      return nearest
+    end
+  elseif op == 'checker' then
+    local size = number(field, 'size', 1)
+
+    made = function(across: number, down: number): number
+      return (math.floor(across / size) + math.floor(down / size)) % 2
+    end
+  elseif op == 'stripes' then
+    local period, angle = number(field, 'period', 1), number(field, 'angle', 0)
+    local cosine, sine = math.cos(angle), math.sin(angle)
+
+    made = function(across: number, down: number): number
+      return 0.5 + 0.5 * math.sin((across * cosine + down * sine) / period * 2 * math.pi)
+    end
+  elseif op == 'rings' then
+    local centerX, centerY, period = number(field, 'centerX', 0), number(field, 'centerY', 0), number(field, 'period', 1)
+
+    made = function(across: number, down: number): number
+      return 0.5 + 0.5 * math.sin(math.sqrt((across - centerX) ^ 2 + (down - centerY) ^ 2) / period * 2 * math.pi)
+    end
+  elseif op == 'warp' then
+    local input, byX, byY = Module.compile(field.input :: Field), Module.compile(field.byX :: Field), Module.compile(field.byY :: Field)
+    local amount = number(field, 'amount', 0)
+
+    made = function(across: number, down: number): number
+      return input(across + amount * byX(across, down), down + amount * byY(across, down))
+    end
+  elseif op == 'transform' then
+    local input, matrix = Module.compile(field.input :: Field), field.matrix :: { number }
+    local scaleX, skewY, skewX, scaleY, offsetX, offsetY = matrix[1], matrix[2], matrix[3], matrix[4], matrix[5], matrix[6]
+
+    made = function(across: number, down: number): number
+      return input(scaleX * across + skewX * down + offsetX, skewY * across + scaleY * down + offsetY)
+    end
+  else
+    local first = Module.compile(field.input :: Field)
+
+    if op == 'abs' then
+      made = function(across: number, down: number): number
+        return math.abs(first(across, down))
+      end
+    elseif op == 'sin' then
+      made = function(across: number, down: number): number
+        return math.sin(first(across, down))
+      end
+    elseif op == 'negate' then
+      made = function(across: number, down: number): number
+        return -first(across, down)
+      end
+    elseif op == 'scale' then
+      local by, plus = number(field, 'by', 1), number(field, 'plus', 0)
+
+      made = function(across: number, down: number): number
+        return first(across, down) * by + plus
+      end
+    elseif op == 'clamp' then
+      local low, high = number(field, 'low', 0), number(field, 'high', 1)
+
+      made = function(across: number, down: number): number
+        return math.clamp(first(across, down), low, high)
+      end
+    elseif op == 'smoothstep' then
+      local low, high = number(field, 'low', 0), number(field, 'high', 1)
+      local span = if high ~= low then high - low else 1
+
+      made = function(across: number, down: number): number
+        local along = math.clamp((first(across, down) - low) / span, 0, 1)
+
+        return along * along * (3 - 2 * along)
+      end
+    elseif op == 'power' then
+      local exponent = number(field, 'exponent', 1)
+
+      made = function(across: number, down: number): number
+        return math.clamp(first(across, down), 0, 1) ^ exponent
+      end
+    else
+      local second = Module.compile(field.other :: Field)
+
+      if op == 'add' then
+        made = function(across: number, down: number): number
+          return first(across, down) + second(across, down)
+        end
+      elseif op == 'subtract' then
+        made = function(across: number, down: number): number
+          return first(across, down) - second(across, down)
+        end
+      elseif op == 'multiply' then
+        made = function(across: number, down: number): number
+          return first(across, down) * second(across, down)
+        end
+      elseif op == 'min' then
+        made = function(across: number, down: number): number
+          return math.min(first(across, down), second(across, down))
+        end
+      elseif op == 'max' then
+        made = function(across: number, down: number): number
+          return math.max(first(across, down), second(across, down))
+        end
+      else
+        local weight = Module.compile(field.weight :: Field)
+
+        made = function(across: number, down: number): number
+          local along = weight(across, down)
+
+          return first(across, down) * (1 - along) + second(across, down) * along
+        end
+      end
+    end
+  end
+
+  compiledCache[field] = made
+
+  return made
+end
+
+--- A field's value at a point, compiling it first if need be.
+function Module.sample(field: Field, across: number, down: number): number
+  return Module.compile(field)(across, down)
+end
+
+return Module

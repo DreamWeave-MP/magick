@@ -14,6 +14,7 @@ Paths and paints are shared freely between nodes: a paint is a frozen value, and
 only at compile time.
 ]]
 local bytes = require '@dream/bytes'
+local brush = require '@magick/brush'
 local color = require '@magick/color'
 local json = require '@jess/json'
 local magick = require '@magick'
@@ -79,7 +80,7 @@ export type GroupOptions = NodeOptions & { clip: Clip?, mask: Mask?, filters: { 
 
 type NodeData = {
   id: number,
-  kind: 'shape' | 'image' | 'group',
+  kind: 'shape' | 'image' | 'group' | 'stroke',
   document: Document,
   parent: Node?,
   children: { Node },
@@ -99,6 +100,10 @@ type NodeData = {
   filters: { Filter },
   --- Whether this node is a group's mask, and so never drawn as a child.
   isMask: boolean,
+  --- Stroke: its samples, brush and seed.
+  samples: { brush.Sample }?,
+  brush: brush.Brush?,
+  seed: number,
 }
 
 local Node = {}
@@ -151,7 +156,7 @@ local function checkSeed(seed: number): number
   return seed
 end
 
-local function makeNode(document: Document, kind: 'shape' | 'image' | 'group', options: NodeOptions?): Node
+local function makeNode(document: Document, kind: 'shape' | 'image' | 'group' | 'stroke', options: NodeOptions?): Node
   if document.count >= Module.MaxNodes then error(`magick: MaxNodes {Module.MaxNodes} exceeded`, 4) end
 
   local matrix = if options and options.transform then transform.check(options.transform) else transform.identity()
@@ -180,6 +185,9 @@ local function makeNode(document: Document, kind: 'shape' | 'image' | 'group', o
     mask = nil,
     filters = {},
     isMask = false,
+    samples = nil,
+    brush = nil,
+    seed = 1,
   }
 
   document.nextId += 1
@@ -269,6 +277,34 @@ function Document.image(self: Document, image: magick.Image, options: ImageOptio
   node.sampling = if options and options.sampling then options.sampling else 'nearest'
 
   if node.sampling ~= 'nearest' and node.sampling ~= 'bilinear' then error(`magick: unknown sampling {node.sampling}`, 2) end
+
+  return node
+end
+
+--- A stroke node's options: a seed (1 by default) for its dabs' jitter, besides every node's.
+export type StrokeOptions = NodeOptions & { seed: number? }
+
+--- A new brush stroke, not yet in the tree: samples `{ x, y, pressure? }` in the node's space,
+--- stamped with `brush` (see @magick/brush). Its dabs are made when the document is compiled, from
+--- these samples, this brush and this seed, so a saved stroke replays exactly.
+function Document.stroke(self: Document, samples: { brush.Sample }, settings: brush.Brush, options: StrokeOptions?): Node
+  checkKeys(options, { transform = true, opacity = true, blend = true, name = true, seed = true })
+
+  local seed = if options and options.seed then options.seed else 1
+
+  -- Made once here so a bad sample, brush or seed is refused where the stroke is written.
+  brush.stroke(samples, settings, seed)
+
+  local node = makeNode(self, 'stroke', options)
+  local copied: { brush.Sample } = {}
+
+  for _, sample in samples do
+    table.insert(copied, table.clone(sample))
+  end
+
+  node.samples = copied
+  node.brush = table.clone(settings)
+  node.seed = seed
 
   return node
 end
@@ -489,6 +525,21 @@ local function describeNode(node: Node, assets: Assets): { [string]: unknown }
     out.fill = if node.fill then paint.describe(node.fill, sourceAsset) else nil
     out.stroke = if node.stroke then paint.describe(node.stroke, sourceAsset) else nil
     out.strokeStyle = node.strokeStyle
+  elseif node.kind == 'stroke' then
+    local settings = table.clone(node.brush :: brush.Brush) :: { [string]: unknown }
+    local tip = settings.tip :: brush.Tip?
+
+    if tip and tip.kind == 'image' then
+      local mask = tip.mask
+
+      settings.tip = { kind = 'image', mask = { width = mask.width, height = mask.height, data = bytes.toBase64(mask.data) } }
+    end
+
+    if settings.color then settings.color = colorText(settings.color :: magick.Color) end
+
+    out.samples = node.samples
+    out.brush = settings
+    out.seed = node.seed
   elseif node.kind == 'image' then
     local image = node.image :: magick.Image
 
@@ -572,6 +623,9 @@ local NodeKeys: { [string]: boolean } = {
   clip = true,
   mask = true,
   filters = true,
+  samples = true,
+  brush = true,
+  seed = true,
 }
 
 local function field(record: { [string]: unknown }, name: string, kind: string): unknown
@@ -647,6 +701,24 @@ local function loadNode(record: { [string]: unknown }, loading: Loading, into: N
     shapeOptions.stroke = if record.stroke ~= nil then paint.fromDescription(record.stroke :: paint.Description, source) else nil
     shapeOptions.strokeStyle = record.strokeStyle :: StrokeStyle?
     node = document:shape(path.fromDescription(field(record, 'path', 'table') :: path.Description), shapeOptions)
+  elseif kind == 'stroke' then
+    local settings = table.clone(field(record, 'brush', 'table') :: { [string]: unknown })
+    local tip = settings.tip :: { [string]: unknown }?
+
+    if tip and tip.kind == 'image' then
+      local mask = tip.mask :: { [string]: unknown }
+      local width, height = field(mask, 'width', 'number') :: number, field(mask, 'height', 'number') :: number
+      local data = bytes.fromBase64(field(mask, 'data', 'string') :: string)
+
+      if buffer.len(data) ~= width * height then error('magick: a brush tip mask holds the wrong number of bytes', 3) end
+
+      settings.tip = { kind = 'image', mask = magick.mask(width, height, data) }
+    end
+
+    local strokeOptions = options :: StrokeOptions
+
+    strokeOptions.seed = field(record, 'seed', 'number') :: number
+    node = document:stroke(field(record, 'samples', 'table') :: { brush.Sample }, settings :: brush.Brush, strokeOptions)
   elseif kind == 'image' then
     local image = source(field(record, 'image', 'number') :: number)
 

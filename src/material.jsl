@@ -1,0 +1,188 @@
+--!strict
+--[[
+@magick/material: material recipes (MAG-034).
+
+Each recipe takes a seed, a `scale` (the size of its main feature in pixels of paint space) and the
+colors it ramps through, and returns a paint made only of fields and stops: data, so it renders the
+same in any tile, on any worker, at any output size, and saves with the scene. Nothing is read from
+a file. Recipes compose: each is a paint like any other, and `grain` returns the field a recipe is
+made of, for a brush's grain or a mask.
+
+Recipes are stylized: wood has rings and figure, not cells; clouds are turbulence, not weather.
+]]
+local magick = require '@magick'
+local noise = require '@magick/noise'
+local paint = require '@magick/paint'
+local transform = require '@magick/transform'
+
+type Field = noise.Field
+
+local Module = {}
+
+--- What every recipe takes. `scale` is its main feature's size in pixels (each recipe's default
+--- below), `detail` how many octaves of finer noise ride on it (1..8, 5), `colors` the ramp from
+--- dark to light (each recipe has its own), `transform` where its paint space lies.
+export type Options = {
+  seed: number,
+  scale: number?,
+  detail: number?,
+  colors: { magick.Color }?,
+  transform: transform.Matrix?,
+  opacity: number?,
+}
+
+local Keys = { seed = true, scale = true, detail = true, colors = true, transform = true, opacity = true }
+
+local function settle(options: Options, defaultScale: number, defaultColors: { magick.Color }): (number, number, number, { magick.Color })
+  for name in (options :: unknown) :: { [string]: unknown } do
+    if not Keys[name] then error(`magick: unknown option {name}`, 3) end
+  end
+
+  local scale = options.scale or defaultScale
+  local detail = options.detail or 5
+
+  if scale ~= scale or scale <= 0 or scale > 100000 then error('magick: a material scale must be in (0, 100000]', 3) end
+  if detail ~= math.floor(detail) or detail < 1 or detail > 8 then error('magick: a material detail must be a whole number in 1..8', 3) end
+
+  local colors = options.colors or defaultColors
+
+  if #colors < 2 then error('magick: a material needs at least two colors', 3) end
+
+  return options.seed, scale, detail, colors
+end
+
+--- Stops spread evenly over colors.
+local function ramp(colors: { magick.Color }): { paint.Stop }
+  local stops: { paint.Stop } = {}
+
+  for index, entry in colors do
+    table.insert(stops, { offset = (index - 1) / (#colors - 1), color = entry })
+  end
+
+  return stops
+end
+
+local function finish(field: Field, colors: { magick.Color }, options: Options, spread: paint.Spread?): paint.Paint
+  return paint.fieldPaint(field, ramp(colors), { transform = options.transform, opacity = options.opacity, spread = spread })
+end
+
+--- Seeds for the parts of a recipe, each its own, from the recipe's seed.
+local function part(seed: number, index: number): number
+  return noise.hash(seed, index) % 2147483646 + 1
+end
+
+--- Cumulus: turbulence thresholded into soft-edged clouds over sky. `scale` is a cloud's breadth
+--- (160); colors run sky, shadow, light.
+function Module.clouds(options: Options): paint.Paint
+  local seed, scale, detail, colors = settle(options, 160, { '#5b86c8', '#c8d0e0', '#ffffff' })
+  local body = noise.turbulenceField(part(seed, 1), 1 / scale, { octaves = detail, gain = 0.55 })
+
+  return finish(noise.smoothstep(body, 0.18, 0.75), colors, options)
+end
+
+--- Fog: low, slow fbm as density. `scale` is a bank's breadth (300); colors run clear to thick.
+function Module.fog(options: Options): paint.Paint
+  local seed, scale, detail, colors = settle(options, 300, { '#c8ccd400', '#d8dce4c0' })
+  local stretched = noise.transform(noise.fbmField(part(seed, 1), 1 / scale, { octaves = detail }), 1, 0, 0, 3, 0, 0)
+
+  return finish(noise.smoothstep(stretched, -0.25, 0.35), colors, options)
+end
+
+--- Wood: growth rings about a pith off to one side, pushed about by fbm for figure, through a ramp
+--- that repeats. `scale` is the ring spacing (9); colors run latewood to earlywood.
+function Module.wood(options: Options): paint.Paint
+  local seed, scale, detail, colors = settle(options, 9, { '#5a3518', '#8a5a2e', '#c08a52', '#d8a868' })
+  local figure = noise.fbmField(part(seed, 1), 1 / (scale * 12), { octaves = detail })
+  local rings = noise.rings(-scale * 40, scale * 5, scale)
+  local grain = noise.fbmField(part(seed, 2), 1 / (scale * 0.4), { octaves = 2 })
+  local warped = noise.warp(rings, figure, noise.fbmField(part(seed, 3), 1 / (scale * 12), { octaves = detail }), scale * 1.6)
+
+  return finish(noise.combine('add', warped, noise.scale(grain, 0.15)), colors, options, 'reflect')
+end
+
+--- Bark: ridged noise stretched along the trunk, split by cellular cracks. `scale` is a ridge's
+--- width (14); colors run crevice to ridge.
+function Module.bark(options: Options): paint.Paint
+  local seed, scale, detail, colors = settle(options, 14, { '#1e1610', '#3e2e22', '#6a5442', '#8e7a64' })
+  local ridges = noise.transform(noise.ridgedField(part(seed, 1), 1 / scale, { octaves = detail }), 1, 0, 0, 0.18, 0, 0)
+  local cracks = noise.transform(noise.worleyField(part(seed, 2), 1 / (scale * 2.5), 'edges'), 1, 0, 0, 0.3, 0, 0)
+
+  return finish(noise.combine('multiply', ridges, noise.smoothstep(cracks, 0, 0.12)), colors, options)
+end
+
+--- Rock: fbm boulders and cellular fractures. `scale` is a boulder's size (90); colors run shadow,
+--- stone, lit stone.
+function Module.rock(options: Options): paint.Paint
+  local seed, scale, detail, colors = settle(options, 90, { '#2e2c2a', '#5e5a54', '#8e8a80', '#bdb8ac' })
+  local mass = noise.scale(noise.fbmField(part(seed, 1), 1 / scale, { octaves = detail }), 0.8, 0.5)
+  local fractures = noise.smoothstep(noise.worleyField(part(seed, 2), 1 / (scale * 0.6), 'edges'), 0, 0.08)
+  local pits = noise.scale(noise.turbulenceField(part(seed, 3), 4 / scale, { octaves = 3 }), 0.25, 0)
+
+  return finish(noise.combine('subtract', noise.combine('multiply', mass, noise.scale(fractures, 0.5, 0.5)), pits), colors, options)
+end
+
+--- Leaf: veins branching from a midrib, cells between them, a little mottling. `scale` is the
+--- spacing of the side veins (18); colors run vein to lamina.
+function Module.leaf(options: Options): paint.Paint
+  local seed, scale, detail, colors = settle(options, 18, { '#d8e8a0', '#2e5a1e', '#4a8a2e', '#6aaa3e' })
+  local midrib = noise.smoothstep(noise.apply('abs', noise.coordinate 'y'), 0, scale * 0.12)
+  local side = noise.transform(noise.stripes(scale, 0), 1, 0, -0.9, 1, 0, 0)
+  local veins = noise.smoothstep(side, 0.0, 0.08)
+  local cells = noise.smoothstep(noise.worleyField(part(seed, 1), 1 / (scale * 0.35), 'edges'), 0, 0.06)
+  local mottle = noise.scale(noise.fbmField(part(seed, 2), 1 / (scale * 3), { octaves = detail }), 0.3, 0.7)
+  local lamina = noise.combine('multiply', noise.combine('multiply', midrib, veins), noise.scale(cells, 0.25, 0.75))
+
+  return finish(noise.combine('multiply', lamina, mottle), colors, options)
+end
+
+--- Fabric: a plain weave, warp and weft threads crossing over and under, with slubs. `scale` is a
+--- thread's width (4); colors run shadow to thread.
+function Module.fabric(options: Options): paint.Paint
+  local seed, scale, detail, colors = settle(options, 4, { '#3a2a4a', '#6a4a7a', '#9a78a8' })
+  local warp = noise.stripes(scale * 2, 0)
+  local weft = noise.stripes(scale * 2, math.pi / 2)
+  local over = noise.checker(scale * 2)
+  local weave = noise.blend(warp, weft, over)
+  local slubs = noise.scale(noise.transform(noise.fbmField(part(seed, 1), 1 / (scale * 8), { octaves = detail }), 1, 0, 0, 0.1, 0, 0), 0.25, 0.85)
+
+  return finish(noise.combine('multiply', weave, slubs), colors, options)
+end
+
+--- Parchment: blotchy staining over a fine fibrous grain, darker toward stains. `scale` is a
+--- stain's size (220); colors run stain to clean sheet.
+function Module.parchment(options: Options): paint.Paint
+  local seed, scale, detail, colors = settle(options, 220, { '#b08a58', '#d8c094', '#efe2c0', '#f6edd6' })
+  local stains = noise.scale(noise.fbmField(part(seed, 1), 1 / scale, { octaves = detail }), 0.9, 0.62)
+  local fibres = noise.scale(noise.transform(noise.turbulenceField(part(seed, 2), 1 / 3, { octaves = 2 }), 1, 0, 0, 0.25, 0, 0), -0.12, 0.06)
+
+  return finish(noise.combine('add', stains, fibres), colors, options)
+end
+
+--- Marble: veins of turbulence through a light stone. `scale` is the vein spacing (60); colors
+--- run vein to stone.
+function Module.marble(options: Options): paint.Paint
+  local seed, scale, detail, colors = settle(options, 60, { '#3a3a44', '#9a98a0', '#e8e4dc', '#f8f6f0' })
+  local turbulence = noise.turbulenceField(part(seed, 1), 1 / (scale * 2), { octaves = detail })
+  local veins = noise.apply('sin', noise.combine('add', noise.scale(noise.coordinate 'x', 1 / scale), noise.scale(turbulence, 6)))
+
+  return finish(noise.power(noise.scale(veins, 0.5, 0.5), 0.35), colors, options)
+end
+
+--- The names of the recipes, in a stable order.
+Module.names = table.freeze { 'clouds', 'fog', 'wood', 'bark', 'rock', 'leaf', 'fabric', 'parchment', 'marble' }
+
+--- A recipe by name.
+function Module.make(name: string, options: Options): paint.Paint
+  local recipe = (Module :: { [string]: unknown })[name]
+
+  if type(recipe) ~= 'function' or not table.find(Module.names, name) then error(`magick: unknown material {name}`, 2) end
+
+  return (recipe :: (Options) -> paint.Paint)(options)
+end
+
+--- The field a field paint reads, for a brush's grain or a mask: nil for any other paint.
+function Module.grain(material: paint.Paint): Field?
+  return material.field
+end
+
+return Module

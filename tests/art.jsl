@@ -1,0 +1,78 @@
+--!strict
+-- `@magick/art` (MAG-035): palettes, scatter, brush samples along paths and symbols, each a
+-- deterministic convenience over the public modules.
+local art = require '@magick/art'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+suite.describe('helpers', function()
+  suite.it('hands out copies of palettes, dark to light, and refuses unknown ones', function()
+    local dusk = art.palette 'dusk'
+
+    dusk[1] = '#ffffff'
+    expect(art.palette('dusk')[1]).toBe '#141a33'
+    expect(#art.paletteNames).toBe(6)
+
+    expect(function()
+      art.palette 'neon'
+    end).toThrow 'magick: unknown palette neon'
+  end)
+
+  suite.it('scatters points inside their box, the same for a seed, one to a cell', function()
+    local first, again = art.scatter(4, 100, { 10, 20, 210, 120 }), art.scatter(4, 100, { 10, 20, 210, 120 })
+    local cells: { [number]: boolean } = {}
+
+    expect(#first).toBe(100)
+
+    for index, point in first do
+      expect(point[1] >= 10 and point[1] <= 210 and point[2] >= 20 and point[2] <= 120).toBe(true)
+      expect(point[1] == again[index][1] and point[2] == again[index][2]).toBe(true)
+
+      -- round(sqrt(100 * 2)) = 14 columns and ceil(100 / 14) = 8 rows: no two points share a cell.
+      local cell = math.floor((point[1] - 10) / (200 / 14)) * 100 + math.floor((point[2] - 20) / (100 / 8))
+
+      expect(cells[cell]).toBe(nil)
+      cells[cell] = true
+    end
+
+    expect(function()
+      art.scatter(1, 70000, { 0, 0, 10, 10 })
+    end).toThrow 'magick: MaxScatter 65536 exceeded'
+  end)
+
+  suite.it('samples a path every step along it, with pressure by the way along', function()
+    local samples = art.samples(path.new():moveTo(0, 0):lineTo(10, 0), function(along: number): number
+      return along
+    end, 2.5)
+
+    expect(#samples).toBe(5)
+    expect(samples[1]).toEqual { 0, 0, 0 }
+    expect(samples[5]).toEqual { 10, 0, 1 }
+    expect(samples[3]).toEqual { 5, 0, 0.5 }
+  end)
+
+  suite.it('places a symbol as its own group wherever it is wanted, the same each time', function()
+    local document = scene.new(60, 30)
+    local dot = art.symbol(function(owner: scene.Document, group: scene.Node)
+      group:add(owner:shape(path.new():circle(0, 0, 5), { fill = paint.solid '#ffffff' }))
+    end)
+
+    dot(document, document.root, transform.translate(15, 15))
+    dot(document, document.root, transform.translate(45, 15), { opacity = 0.5 })
+
+    local image = render.image(document)
+
+    expect({ image:get(15, 15) }).toEqual { 255, 255, 255, 255 }
+    expect({ image:get(45, 15) }).toEqual { 255, 255, 255, 128 }
+    expect(#document.root.children).toBe(2)
+  end)
+end)
+
+return suite

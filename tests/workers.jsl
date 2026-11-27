@@ -5,6 +5,8 @@
 --
 --   jess package run --capability worker.spawn --target workers-check .
 local application = require '@jess/application'
+local brush = require '@magick/brush'
+local noise = require '@magick/noise'
 local paint = require '@magick/paint'
 local path = require '@magick/path'
 local render = require '@magick/render'
@@ -29,7 +31,9 @@ local function busy(): scene.Document
 
       group:add(document:shape(petal, {
         transform = transform.compose(transform.translate(512 + math.cos(angle) * radius, 384 + math.sin(angle) * radius * 0.75), transform.rotate(angle), transform.scale(0.6 + layer * 0.1)),
-        fill = paint.linear(0, 0, 70, 0, paint.stops(0, '#ffd08080', 1, '#6040c0d0')),
+        fill = if layer == 3
+          then paint.fieldPaint(noise.turbulenceField(7, 0.05, { octaves = 4 }), paint.stops(0, '#20406080', 1, '#ffe0a0e0'))
+          else paint.linear(0, 0, 70, 0, paint.stops(0, '#ffd08080', 1, '#6040c0d0')),
         stroke = paint.solid '#ffffff60',
         strokeStyle = { width = 1 },
         blend = if index % 3 == 0 then 'screen' else 'normal',
@@ -40,7 +44,20 @@ local function busy(): scene.Document
   return document
 end
 
-local plan = render.compile(busy())
+local function withStrokes(document: scene.Document): scene.Document
+  local samples: { brush.Sample } = {}
+
+  for step = 0, 120 do
+    table.insert(samples, { 80 + step * 7, 600 + math.sin(step * 0.1) * 80, 0.4 + 0.6 * math.abs(math.sin(step * 0.05)) })
+  end
+
+  document:add(document:stroke(samples, brush.preset('oil', 40, '#c05028'), { seed = 9 }))
+  document:add(document:stroke(samples, brush.preset('watercolor', 70, '#3070c0', { grain = brush.paper(4) }), { seed = 10, transform = transform.translate(0, -120) }))
+
+  return document
+end
+
+local plan = render.compile(withStrokes(busy()))
 local started = os.clock()
 local single = render.image(plan, { tileSize = 128 })
 local base = os.clock() - started

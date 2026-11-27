@@ -6,6 +6,7 @@
 local color = require '@magick/color'
 local documents = require './documents'
 local magick = require '@magick'
+local noise = require '@magick/noise'
 local paint = require '@magick/paint'
 local path = require '@magick/path'
 local render = require '@magick/render'
@@ -155,6 +156,9 @@ suite.describe('plans', function()
 
     document:add(document:image(source, { transform = transform.translate(1, 1) }))
     document:add(document:shape(path.new():rect(8, 8, 16, 16), { fill = paint.pattern(source, { edge = 'repeat' }) }))
+    document:add(document:shape(path.new():rect(0, 10, 6, 16), {
+      fill = paint.mix(paint.solid '#0000ff', paint.pattern(source, { edge = 'repeat' }), noise.constant(0.75)),
+    }))
 
     local plan = render.compile(document)
     local before = render.image(plan)
