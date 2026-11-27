@@ -1,0 +1,233 @@
+--!strict
+-- `Path:stroked` (MAG-007): stroke outlines with miter, round and bevel joins, butt, round and
+-- square caps, miter limits, dashes and offsets, held to areas worked out by hand, under rotation
+-- and reflection, with guards for pathological widths and dash lists.
+local magick = require '@magick'
+local path = require '@magick/path'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+--- The coverage a mask holds in all, in whole pixels.
+local function area(mask: magick.Mask): number
+  local total = 0
+
+  for offset = 0, mask.width * mask.height - 1 do
+    total += buffer.readu8(mask.data, offset)
+  end
+
+  return total / 255
+end
+
+local function at(mask: magick.Mask, column: number, row: number): number
+  return buffer.readu8(mask.data, row * mask.width + column)
+end
+
+--- The stroke's coverage over a 40 by 40 window, by the nonzero rule.
+local function strokeArea(outline: path.Path, options: path.StrokeOptions): number
+  return area(outline:stroked(options):coverageIn(0, 0, 40, 40))
+end
+
+local function near(actual: number, expected: number, within: number): boolean
+  return math.abs(actual - expected) <= within
+end
+
+--- An open L: right 10, then down 10, from (5, 5).
+local function corner(): path.Path
+  return path.new():moveTo(5, 5):lineTo(15, 5):lineTo(15, 15)
+end
+
+suite.describe('caps', function()
+  suite.it('draws a butt-capped line as its band, exactly', function()
+    local line = path.new():moveTo(2, 5):lineTo(12, 5):stroked { width = 2 }:coverageIn(0, 0, 16, 8)
+
+    expect(area(line)).toBe(20)
+    expect({ at(line, 2, 4), at(line, 11, 5), at(line, 12, 5), at(line, 1, 4) }).toEqual { 255, 255, 0, 0 }
+  end)
+
+  suite.it('extends a square cap by half the width, and rounds a round one', function()
+    local line = path.new():moveTo(4, 5):lineTo(14, 5)
+
+    expect(strokeArea(line, { width = 2, cap = 'square' })).toBe(24)
+    expect(near(strokeArea(line, { width = 2, cap = 'round' }), 20 + math.pi, 0.05)).toBe(true)
+  end)
+
+  suite.it('draws a lone point as its cap: a disc, a square, or nothing', function()
+    local dot = path.new():moveTo(10, 10):lineTo(10, 10)
+
+    expect(near(strokeArea(dot, { width = 4, cap = 'round' }), 4 * math.pi, 0.1)).toBe(true)
+    expect(strokeArea(dot, { width = 4, cap = 'square' })).toBe(16)
+    expect(strokeArea(dot, { width = 4 })).toBe(0)
+  end)
+end)
+
+suite.describe('joins', function()
+  -- The two bands overlap in one unit square inside the corner; the joins add the outside corner:
+  -- a miter its whole unit square, a bevel half of it, a round join a quarter disc.
+  suite.it('fills the outside of a right-angle corner by its join', function()
+    expect(strokeArea(corner(), { width = 2, join = 'miter' })).toBe(40)
+    expect(near(strokeArea(corner(), { width = 2, join = 'bevel' }), 39.5, 0.01)).toBe(true)
+    -- A quarter arc of radius 1 at a quarter pixel is two chords: 0.745 of the quarter disc's 0.785.
+    expect(near(strokeArea(corner(), { width = 2, join = 'round' }), 39 + math.pi / 4, 0.05)).toBe(true)
+  end)
+
+  suite.it('bevels a miter longer than its limit, and keeps one at the limit', function()
+    -- At 90 degrees the miter is sqrt 2 widths long: a miter at limit sqrt 2, a bevel at 1.4.
+    expect(strokeArea(corner(), { width = 2, miterLimit = math.sqrt(2) })).toBe(40)
+    expect(near(strokeArea(corner(), { width = 2, miterLimit = 1.4 }), 39.5, 0.01)).toBe(true)
+
+    -- A 20 degree turn back is a miter 5.76 widths long.
+    local sharp = path.new():moveTo(4, 30):lineTo(34, 30):lineTo(4, 30 - 30 * math.tan(math.rad(20)))
+    local bevelled = strokeArea(sharp, { width = 2, join = 'bevel' })
+
+    expect(strokeArea(sharp, { width = 2, miterLimit = 4 })).toBe(bevelled)
+    expect(strokeArea(sharp, { width = 2, miterLimit = 6 }) > bevelled + 1).toBe(true)
+  end)
+
+  suite.it('joins a closed contour all the way round, with no caps', function()
+    local square = path.new():moveTo(10, 10):lineTo(20, 10):lineTo(20, 20):lineTo(10, 20):close()
+
+    -- A 12 square less the 8 square inside: 144 - 64.
+    expect(strokeArea(square, { width = 2, cap = 'round' })).toBe(80)
+    expect(near(strokeArea(square, { width = 2, join = 'bevel' }), 78, 0.02)).toBe(true)
+  end)
+
+  suite.it('leaves no crack along a flattened curve, whatever the join', function()
+    local arc = path.new():moveTo(5, 30):cubicTo(5, 0, 35, 0, 35, 30)
+
+    for _, join in { 'miter', 'round', 'bevel' } :: { path.Join } do
+      local stroke = arc:stroked({ width = 3, join = join }):coverageIn(0, 0, 40, 40)
+
+      -- Down the middle of the band, at the top of the curve, every pixel is whole.
+      expect({ at(stroke, 19, 7), at(stroke, 20, 7) }).toEqual { 255, 255 }
+    end
+  end)
+end)
+
+suite.describe('dashes', function()
+  suite.it('draws on and off lengths by turns, from an offset into the pattern', function()
+    local line = path.new():moveTo(0, 5):lineTo(20, 5)
+    local plain = line:stroked({ width = 2, dashes = { 5, 5 } }):coverageIn(0, 0, 24, 8)
+    local shifted = line:stroked({ width = 2, dashes = { 5, 5 }, dashOffset = 5 }):coverageIn(0, 0, 24, 8)
+
+    expect(area(plain)).toBe(20)
+    expect(area(shifted)).toBe(20)
+    expect({ at(plain, 2, 5), at(plain, 7, 5), at(plain, 12, 5) }).toEqual { 255, 0, 255 }
+    expect({ at(shifted, 2, 5), at(shifted, 7, 5), at(shifted, 12, 5) }).toEqual { 0, 255, 0 }
+  end)
+
+  suite.it('reduces a negative offset by floored modulo, and repeats an odd pattern twice', function()
+    local line = path.new():moveTo(0, 5):lineTo(20, 5)
+    local back = line:stroked({ width = 2, dashes = { 3, 7 }, dashOffset = -1 }):coverageIn(0, 0, 24, 8)
+
+    -- -1 is 9 into the period of 10: one unit of gap, then a dash at 1..4.
+    expect({ at(back, 0, 5), at(back, 1, 5), at(back, 3, 5), at(back, 4, 5) }).toEqual { 0, 255, 255, 0 }
+
+    local odd = line:stroked({ width = 2, dashes = { 4 } }):coverageIn(0, 0, 24, 8)
+
+    expect({ at(odd, 1, 5), at(odd, 5, 5), at(odd, 9, 5) }).toEqual { 255, 0, 255 }
+  end)
+
+  suite.it('draws a zero-length dash as its cap, and an all-zero pattern solid', function()
+    local line = path.new():moveTo(5, 10):lineTo(25, 10)
+    local dots = strokeArea(line, { width = 2, cap = 'round', dashes = { 0, 10 } })
+
+    -- Dots at 5, 15 and 25, the last at the very end: three discs of radius 1.
+    expect(near(dots, 3 * math.pi, 0.1)).toBe(true)
+    expect(strokeArea(line, { width = 2, dashes = { 0, 0 } })).toBe(40)
+  end)
+
+  suite.it('carries the pattern around corners', function()
+    local dashed = corner():stroked({ width = 2, dashes = { 8, 4 } }):coverageIn(0, 0, 24, 24)
+
+    -- 8 on along the top, 4 off around the corner (2 before it, 2 after), then 8 on down.
+    expect({ at(dashed, 12, 5), at(dashed, 14, 5), at(dashed, 15, 6), at(dashed, 15, 8) }).toEqual { 255, 0, 0, 255 }
+  end)
+end)
+
+suite.describe('transforms', function()
+  suite.it('mirrors a stroke under a reflection, and keeps its area under a rotation', function()
+    local shape = corner():stroked { width = 2, join = 'round', cap = 'square' }
+    local base = area(shape:coverageIn(0, 0, 40, 40))
+    local mirrored = shape:transformBy(transform.compose(transform.translate(40, 0), transform.scale(-1, 1)))
+    local turned = shape:transformBy(transform.compose(transform.translate(20, 0), transform.rotate(0.7)))
+
+    expect(near(area(mirrored:coverageIn(0, 0, 40, 40)), base, 0.02)).toBe(true)
+    expect(near(area(turned:coverageIn(-10, 0, 50, 40)), base, 0.05)).toBe(true)
+  end)
+
+  suite.it('scales a stroke width with the matrix, in user space', function()
+    local line = path.new():moveTo(1, 2):lineTo(6, 2):stroked { width = 1 }
+    local wide = line:coverageIn(0, 0, 20, 10, { transform = transform.scale(3) })
+
+    -- 15 by 3 from y 4.5: the top and bottom rows are half covered, 128 of 255 each.
+    expect(near(area(wide), 45, 0.06)).toBe(true)
+  end)
+
+  suite.it('flattens the centerline finer for a larger transform', function()
+    local arc = path.new():moveTo(0, 0):quadTo(5, 5, 10, 0)
+    local coarse = arc:stroked { width = 1 }
+    local fine = arc:stroked { width = 1, transform = transform.scale(20) }
+
+    expect(#fine.contours > #coarse.contours).toBe(true)
+  end)
+end)
+
+suite.describe('guards', function()
+  suite.it('refuses bad widths, joins, caps, limits and options by name', function()
+    local line = path.new():moveTo(0, 0):lineTo(1, 0)
+
+    expect(function()
+      line:stroked { width = -1 }
+    end).toThrow 'magick: stroke width must be finite and not negative'
+
+    expect(function()
+      line:stroked { width = 0 / 0 }
+    end).toThrow 'magick: stroke width must be finite and not negative'
+
+    expect(function()
+      line:stroked { width = 4194305 }
+    end).toThrow 'magick: MaxCoordinate 4194304 exceeded'
+
+    expect(function()
+      line:stroked { width = 1, join = 'mitre' :: any }
+    end).toThrow 'magick: unknown join mitre'
+
+    expect(function()
+      line:stroked { width = 1, cap = 'flat' :: any }
+    end).toThrow 'magick: unknown cap flat'
+
+    expect(function()
+      line:stroked { width = 1, miterLimit = 0.5 }
+    end).toThrow 'magick: miterLimit must be finite and at least 1'
+
+    expect(function()
+      line:stroked(({ width = 1, dash = { 1 } } :: any) :: path.StrokeOptions)
+    end).toThrow 'magick: unknown option dash'
+  end)
+
+  suite.it('refuses dash lists past their caps before building anything', function()
+    local line = path.new():moveTo(0, 0):lineTo(4000000, 0)
+    local long = table.create(65, 1)
+
+    expect(function()
+      line:stroked { width = 1, dashes = long }
+    end).toThrow 'magick: MaxDashEntries 64 exceeded'
+
+    expect(function()
+      line:stroked { width = 1, dashes = { 1, -1 } }
+    end).toThrow 'magick: dash lengths must be finite and not negative'
+
+    expect(function()
+      line:stroked { width = 1, dashes = { 1, 1 } }
+    end).toThrow 'magick: MaxDashesPerStroke 1048576 exceeded'
+  end)
+
+  suite.it('gives a zero width nothing', function()
+    expect(#corner():stroked({ width = 0 }).contours).toBe(0)
+  end)
+end)
+
+return suite

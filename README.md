@@ -64,6 +64,28 @@ An unknown option, fill rule or a window that is not whole numbers is refused by
   outline is refused depends on the outline alone, never on the tiling. A 400-edge zigzag inside one row took 11.6 s
   before the caps and is now refused in milliseconds; 200 such edges cover exactly in 0.35 s.
 
+### Strokes
+
+`Path:stroked(options)` returns the stroke's outline as a new path: a band along each segment, a join piece at each
+corner and caps at the ends of open subpaths and dashes. The pieces overlap and their union is the stroke, which is
+what `coverageIn` covers under `nonzero`; legacy `mask()` sums overlaps and is not the call for a stroke. Options, in
+the path's own space (RFC-0001 SK1 to SK7):
+
+- `width` (required, finite, `0 <= width <= MaxCoordinate`; 0 gives an empty path).
+- `join`: `miter` (default), `round` or `bevel`; `miterLimit` (default 4, at least 1): a miter whose length over the
+  width, `1 / sin(interior / 2)`, exceeds it is a bevel, and one equal to it stays a miter.
+- `cap`: `butt` (default), `round` or `square`. A subpath of one point draws its cap about itself: a disc, a square,
+  or nothing for `butt`.
+- `dashes` (at most `MaxDashEntries` 64, each finite and not negative; empty or all zero is solid; an odd list repeats
+  twice, as SVG does) and `dashOffset` (reduced by floored modulo). A dash boundary exactly at the end of the line
+  starts a dash of no length there, which a round or square cap draws. More than `MaxDashesPerStroke` (2^20) dashes
+  are refused before any is built.
+- `transform` and `tolerance`: where the stroke will be drawn, so curves in the centerline flatten to the device
+  tolerance over the transform's largest stretch. Round joins and caps stay arcs and flatten again where drawn.
+
+A subpath is closed for a stroke only when `close()` closed it; one ended by `moveTo`, `mask()` or `stroked()` is open,
+and fills as closed, as in SVG. A subpath of two points is kept for strokes; it never filled and still does not.
+
 ## Gates
 
 `tests/gate.jsl` holds the package to tiny exact fixtures (transparency, clipping, alpha, curves,

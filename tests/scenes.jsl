@@ -12,6 +12,7 @@
 -- drew the right thing. A change that moves one is a visual change and needs a reviewed rebaseline.
 local magick = require '@magick'
 local path = require '@magick/path'
+local transform = require '@magick/transform'
 local support = require './support'
 
 type Image = support.Image
@@ -183,6 +184,38 @@ scene('compound clip', function()
   return magick.new(64, 24, '#101828'):overMask(coverage, '#f05080', 0, 0)
 end)
 
+--- An open zigzag with a right angle and an acute turn, offset into a grid cell.
+local function zigzag(left: number, top: number): path.Path
+  return path.new():moveTo(left + 4, top + 22):lineTo(left + 16, top + 6):lineTo(left + 28, top + 22):lineTo(left + 30, top + 8)
+end
+
+-- MAG-007: every join (rows: miter, round, bevel) with every cap (columns: butt, round, square),
+-- turned by 0.3 radians about the middle.
+scene('stroke joins and caps', function()
+  local image = magick.new(132, 124, '#14161c')
+  local turn = transform.compose(transform.translate(66, 62), transform.rotate(0.3), transform.translate(-54, -48))
+
+  for row, join in { 'miter', 'round', 'bevel' } :: { path.Join } do
+    for column, cap in { 'butt', 'round', 'square' } :: { path.Cap } do
+      local outline = zigzag((column - 1) * 36, (row - 1) * 32):stroked { width = 5, join = join, cap = cap }
+
+      image:overMask(outline:coverageIn(0, 0, 132, 124, { transform = turn }), '#e8d8a0', 0, 0)
+    end
+  end
+
+  return image
+end)
+
+-- Dashes with zero-length round dots, carried around a curve and mirrored left to right.
+scene('stroke dashes mirrored', function()
+  local wave = path.new():moveTo(6, 24):cubicTo(30, -6, 50, 54, 74, 24):cubicTo(86, 9, 96, 12, 102, 20)
+  local dashed = wave:stroked { width = 4, cap = 'round', join = 'round', dashes = { 9, 5, 0, 5 }, dashOffset = 3 }
+  local mirror = transform.compose(transform.translate(108, 0), transform.scale(-1, 1))
+  local image = magick.new(108, 40, '#14161c')
+
+  return image:overMask(dashed:coverageIn(0, 0, 108, 40, { transform = mirror }), '#80d0ff', 0, 0)
+end)
+
 --- The scenes, in the order the gallery renders and the gate suite checks them.
 local Scenes: { Scene } = scenes
 
@@ -220,6 +253,10 @@ local Recorded: { [string]: string } = {
   ['fill rule evenodd png'] = '972:7a04541a',
   ['compound clip pixels'] = '64x24:ff91d9c4',
   ['compound clip png'] = '797:ab4254c4',
+  ['stroke joins and caps pixels'] = '132x124:5d966df0',
+  ['stroke joins and caps png'] = '4841:82f16e74',
+  ['stroke dashes mirrored pixels'] = '108x40:ed898f9d',
+  ['stroke dashes mirrored png'] = '1398:eefb5a78',
 }
 
 return table.freeze {
