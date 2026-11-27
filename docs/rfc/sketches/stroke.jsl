@@ -1,0 +1,76 @@
+--!strict
+--[[
+Stroke rules (RFC-0001 section 5, SK1 to SK7). REFERENCE arithmetic for the units, the joins and the
+dash rules. MAG-007 implements strokes; these functions are what its tests must agree with.
+]]
+
+local caps = require './caps'
+local transform = require './transform'
+
+local Stroke = {}
+
+--- SK2: a width is finite and within MaxCoordinate, and not negative.
+function Stroke.checkWidth(width: number): number
+  if width ~= width or width < 0 then error('magick: stroke width must be finite and not negative', 2) end
+
+  return caps.check('MaxCoordinate', width)
+end
+
+--- SK1: the device width of a user-space stroke of width `width` along user direction (dirX, dirY), under
+--- the matrix. A strip of user width w along d maps to a parallelogram of area |det M| * w * L, and its device
+--- length is |M d| * L, so the device width is w * |det M| / |M d|.
+function Stroke.deviceWidth(width: number, matrix: transform.Matrix, dirX: number, dirY: number): number
+  local linearX = matrix.scaleX * dirX + matrix.skewX * dirY
+  local linearY = matrix.skewY * dirX + matrix.scaleY * dirY
+  local length = math.sqrt(linearX * linearX + linearY * linearY)
+
+  if length == 0 then error('magick: stroke direction is zero', 2) end
+
+  return width * math.abs(transform.determinant(matrix)) / length
+end
+
+--- SK4: the miter length over the width at a join with interior angle theta: 1 / sin(theta / 2).
+function Stroke.miterRatio(theta: number): number
+  return 1 / math.sin(theta / 2)
+end
+
+--- SK4: a miter join where the ratio does not exceed the limit, and a bevel where it does.
+function Stroke.joinKind(theta: number, miterLimit: number): 'miter' | 'bevel'
+  if Stroke.miterRatio(theta) <= miterLimit then return 'miter' end
+
+  return 'bevel'
+end
+
+--- SK3: what a zero-length segment draws at its point. Round is a disk of the width's diameter, square a
+--- square of the width's side, butt nothing.
+function Stroke.zeroLengthCap(cap: 'butt' | 'round' | 'square', width: number): { kind: string, size: number }
+  if cap == 'round' then return { kind = 'disk', size = width } end
+  if cap == 'square' then return { kind = 'square', size = width } end
+
+  return { kind = 'none', size = 0 }
+end
+
+--- SK6: the dash array's check. At most MaxDashEntries entries, each finite and not negative. The sum is
+--- returned; a sum of 0 means a solid stroke.
+function Stroke.checkDashes(dashes: { number }): number
+  caps.check('MaxDashEntries', #dashes)
+
+  local total = 0
+
+  for _, length in dashes do
+    if length ~= length or length < 0 or length == math.huge then
+      error('magick: dash lengths must be finite and not negative', 2)
+    end
+
+    total += length
+  end
+
+  return total
+end
+
+--- SK6: the dash offset reduced into [0, period) by floored modulo.
+function Stroke.dashOffset(offset: number, period: number): number
+  return offset - period * math.floor(offset / period)
+end
+
+return Stroke

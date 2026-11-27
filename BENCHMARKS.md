@@ -17,6 +17,7 @@ jess run --package jpk/magick jpk/magick/bench/bench.jsl [filter]
 
 It refuses a build without the verified toolchain.
 
+The renderer design these benchmarks will measure against is [RFC-0001](docs/RFC-0001-renderer.md). Its budgets and tile sizes are decisions, not measurements; numbers in this file stay measured on verified builds.
 ## Measuring now
 
 Every table in this file below this section is a historical record. It says what one build did on

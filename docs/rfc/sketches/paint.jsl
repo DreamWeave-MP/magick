@@ -1,0 +1,140 @@
+--!strict
+--[[
+@magick/paint (0.2.0), SKETCH of RFC-0001 section 9.
+
+Declarations are the contract; the functions with bodies are REFERENCE arithmetic that the tests in
+tests/rfc.jsl run: the fill-rule coverage of a winding sum (F1, F2) and the premultiplied mixing of two
+gradient stops (M9). Every constructor and span function is a STUB and is not an implementation.
+
+A paint is an immutable value. It is evaluated over a span of pixel centers in one row of a tile, at
+(x + 0.5, y + 0.5), and writes premultiplied values into a scratch buffer. A user callback is not part
+of 0.2.0.
+]]
+
+local path = require '@magick/path'
+local transform = require './transform'
+local color = require './color'
+
+local Paint = {}
+
+export type Matrix = transform.Matrix
+export type Working = color.Working
+export type Space = color.Space
+
+--- Spread past the first and last stop, shared by linear, radial and conic paints.
+export type Spread = 'pad' | 'repeat' | 'reflect'
+
+--- A stop: offset in 0..1, straight color as channels in 0..1, alpha included. Constructors accept a
+--- legacy magick.Color and convert it to these channels once.
+export type Stop = { offset: number, red: number, green: number, blue: number, alpha: number }
+
+--- Sampling for image patterns.
+export type Sampling = 'nearest' | 'bilinear'
+
+--- What a pattern does past its source's edges.
+export type Edge = 'clamp' | 'repeat' | 'mirror'
+
+--- A pattern source names its format: a straight RGBA8 image (legacy layout), or a premultiplied
+--- f32 working tile (RFC-0001 W1). The two are not interchangeable.
+export type PatternSource =
+  { format: 'straight8', width: number, height: number, data: buffer }
+  | { format: 'premultiplied32', width: number, height: number, data: buffer }
+
+export type Solid = { kind: 'solid', red: number, green: number, blue: number, alpha: number }
+export type Linear = { kind: 'linear', x0: number, y0: number, x1: number, y1: number, stops: { Stop }, spread: Spread, space: Space, transform: Matrix }
+export type Radial = { kind: 'radial', cx: number, cy: number, radius: number, stops: { Stop }, spread: Spread, space: Space, transform: Matrix }
+export type Conic = { kind: 'conic', cx: number, cy: number, startAngle: number, stops: { Stop }, spread: Spread, space: Space, transform: Matrix }
+export type Pattern = { kind: 'pattern', source: PatternSource, edge: Edge, sampling: Sampling, transform: Matrix }
+
+--- Every paint. `opacity` in 0..1 multiplies the paint's alpha on evaluation.
+export type Paint = (Solid | Linear | Radial | Conic | Pattern) & { opacity: number }
+
+--- Options every fill takes. Omitted options take the RFC-0001 E3 defaults.
+export type FillOptions = {
+  fillRule: 'nonzero' | 'evenodd'?,
+  blend: 'normal' | 'multiply' | 'screen' | 'overlay' | 'darken' | 'lighten' | 'soft-light'?,
+  clip: { left: number, top: number, right: number, bottom: number }?,
+}
+
+--- REFERENCE. The coverage of a pixel from its winding sum S (RFC-0001 F1, F2). Nonzero is
+--- min(1, |S|), the 0.1.3 rule. Evenodd folds |S| with period 2: w = |S| mod 2, then w if w <= 1, else
+--- 2 - w. Evenodd on a summed S is exact for a single contour and for disjoint contours, and it is an
+--- approximation under overlap, as nonzero is (RFC-0001 C2 and section 6, F2). An unknown rule is refused.
+function Paint.coverage(fillRule: 'nonzero' | 'evenodd', winding: number): number
+  local magnitude = math.abs(winding)
+
+  if fillRule == 'nonzero' then return math.min(1, magnitude) end
+
+  if fillRule == 'evenodd' then
+    local remainder = magnitude % 2
+
+    if remainder <= 1 then return remainder end
+
+    return 2 - remainder
+  end
+
+  error(`magick: unknown fill rule {fillRule}`, 2)
+end
+
+--- REFERENCE. Mixes two stops at `along` in 0..1, premultiplied (RFC-0001 M9): each straight color is
+--- premultiplied by its own alpha, the premultiplied channels and the alphas are mixed linearly, and the
+--- result is straight again. Two stops of unequal alpha therefore do not pull color from the transparent
+--- stop. A zero mixed alpha gives color 0.
+function Paint.mixStop(first: Stop, second: Stop, along: number): Stop
+  local alpha = first.alpha * (1 - along) + second.alpha * along
+
+  local function channel(firstStraight: number, secondStraight: number): number
+    if alpha == 0 then return 0 end
+
+    local premultiplied = firstStraight * first.alpha * (1 - along) + secondStraight * second.alpha * along
+
+    return premultiplied / alpha
+  end
+
+  return {
+    offset = first.offset * (1 - along) + second.offset * along,
+    red = channel(first.red, second.red),
+    green = channel(first.green, second.green),
+    blue = channel(first.blue, second.blue),
+    alpha = alpha,
+  }
+end
+
+--- Stub: a solid paint from channels in 0..1 (or a color string resolved by the caller).
+function Paint.solid(red: number, green: number, blue: number, alpha: number?): Paint
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+--- Stub: a linear gradient through two points in paint space, after its transform.
+function Paint.linear(x0: number, y0: number, x1: number, y1: number, stops: { Stop }, options: { spread: Spread?, space: Space?, transform: Matrix? }?): Paint
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+--- Stub: a radial gradient. radius 0 gives the last stop's color (RFC-0001 section 9, M8).
+function Paint.radial(cx: number, cy: number, radius: number, stops: { Stop }, options: { spread: Spread?, space: Space?, transform: Matrix? }?): Paint
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+--- Stub: a conic gradient. Its seam is at `startAngle` in paint space (0 is the +x axis, the default);
+--- angles grow clockwise on screen.
+function Paint.conic(cx: number, cy: number, stops: { Stop }, options: { startAngle: number?, spread: Spread?, space: Space?, transform: Matrix? }?): Paint
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+--- Stub: an image as a repeated, transformed fill. Reading the destination is refused.
+function Paint.pattern(source: PatternSource, options: { edge: Edge?, sampling: Sampling?, transform: Matrix? }?): Paint
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+--- Stub: the coverage of a path inside a rectangle, filled with a paint into a working tile. The
+--- rectangle is the tile (or clip) and bounds the scratch buffer; it is not a full-shape buffer.
+function Paint.fillPath(target: Working, geometry: path.Path, paint: Paint, options: FillOptions): Working
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+--- Stub: evaluate one span of pixel centers of one row into `out` (premultiplied f32, 4 per pixel).
+function Paint.span(paint: Paint, row: number, firstColumn: number, count: number, out: buffer): ()
+  error('magick: sketch stub, not implemented in 0.2.0 sketch', 2)
+end
+
+return Paint

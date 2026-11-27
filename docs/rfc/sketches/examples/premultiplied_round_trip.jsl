@@ -1,0 +1,31 @@
+--!strict
+-- RFC-0001 section 8 (W5): straight RGBA8 -> premultiplied f32 -> straight RGBA8 is exact for every
+-- channel at every nonzero alpha. Red and blue get the same stored value, green gets 255 - channel, so a copy between
+-- slots would fail. A zero alpha stores RGB 0.
+-- Run: jess run --package . docs/rfc/sketches/examples/premultiplied_round_trip.jsl
+local color = require '../color'
+
+local scratch = buffer.create(8)
+local checked, failures = 0, 0
+
+for alpha = 1, 255 do
+  for channel = 0, 255 do
+    -- Two different values in red and green, so a straight() that copies one slot into another fails.
+    local premultipliedChannel, storedAlpha = color.premultiply(channel, alpha, scratch)
+    local otherPremultiplied = color.premultiply(255 - channel, alpha, scratch)
+    local red, green, blue = color.straight(premultipliedChannel, otherPremultiplied, premultipliedChannel, storedAlpha)
+
+    checked += 1
+    if red ~= channel or green ~= 255 - channel or blue ~= channel then failures += 1 end
+  end
+end
+
+assert(failures == 0, `round trip failed for {failures} channel values`)
+
+local zeroRed, zeroGreen, zeroBlue, zeroAlpha = color.straight(0.5, 0.5, 0.5, 0)
+assert(zeroRed == 0 and zeroGreen == 0 and zeroBlue == 0 and zeroAlpha == 0, 'alpha 0 stores RGB 0')
+
+print('round trip exact for', checked, 'premultiplied values with alpha 1..255, with distinct red and green values')
+print('alpha 0 stores', zeroRed, zeroGreen, zeroBlue, zeroAlpha)
+
+return true

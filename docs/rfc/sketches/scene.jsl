@@ -1,0 +1,41 @@
+--!strict
+--[[
+@magick/scene: 0.3.0+ SKETCH (RFC-0001 section 12). NOT part of 0.2.0. Every function is a STUB.
+
+Scene structure is a TREE: each node has one parent, and nodes are never shared. A shared paint or
+pattern is a value, shared freely, because paints are immutable. A DAG of node references is
+deferred (section 12 says why, and what would have to exist before it is added).
+]]
+
+local color = require './color'
+local paint = require './paint'
+local transform = require './transform'
+
+local Scene = {}
+
+export type Matrix = transform.Matrix
+export type Paint = paint.Paint
+
+--- Limits of a scene, fixed by RFC-0001 section 11 and checked when a node is added.
+Scene.MaxDepth = 32
+Scene.MaxNodes = 65536
+
+export type Group = { kind: 'group', children: { Node }, opacity: number, blend: color.BlendMode?, transform: Matrix }
+export type Shape = { kind: 'shape', geometry: unknown, fill: Paint?, stroke: Paint?, transform: Matrix }
+
+--- A node is a group or a shape. Image layers are a later node kind, not 0.3.0.
+export type Node = Group | Shape
+
+export type Document = { width: number, height: number, seed: number, space: paint.Space, root: Group }
+
+--- Stub: an empty document of a size and a seed (an integer in 1..2^31-2).
+function Scene.new(width: number, height: number, seed: number, space: paint.Space?): Document
+  error('magick: sketch stub, not implemented before 0.3.0', 2)
+end
+
+--- Stub: add a node under a group. Refuses a node that would exceed MaxDepth or MaxNodes.
+function Scene.add(document: Document, parent: Group, node: Node): Node
+  error('magick: sketch stub, not implemented before 0.3.0', 2)
+end
+
+return Scene

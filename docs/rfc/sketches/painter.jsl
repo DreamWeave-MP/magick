@@ -1,0 +1,39 @@
+--!strict
+--[[
+@magick/painter: 0.5.0+ SKETCH (MAG-037 to MAG-040 territory). NOT part of 0.2.0. Every function is
+a STUB. It is here so the working tile and paint contracts are checked against reference-driven
+planning, which needs ordered, deterministic brush application and a bounded plan.
+
+A plan is a list of strokes in a fixed order (coarse to fine). It is pure data: planning does not
+touch pixels, and executing a plan is the render path of 0.3.0 with brush dabs of 0.4.0.
+]]
+
+local brush = require './brush'
+local color = require './color'
+
+local Painter = {}
+
+export type Brush = brush.Brush
+export type Working = color.Working
+
+--- One planned stroke: a brush, its points in order, and the stroke's seed.
+export type Stroke = { brush: Brush, points: { { number } }, seed: number, order: number }
+
+--- A plan is bounded: at most MaxStrokes strokes, and strokes are applied in `order`.
+export type Plan = { strokes: { Stroke }, levels: number }
+
+Painter.MaxStrokes = 16384
+Painter.MaxLevels = 8
+
+--- Stub: plan strokes over a reference's analysis levels. Every stroke gets a seed as a stable
+--- hash of its level and index, never a shared generator.
+function Painter.plan(reference: Working, levels: number, budget: number): Plan
+  error('magick: sketch stub, not implemented before 0.5.0', 2)
+end
+
+--- Stub: apply a plan in its order to a working tile.
+function Painter.apply(target: Working, plan: Plan): Working
+  error('magick: sketch stub, not implemented before 0.5.0', 2)
+end
+
+return Painter

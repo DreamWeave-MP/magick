@@ -6,6 +6,7 @@ ImageMagick is used only as a development oracle; this package does not spawn it
 
 What 0.1.x promises consumers, and what it keeps as it always did, is in [COMPATIBILITY.md](COMPATIBILITY.md).
 
+The renderer design for 0.2.0 (coordinates, transforms, premultiplied working tiles, compositing and the API boundaries) is proposed for ratification by review in [RFC-0001](docs/RFC-0001-renderer.md), with its checked sketches in `docs/rfc/sketches/`.
 ## Gates
 
 `tests/gate.jsl` holds the package to tiny exact fixtures (transparency, clipping, alpha, curves,
