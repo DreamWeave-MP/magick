@@ -1,0 +1,474 @@
+--!strict
+-- `@magick/scene` and `@magick/render` (MAG-016 to MAG-023): the builder's order and ownership
+-- rules, compiled plans that later edits cannot change, the same bytes at every tile size and from
+-- the full-frame reference, isolated group opacity, nested transforms, clips with holes, alpha and
+-- luminance masks, blur and shadow across tile edges, culling, region redraw and budgets.
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+local function same(first: magick.Image, second: magick.Image): boolean
+  return first.width == second.width and first.height == second.height and buffer.tostring(first.data) == buffer.tostring(second.data)
+end
+
+--- Everything the renderer does, in one small document: nested transformed groups, every node
+--- kind, strokes, a clip with a hole, both mask kinds, blur and shadow, blends and opacity, and
+--- shapes that run off the canvas.
+local function busy(width: number, height: number): scene.Document
+  local document = scene.new(width, height, { background = '#182030', space = 'linear' })
+  local checker = magick.new(4, 4)
+
+  for row = 0, 3 do
+    for column = 0, 3 do
+      if (row + column) % 2 == 0 then checker:set(column, row, 250, 220, 120, 255) end
+    end
+  end
+
+  local sky = document:group { filters = { { kind = 'blur', radius = 2.5 } }, opacity = 0.9 }
+
+  document:add(sky)
+  sky:add(document:shape(path.new():rect(-20, 5, width + 20, 30), {
+    fill = paint.linear(0, 0, width, 0, paint.stops(0, '#ff6040', 1, '#4060ff')),
+  }))
+
+  local turned = document:group {
+    transform = transform.compose(transform.translate(width / 2, height / 2), transform.rotate(0.35)),
+    clip = { path = path.new():circle(0, 0, 40):circle(0, 0, 12), fillRule = 'evenodd' },
+    filters = { { kind = 'shadow', radius = 2, offsetX = 3, offsetY = 4, color = '#000000c0' } },
+  }
+
+  document:add(turned)
+
+  for index = -2, 2 do
+    turned:add(document:shape(path.new():circle(index * 16, 0, 14), {
+      fill = paint.radial(index * 16 - 4, -4, 18, paint.stops(0, '#fff0c0', 1, '#c03060')),
+      stroke = paint.solid '#ffffff',
+      strokeStyle = { width = 2, join = 'round' },
+      opacity = 0.85,
+    }))
+  end
+
+  turned:add(document:image(checker, { transform = transform.compose(transform.translate(-30, 10), transform.scale(5)), sampling = 'bilinear' }))
+
+  local faded = document:group {
+    mask = { node = document:shape(path.new():rect(0, 0, width, height), { fill = paint.linear(0, 0, width, 0, paint.stops(0, '#000000', 1, '#ffffff')) }), kind = 'luminance' },
+    blend = 'screen',
+  }
+
+  document:add(faded)
+  faded:add(document:shape(path.new():rect(4, height - 30, width - 4, height - 6), { fill = paint.solid '#40ff80' }))
+
+  local cut = document:group {
+    mask = { node = document:shape(path.new():circle(width - 20, 20, 14), { fill = paint.radial(width - 20, 20, 14, paint.stops(0, '#ffffffff', 1, '#ffffff00')) }) },
+  }
+
+  document:add(cut)
+  cut:add(document:shape(path.new():rect(width - 40, 0, width + 10, 40), { fill = paint.solid '#ffe040' }))
+
+  return document
+end
+
+suite.describe('builder', function()
+  suite.it('gives ids in the order nodes are made, and keeps children in the order they are added', function()
+    local document = scene.new(10, 10)
+    local first, second, third = document:shape(path.new()), document:shape(path.new()), document:group()
+
+    expect({ document.root.id, first.id, second.id, third.id }).toEqual { 1, 2, 3, 4 }
+
+    document:add(second)
+    document:add(first, 1)
+    document:add(third)
+    expect({ document.root.children[1].id, document.root.children[2].id, document.root.children[3].id }).toEqual { 2, 3, 4 }
+
+    first:reorder(3)
+    expect({ document.root.children[1].id, document.root.children[3].id }).toEqual { 3, 2 }
+
+    second:remove()
+    expect(#document.root.children).toBe(2)
+    expect(second.parent).toBe(nil)
+  end)
+
+  suite.it('refuses cycles, strangers, second parents, masks as children and depth past MaxDepth', function()
+    local document, other = scene.new(10, 10), scene.new(10, 10)
+    local outer, inner = document:group(), document:group()
+
+    document:add(outer)
+    outer:add(inner)
+
+    expect(function()
+      inner:add(outer:remove())
+    end).toThrow 'magick: a group cannot contain itself'
+
+    expect(function()
+      inner:add(other:shape(path.new()))
+    end).toThrow 'magick: a node belongs to the document that made it'
+
+    expect(function()
+      document:add(inner)
+    end).toThrow 'magick: the node is already in a group; remove it first'
+
+    local masked = document:shape(path.new())
+
+    document:group { mask = { node = masked } }
+
+    expect(function()
+      document:add(masked)
+    end).toThrow 'magick: a mask node is drawn only as its group\'s mask'
+
+    local chain = document:group()
+
+    document:add(chain)
+
+    for _ = 2, scene.MaxDepth do
+      chain = chain:add(document:group())
+    end
+
+    expect(function()
+      chain:add(document:group())
+    end).toThrow 'magick: MaxDepth 32 exceeded'
+  end)
+
+  suite.it('refuses bad options by name', function()
+    local document = scene.new(10, 10)
+
+    expect(function()
+      document:shape(path.new(), { fil = paint.solid '#fff' } :: any)
+    end).toThrow 'magick: unknown option fil'
+
+    expect(function()
+      document:shape(path.new(), { stroke = paint.solid '#fff' })
+    end).toThrow 'magick: a stroke paint needs a strokeStyle'
+
+    expect(function()
+      document:group { filters = { { kind = 'sharpen', radius = 1 } :: any } }
+    end).toThrow 'magick: unknown filter sharpen'
+
+    expect(function()
+      document:group { opacity = 2 }
+    end).toThrow 'magick: opacity must be in 0..1'
+
+    expect(function()
+      scene.new(0, 10)
+    end).toThrow 'magick: a document needs a whole size of at least 1'
+  end)
+end)
+
+suite.describe('plans', function()
+  suite.it('snapshots the document: later edits to paths and nodes do not change a compiled plan', function()
+    local document = scene.new(20, 20)
+    local shape = path.new():rect(2, 2, 8, 8)
+    local node = document:add(document:shape(shape, { fill = paint.solid '#ff0000' }))
+    local plan = render.compile(document)
+    local before = render.image(plan)
+
+    shape:rect(10, 10, 18, 18)
+    node:set { transform = transform.translate(5, 0) }
+
+    expect(same(render.image(plan), before)).toBe(true)
+    expect(same(render.image(render.compile(document)), before)).toBe(false)
+  end)
+
+  suite.it('is an opaque frozen handle: no operation, paint or buffer of a plan is reachable', function()
+    local plan = render.compile(busy(32, 24))
+    local fields = (plan :: unknown) :: { [string]: unknown }
+
+    expect(table.isfrozen(fields)).toBe(true)
+    expect(fields.ops).toBe(nil)
+    expect(fields.background).toBe(nil)
+
+    for _, value in fields do
+      expect(type(value) == 'number' or type(value) == 'string').toBe(true)
+    end
+
+    expect(plan.operations > 0).toBe(true)
+    expect(function()
+      fields.width = 1
+    end).toThrow()
+
+    local forged = (table.freeze { width = 32, height = 24, space = 'linear', nodes = 1, operations = 0, bytes = 0 } :: unknown) :: render.Plan
+
+    expect(function()
+      render.image(forged)
+    end).toThrow 'magick: not a plan render.compile made'
+  end)
+
+  suite.it('owns the pixels it reads: images and pattern sources written after a compile change nothing', function()
+    local source = magick.new(4, 4)
+
+    source:fill '#c82828'
+
+    local document = scene.new(16, 16)
+
+    document:add(document:image(source, { transform = transform.translate(1, 1) }))
+    document:add(document:shape(path.new():rect(8, 8, 16, 16), { fill = paint.pattern(source, { edge = 'repeat' }) }))
+
+    local plan = render.compile(document)
+    local before = render.image(plan)
+
+    source:fill '#00ff00'
+    expect(same(render.image(plan), before)).toBe(true)
+    expect(same(render.image(render.compile(document)), before)).toBe(false)
+  end)
+
+  suite.it('copies a source once however many nodes and paints read it', function()
+    local source = magick.new(256, 256)
+
+    local function document(uses: number): scene.Document
+      local made = scene.new(16, 16)
+
+      for index = 1, uses do
+        made:add(made:image(source, { transform = transform.translate(index, 0) }))
+        made:add(made:shape(path.new():rect(0, 0, 4, 4), { fill = paint.pattern(source) }))
+      end
+
+      return made
+    end
+
+    local once, many = render.compile(document(1)), render.compile(document(20))
+    local pixels = 256 * 256 * 4
+
+    expect(once.bytes >= pixels).toBe(true)
+    -- Nineteen more pairs of operations, but not one more copy of the source.
+    expect(many.bytes - once.bytes < pixels).toBe(true)
+  end)
+
+  suite.it('copies group filters: changing them after a compile changes nothing', function()
+    local document = scene.new(24, 24)
+    local filters: { scene.Filter } = { { kind = 'shadow', radius = 1, offsetX = 2, offsetY = 2, color = '#000000' } }
+    local group = document:add(document:group { filters = filters })
+
+    group:add(document:shape(path.new():rect(4, 4, 12, 12), { fill = paint.solid '#ffffff' }))
+
+    local plan = render.compile(document)
+    local before = render.image(plan)
+    local kept = (group.filters[1] :: unknown) :: { [string]: unknown }
+
+    kept.offsetX, kept.radius = 9, 6
+    expect(same(render.image(plan), before)).toBe(true)
+  end)
+
+  suite.it('works out tiles as it goes: a canvas of a million one-pixel tiles starts at once', function()
+    local plan = render.compile(scene.new(1024, 1024))
+    local asked = 0
+    local started = os.clock()
+
+    expect(function()
+      render.image(plan, {
+        tileSize = 1,
+        cancel = function(): boolean
+          asked += 1
+
+          return asked > 3
+        end,
+      })
+    end).toThrow 'magick: render cancelled'
+    -- A list of every tile first took seconds and hundreds of megabytes here.
+    expect(os.clock() - started < 0.5).toBe(true)
+    expect(asked).toBe(4)
+  end)
+
+  suite.it('refuses a region that is not four finite numbers', function()
+    local plan = render.compile(scene.new(8, 8))
+
+    for _, region in { { 0, 0, 8 }, { 0, 0 / 0, 8, 8 }, { 0, 0, math.huge, 8 } } do
+      expect(function()
+        render.image(plan, { region = region })
+      end).toThrow 'magick: a region is four finite numbers'
+    end
+  end)
+
+  suite.it('compiles the same document to the same plan, and lists it for inspection', function()
+    local first, second = render.compile(busy(64, 48)), render.compile(busy(64, 48))
+
+    expect(render.dump(first)).toBe(render.dump(second))
+
+    local document = scene.new(20, 20)
+
+    document:add(document:shape(path.new():rect(40, 40, 50, 50), { fill = paint.solid '#fff', name = 'lost' }))
+    expect(string.find(render.dump(render.compile(document)), 'lost [40, 40, 50, 50] solid nonzero 2 edges OFF-CANVAS', 1, true) ~= nil).toBe(true)
+  end)
+
+  suite.it('leaves empty groups out of the plan', function()
+    local document = scene.new(20, 20)
+    local group = document:add(document:group { filters = { { kind = 'blur', radius = 3 } } })
+
+    group:add(document:group())
+    expect(render.compile(document).operations).toBe(0)
+  end)
+
+  suite.it('refuses a group whose filters read past MaxHaloPx', function()
+    local document = scene.new(20, 20)
+    local group = document:add(document:group { filters = { { kind = 'blur', radius = 21 }, { kind = 'blur', radius = 1 } } })
+
+    group:add(document:shape(path.new():rect(0, 0, 4, 4), { fill = paint.solid '#fff' }))
+
+    expect(function()
+      render.compile(document)
+    end).toThrow 'magick: MaxHaloPx 64 exceeded'
+  end)
+end)
+
+suite.describe('tiles', function()
+  suite.it('gives the same bytes at every tile size, partial edge tiles included, and as the reference', function()
+    local plan = render.compile(busy(83, 61))
+    local reference = render.image(plan, { reference = true })
+
+    for _, size in { 1, 7, 16, 37, 64, 128, 256 } do
+      expect(same(render.image(plan, { tileSize = size }), reference)).toBe(true)
+    end
+  end)
+
+  suite.it('renders a 1 by 1 canvas, odd sizes, and an empty scene', function()
+    local tiny = scene.new(1, 1, { background = '#336699' })
+
+    tiny:add(tiny:shape(path.new():rect(0, 0, 0.5, 1), { fill = paint.solid '#ffffff' }))
+    -- Half covered is the byte 128: 51 + 204 * 128 / 255, 102 + 153 * 128 / 255, 153 + 102 * 128 / 255.
+    expect({ render.image(tiny):get(0, 0) }).toEqual { 153, 179, 204, 255 }
+
+    local empty = render.image(scene.new(5, 3, { background = '#102030' }), { tileSize = 2 })
+
+    expect({ empty:get(4, 2) }).toEqual { 16, 32, 48, 255 }
+    expect(same(render.image(busy(13, 9), { tileSize = 4 }), render.image(busy(13, 9), { reference = true }))).toBe(true)
+  end)
+
+  suite.it('holds only tile-sized working surfaces', function()
+    local _, stats = render.image(busy(400, 300), { tileSize = 64 })
+
+    -- Base, two group levels and a mask level, each a 64 tile widened by halo at most 6 a side.
+    expect(stats.peakTileBytes <= 4 * 76 * 76 * 16).toBe(true)
+    expect(stats.tiles).toBe(35)
+  end)
+
+  suite.it('skips what cannot reach a tile, and counts it', function()
+    local document = scene.new(256, 256)
+
+    for index = 0, 15 do
+      document:add(document:shape(path.new():rect(index * 16, 0, index * 16 + 8, 8), { fill = paint.solid '#ffffff' }))
+    end
+
+    local _, stats = render.image(document, { tileSize = 64 })
+
+    expect(stats.rendered).toBe(16)
+    expect(stats.skipped).toBe(16 * 15)
+  end)
+end)
+
+suite.describe('groups', function()
+  suite.it('fades a group once, unlike fading each child: the overlap is no darker than the rest', function()
+    local document = scene.new(30, 10)
+    local group = document:add(document:group { opacity = 0.5 })
+
+    group:add(document:shape(path.new():rect(0, 0, 20, 10), { fill = paint.solid '#ff0000' }))
+    group:add(document:shape(path.new():rect(10, 0, 30, 10), { fill = paint.solid '#0000ff' }))
+
+    local image = render.image(document)
+
+    expect({ image:get(15, 5) }).toEqual { 0, 0, 255, 128 }
+    expect({ image:get(5, 5) }).toEqual { 255, 0, 0, 128 }
+  end)
+
+  suite.it('composes nested transforms parent first: the same bytes as one matrix on the shape', function()
+    local outer, inner = transform.compose(transform.translate(20, 10), transform.rotate(0.4)), transform.scale(2, 1)
+    local shape = path.new():moveTo(0, 0):cubicTo(10, -6, 14, 6, 6, 9):close()
+    local nested = scene.new(40, 30)
+    local direct = scene.new(40, 30)
+
+    nested:add(nested:group { transform = outer }):add(nested:shape(shape, { transform = inner, fill = paint.solid '#ffffff' }))
+    direct:add(direct:shape(shape, { transform = transform.multiply(outer, inner), fill = paint.solid '#ffffff' }))
+    expect(same(render.image(nested), render.image(direct))).toBe(true)
+  end)
+
+  suite.it('clips with a hole, seamlessly across tiles', function()
+    local document = scene.new(40, 40)
+    local group = document:add(document:group { clip = { path = path.new():circle(20, 20, 16):circle(20, 20, 6), fillRule = 'evenodd' } })
+
+    group:add(document:shape(path.new():rect(0, 0, 40, 40), { fill = paint.solid '#ffffff' }))
+
+    local image = render.image(document, { tileSize = 8 })
+
+    expect((select(4, image:get(20, 20)))).toBe(0)
+    expect((select(4, image:get(20, 9)))).toBe(255)
+    expect((select(4, image:get(1, 1)))).toBe(0)
+  end)
+
+  suite.it('masks by alpha and by luminance', function()
+    local document = scene.new(10, 1)
+    local ramp = paint.linear(0, 0, 10, 0, paint.stops(0, '#ffffff00', 1, '#ffffffff'))
+    local byAlpha = document:add(document:group { mask = { node = document:shape(path.new():rect(0, 0, 10, 1), { fill = ramp }) } })
+
+    byAlpha:add(document:shape(path.new():rect(0, 0, 10, 1), { fill = paint.solid '#ff0000' }))
+
+    local image = render.image(document)
+
+    -- Column 0's center is 0.05 along the ramp, column 9's 0.95.
+    expect({ (select(4, image:get(0, 0))), (select(4, image:get(9, 0))) }).toEqual { 13, 242 }
+
+    local lit = scene.new(10, 1)
+    local dark = paint.linear(0, 0, 10, 0, paint.stops(0, '#000000', 1, '#ffffff'))
+    local byLight = lit:add(lit:group { mask = { node = lit:shape(path.new():rect(0, 0, 10, 1), { fill = dark }), kind = 'luminance' } })
+
+    byLight:add(lit:shape(path.new():rect(0, 0, 10, 1), { fill = paint.solid '#ff0000' }))
+    expect({ (select(4, render.image(lit):get(0, 0))), (select(4, render.image(lit):get(9, 0))) }).toEqual { 13, 242 }
+  end)
+
+  suite.it('blurs and shadows across tile edges as the reference does', function()
+    local document = scene.new(48, 48)
+    local group = document:add(document:group { filters = { { kind = 'shadow', radius = 3, offsetX = 5, offsetY = 5, color = '#000000' }, { kind = 'blur', radius = 1.5 } } })
+
+    group:add(document:shape(path.new():rect(10, 10, 30, 30), { fill = paint.solid '#ffffff' }))
+
+    local reference = render.image(document, { reference = true })
+
+    expect(same(render.image(document, { tileSize = 11 }), reference)).toBe(true)
+    -- The shadow reaches past the square's corner, and the blur softens its edge.
+    expect((select(4, reference:get(34, 34))) > 0).toBe(true)
+    expect((select(1, reference:get(10, 20))) < 255).toBe(true)
+  end)
+end)
+
+suite.describe('redraw and budgets', function()
+  suite.it('redraws a region into an earlier render to give the full render of the edited scene', function()
+    local document = busy(90, 70)
+    local image = render.image(document, { tileSize = 32 })
+    local node = document:add(document:shape(path.new():circle(70, 50, 6), { fill = paint.solid '#ff00ff' }))
+    local plan = render.compile(document)
+
+    render.image(plan, { tileSize = 32, region = { 64, 44, 77, 57 }, into = image })
+    expect(same(image, render.image(plan, { tileSize = 32 }))).toBe(true)
+    expect(node.id > 0).toBe(true)
+  end)
+
+  suite.it('refuses a render past its memory budget before any tile runs', function()
+    expect(function()
+      render.image(busy(400, 300), { memoryBudgetBytes = 100000 })
+    end).toThrow 'magick: render needs'
+
+    expect(function()
+      render.image(busy(40, 30), { tileSize = 257 })
+    end).toThrow 'magick: MaxTileEdge 256 exceeded'
+  end)
+end)
+
+suite.describe('color spaces', function()
+  suite.it('composites in the document\'s space', function()
+    local function half(space: color.Space): number
+      local document = scene.new(1, 1, { background = '#ffffff', space = space })
+
+      document:add(document:shape(path.new():rect(0, 0, 1, 1), { fill = paint.solid '#00000080' }))
+
+      return (render.image(document):get(0, 0))
+    end
+
+    expect({ half 'srgb', half 'linear' }).toEqual { 127, 187 }
+  end)
+end)
+
+return suite

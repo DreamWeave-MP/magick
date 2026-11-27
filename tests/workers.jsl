@@ -1,0 +1,132 @@
+--!strict
+-- The worker check (MAG-024): renders one busy scene on 1, 2, 4 and 8 workers and holds every
+-- result to the 1-worker bytes, then checks that a cancel stops the render. Workers need a
+-- ScriptDomain, so this runs as the package's application target, not under `jess package test`:
+--
+--   jess package run --capability worker.spawn --target workers-check .
+local application = require '@jess/application'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+
+--- A 1024 by 768 scene of 600 overlapping, transformed, gradient-filled and stroked shapes in
+--- groups, some blurred, so every tile has work in it.
+local function busy(): scene.Document
+  local document = scene.new(1024, 768, { background = '#101420', space = 'linear' })
+  local petal = path.new():moveTo(0, 0):cubicTo(30, -40, 60, -10, 70, 0):cubicTo(60, 10, 30, 40, 0, 0):close()
+
+  for layer = 0, 5 do
+    local group = document:add(document:group {
+      opacity = 0.6 + layer * 0.06,
+      filters = if layer % 2 == 0 then { { kind = 'blur', radius = 1 + layer * 0.5 } } else nil,
+    })
+
+    for index = 0, 99 do
+      local angle = index * 2.39996 + layer
+      local radius = 30 + index * 3.6
+
+      group:add(document:shape(petal, {
+        transform = transform.compose(transform.translate(512 + math.cos(angle) * radius, 384 + math.sin(angle) * radius * 0.75), transform.rotate(angle), transform.scale(0.6 + layer * 0.1)),
+        fill = paint.linear(0, 0, 70, 0, paint.stops(0, '#ffd08080', 1, '#6040c0d0')),
+        stroke = paint.solid '#ffffff60',
+        strokeStyle = { width = 1 },
+        blend = if index % 3 == 0 then 'screen' else 'normal',
+      }))
+    end
+  end
+
+  return document
+end
+
+local plan = render.compile(busy())
+local started = os.clock()
+local single = render.image(plan, { tileSize = 128 })
+local base = os.clock() - started
+local failures = 0
+
+print(`workers 1: {string.format('%.3f', base)} s`)
+
+for _, count in { 2, 4, 8 } do
+  local began = os.clock()
+  local image = render.image(plan, { tileSize = 128, workers = count })
+  local seconds = os.clock() - began
+  local matches = buffer.tostring(image.data) == buffer.tostring(single.data)
+
+  print(`workers {count}: {string.format('%.3f', seconds)} s, {if matches then 'same bytes' else 'DIFFERENT BYTES'}`)
+
+  if not matches then failures += 1 end
+end
+
+local auto = render.image(plan, { tileSize = 128, workers = 'auto' })
+
+print(`workers auto: {if buffer.tostring(auto.data) == buffer.tostring(single.data) then 'same bytes' else 'DIFFERENT BYTES'}`)
+
+local stopping: render.RenderOptions = {
+  tileSize = 128,
+  workers = 2,
+  cancel = function(): boolean
+    return true
+  end,
+}
+
+-- pcall only around a render that must raise: a cancel asked between tiles stops it.
+local cancelled, message = pcall(render.image, plan, stopping)
+
+print(`cancel: {if not cancelled and string.find(tostring(message), 'render cancelled', 1, true) then 'stops the render' else 'DID NOT STOP'}`)
+
+if cancelled then failures += 1 end
+-- Statistics are summed over the workers: the same counts a render on one gives.
+local _, serialStats = render.image(plan, { tileSize = 64 })
+local _, parallelStats = render.image(plan, { tileSize = 64, workers = 4 })
+local counted = serialStats.tiles == parallelStats.tiles
+  and serialStats.candidates == parallelStats.candidates
+  and serialStats.rendered == parallelStats.rendered
+  and serialStats.skipped == parallelStats.skipped
+  and serialStats.groups == parallelStats.groups
+
+print(`statistics: {if counted then 'summed over workers' else 'DIFFERENT COUNTS'} ({parallelStats.tiles} tiles, {parallelStats.rendered} fills)`)
+
+if not counted then failures += 1 end
+
+-- Far more batches than a worker queue holds (1,024 messages): 2048 x 2048 in 8-pixel tiles is
+-- 65,536 tiles, 8,192 batches, 2,048 a worker. Dispatch keeps a few waiting on each worker, so it
+-- never overflows; sending them all at once did.
+local wide = render.compile(scene.new(2048, 2048, { background = '#336699' }))
+local floodStarted = os.clock()
+local flooded = render.image(wide, { tileSize = 8, workers = 4 })
+local floodSerial = render.image(wide, { tileSize = 8 })
+local floodSame = buffer.tostring(flooded.data) == buffer.tostring(floodSerial.data)
+
+print(`queue: 8192 batches on 4 workers {if floodSame then 'same bytes' else 'DIFFERENT BYTES'} in {string.format('%.2f', os.clock() - floodStarted)} s`)
+
+if not floodSame then failures += 1 end
+
+-- A cancel that raises mid-render: the error comes through, every worker is stopped, and the next
+-- render on fresh workers still gives the same bytes.
+local asked = 0
+local raising: render.RenderOptions = {
+  tileSize = 128,
+  workers = 4,
+  cancel = function(): boolean
+    asked += 1
+
+    if asked == 5 then error('cancel hook failed') end
+
+    return false
+  end,
+}
+
+-- pcall only around a render whose cancel hook raises on purpose.
+local survived, raised = pcall(render.image, plan, raising)
+local after = render.image(plan, { tileSize = 128, workers = 4 })
+local recovered = not survived
+  and string.find(tostring(raised), 'cancel hook failed', 1, true) ~= nil
+  and buffer.tostring(after.data) == buffer.tostring(single.data)
+
+print(`failure: {if recovered then 'raised, workers stopped, next render same bytes' else 'DID NOT RECOVER'}`)
+
+if not recovered then failures += 1 end
+
+application.exit(if failures == 0 then 0 else 1)

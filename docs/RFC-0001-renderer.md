@@ -593,6 +593,16 @@ the same rectangle. **Owned by MAG-008**: it is the tile test of that issue, on 
 The total is `workers * perWorker + outputBytes + encodeBytes`. `Render.plan` returns it, and refuses with
 `magick: render needs <n> bytes, budget is <m>` when it exceeds `memoryBudgetBytes`. The default budget is 512 MiB.
 
+**Amendment A4 (stabilization, provisional until ratified): opaque plans and bounded workers.** A plan is an opaque
+frozen handle (`width`, `height`, `space`, `nodes`, `operations`, `bytes`); its operations live inside
+`@magick/render`, so its immutability is enforced rather than promised. Pixels a plan reads (image nodes, pattern
+sources) are copied at compile time, once per source buffer. Tiles are worked out from a grid, never listed. A
+parallel render keeps at most `InFlightBatches` (2) batches of `BatchTiles` (8) tiles waiting on each worker, and
+stops and joins every worker before any error propagates. B3's parallel total adds, per worker, the plan copy it holds
+(`plan.bytes`, an estimate meant to err high: 2 KiB an operation, 1 KiB and 96 bytes an edge a prepared
+outline, owned pixels exactly) and the tile bytes
+that may wait in its queues (`(InFlightBatches + 1) * BatchTiles * E * E * 4`).
+
 **Computable arithmetic (`tests/rfc.jsl`, `tests/rfc_contracts.jsl`).** The table, with the hand-derived values:
 
 | Case | Per worker | Workers | Output | Total | Default 512 MiB |

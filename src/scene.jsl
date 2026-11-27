@@ -1,0 +1,418 @@
+--!strict
+--[[
+@magick/scene: a retained composition (RFC-0001 section 12).
+
+A document is a tree of nodes under one root group: shapes (a path filled and stroked with paints),
+images (a legacy `Image` placed by a matrix) and groups (children composited in their own isolated
+tile, with a transform, opacity, blend, clip, mask and filters). Each node has one parent and an id
+the document gives it in order of creation, so the order of everything is the order of the calls
+that built it, never of table traversal.
+
+The tree is the mutable builder; `@magick/render` compiles it into an immutable plan, snapshotting
+every path, paint and option, so changing the document after a compile never changes that plan.
+Paths and paints are shared freely between nodes: a paint is a frozen value, and a path is read
+only at compile time.
+]]
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local transform = require '@magick/transform'
+
+type Matrix = transform.Matrix
+
+local Module = {}
+
+--- The deepest a node may sit below the root, and the most nodes one document holds.
+Module.MaxDepth = 32
+Module.MaxNodes = 65536
+
+--- How a shape's outline is stroked: `stroked`'s options, less its `transform`.
+export type StrokeStyle = {
+  width: number,
+  join: path.Join?,
+  miterLimit: number?,
+  cap: path.Cap?,
+  dashes: { number }?,
+  dashOffset: number?,
+}
+
+--- A filter on a group, applied to what its children drew before the group's clip, mask and opacity.
+--- `blur` is a gaussian of standard deviation `radius`; `shadow` lays a blurred, offset, colored copy
+--- of the group's alpha under it.
+export type Filter =
+  { kind: 'blur', radius: number }
+  | { kind: 'shadow', radius: number, offsetX: number, offsetY: number, color: magick.Color }
+
+--- A group's clip: a path, by a fill rule, in the group's own space.
+export type Clip = { path: path.Path, fillRule: path.FillRule? }
+
+--- A group's mask: another node, drawn in the group's space, whose alpha or luminance scales the
+--- group's coverage. The mask node is owned by the group and is never drawn on its own.
+export type Mask = { node: Node, kind: ('alpha' | 'luminance')? }
+
+--- The options every node takes.
+export type NodeOptions = {
+  transform: Matrix?,
+  opacity: number?,
+  blend: color.BlendMode?,
+  --- A name for the node in plan dumps; it changes nothing that is drawn.
+  name: string?,
+}
+
+--- A shape's options: its paints and how they lay down.
+export type ShapeOptions = NodeOptions & {
+  fill: paint.Paint?,
+  fillRule: path.FillRule?,
+  stroke: paint.Paint?,
+  strokeStyle: StrokeStyle?,
+}
+
+--- An image's options.
+export type ImageOptions = NodeOptions & { sampling: paint.Sampling? }
+
+--- A group's options.
+export type GroupOptions = NodeOptions & { clip: Clip?, mask: Mask?, filters: { Filter }? }
+
+type NodeData = {
+  id: number,
+  kind: 'shape' | 'image' | 'group',
+  document: Document,
+  parent: Node?,
+  children: { Node },
+  name: string?,
+  transform: Matrix,
+  opacity: number,
+  blend: color.BlendMode,
+  geometry: path.Path?,
+  fill: paint.Paint?,
+  fillRule: path.FillRule,
+  stroke: paint.Paint?,
+  strokeStyle: StrokeStyle?,
+  image: magick.Image?,
+  sampling: paint.Sampling,
+  clip: Clip?,
+  mask: Mask?,
+  filters: { Filter },
+  --- Whether this node is a group's mask, and so never drawn as a child.
+  isMask: boolean,
+}
+
+local Node = {}
+Node.__index = Node
+
+export type Node = typeof(setmetatable({} :: NodeData, Node))
+
+type DocumentData = {
+  width: number,
+  height: number,
+  space: color.Space,
+  background: magick.Color?,
+  seed: number,
+  root: Node,
+  nextId: number,
+  count: number,
+}
+
+local Document = {}
+Document.__index = Document
+
+export type Document = typeof(setmetatable({} :: DocumentData, Document))
+
+--- What `new` takes.
+export type DocumentOptions = { background: magick.Color?, space: color.Space?, seed: number? }
+
+local function finite(value: number): boolean
+  return value == value and value > -math.huge and value < math.huge
+end
+
+local function checkKeys(options: unknown, known: { [string]: boolean })
+  if options == nil then return end
+
+  for name in options :: { [string]: unknown } do
+    if not known[name] then error(`magick: unknown option {name}`, 4) end
+  end
+end
+
+local function checkOpacity(opacity: number?): number
+  local value = opacity or 1
+
+  if not finite(value) or value < 0 or value > 1 then error('magick: opacity must be in 0..1', 4) end
+
+  return value
+end
+
+local function checkSeed(seed: number): number
+  if seed ~= math.floor(seed) or seed < 1 or seed > 2147483646 then error('magick: seed must be an integer in 1..2147483646', 3) end
+
+  return seed
+end
+
+local function makeNode(document: Document, kind: 'shape' | 'image' | 'group', options: NodeOptions?): Node
+  if document.count >= Module.MaxNodes then error(`magick: MaxNodes {Module.MaxNodes} exceeded`, 4) end
+
+  local matrix = if options and options.transform then transform.check(options.transform) else transform.identity()
+  local blend: color.BlendMode = if options and options.blend then options.blend else 'normal'
+
+  color.checkBlend(blend)
+
+  local data: NodeData = {
+    id = document.nextId,
+    kind = kind,
+    document = document,
+    parent = nil,
+    children = {},
+    name = if options then options.name else nil,
+    transform = matrix,
+    opacity = checkOpacity(if options then options.opacity else nil),
+    blend = blend,
+    geometry = nil,
+    fill = nil,
+    fillRule = 'nonzero',
+    stroke = nil,
+    strokeStyle = nil,
+    image = nil,
+    sampling = 'nearest',
+    clip = nil,
+    mask = nil,
+    filters = {},
+    isMask = false,
+  }
+
+  document.nextId += 1
+  document.count += 1
+
+  return setmetatable(data, Node)
+end
+
+--- An empty document `width` by `height` pixels, drawn over `background` (transparent when left
+--- out), composited in `space` (`srgb` by default), with an integer seed in 1..2^31 - 2 (1).
+function Module.new(width: number, height: number, options: DocumentOptions?): Document
+  checkKeys(options, { background = true, space = true, seed = true })
+
+  for _, value in { width, height } do
+    if not finite(value) or value ~= math.floor(value) or value < 1 then error('magick: a document needs a whole size of at least 1', 2) end
+    if value > 8192 then error('magick: MaxImageEdge 8192 exceeded', 2) end
+  end
+
+  local space: color.Space = if options and options.space then options.space else 'srgb'
+
+  if space ~= 'srgb' and space ~= 'linear' then error(`magick: unknown color space {space}`, 2) end
+
+  local data: DocumentData = {
+    width = width,
+    height = height,
+    space = space,
+    background = if options then options.background else nil,
+    seed = checkSeed(if options and options.seed then options.seed else 1),
+    root = (nil :: unknown) :: Node,
+    nextId = 1,
+    count = 0,
+  }
+  local document = setmetatable(data, Document)
+
+  document.root = makeNode(document, 'group', { name = 'root' })
+
+  return document
+end
+
+local ShapeKeys = {
+  transform = true,
+  opacity = true,
+  blend = true,
+  name = true,
+  fill = true,
+  fillRule = true,
+  stroke = true,
+  strokeStyle = true,
+}
+
+--- A new shape, not yet in the tree: `geometry` filled with `fill` by `fillRule`, then stroked with
+--- `stroke` as `strokeStyle` says. Either paint may be left out; a stroke paint needs a style.
+function Document.shape(self: Document, geometry: path.Path, options: ShapeOptions?): Node
+  checkKeys(options, ShapeKeys)
+
+  local node = makeNode(self, 'shape', options)
+
+  node.geometry = geometry
+
+  if options then
+    node.fill = options.fill
+    node.stroke = options.stroke
+    node.strokeStyle = options.strokeStyle
+
+    if options.fillRule then
+      if options.fillRule ~= 'nonzero' and options.fillRule ~= 'evenodd' then error(`magick: unknown fill rule {options.fillRule}`, 2) end
+
+      node.fillRule = options.fillRule
+    end
+
+    if node.stroke and not node.strokeStyle then error('magick: a stroke paint needs a strokeStyle', 2) end
+  end
+
+  return node
+end
+
+--- A new image node, not yet in the tree: `image`'s pixels laid on the unit squares of its own
+--- space from the origin, placed by `transform`, sampled `nearest` or `bilinear`.
+function Document.image(self: Document, image: magick.Image, options: ImageOptions?): Node
+  checkKeys(options, { transform = true, opacity = true, blend = true, name = true, sampling = true })
+
+  if image.width < 1 or image.height < 1 then error('magick: an image node needs pixels', 2) end
+
+  local node = makeNode(self, 'image', options)
+
+  node.image = image
+  node.sampling = if options and options.sampling then options.sampling else 'nearest'
+
+  if node.sampling ~= 'nearest' and node.sampling ~= 'bilinear' then error(`magick: unknown sampling {node.sampling}`, 2) end
+
+  return node
+end
+
+local function checkFilters(filters: { Filter }): { Filter }
+  for _, filter in filters do
+    if filter.kind ~= 'blur' and filter.kind ~= 'shadow' then error(`magick: unknown filter {(filter :: { kind: string }).kind}`, 4) end
+    if not finite(filter.radius) or filter.radius < 0 or filter.radius > 21 then error('magick: a filter radius must be in 0..21', 4) end
+
+    if filter.kind == 'shadow' then
+      if not finite(filter.offsetX) or not finite(filter.offsetY) or math.abs(filter.offsetX) > 64 or math.abs(filter.offsetY) > 64 then
+        error('magick: a shadow offset must be finite and within 64 pixels', 4)
+      end
+    end
+  end
+
+  return table.clone(filters)
+end
+
+--- A new group, not yet in the tree. Its children draw into an isolated transparent tile, which is
+--- then filtered, clipped, masked, faded by its opacity once, and laid on by its blend.
+function Document.group(self: Document, options: GroupOptions?): Node
+  checkKeys(options, { transform = true, opacity = true, blend = true, name = true, clip = true, mask = true, filters = true })
+
+  local node = makeNode(self, 'group', options)
+
+  if options then
+    node.clip = options.clip
+    node.filters = checkFilters(options.filters or {})
+
+    local mask = options.mask
+
+    if mask then
+      local kind = mask.kind or 'alpha'
+
+      if kind ~= 'alpha' and kind ~= 'luminance' then error(`magick: unknown mask kind {kind}`, 2) end
+      if not rawequal(mask.node.document, self) then error('magick: a mask node must belong to the same document', 2) end
+      if mask.node.parent or mask.node.isMask then error('magick: a mask node must not be in the tree or another mask', 2) end
+
+      mask.node.isMask = true
+      node.mask = { node = mask.node, kind = kind }
+    end
+  end
+
+  return node
+end
+
+--- How deep a node sits: the root is 0.
+local function depthOf(node: Node): number
+  local depth = 0
+  local current = node.parent
+
+  while current do
+    depth += 1
+    current = current.parent
+  end
+
+  return depth
+end
+
+--- How many levels a subtree holds below its top.
+local function heightOf(node: Node): number
+  local tallest = 0
+
+  for _, child in node.children do
+    tallest = math.max(tallest, 1 + heightOf(child))
+  end
+
+  return tallest
+end
+
+--- Puts `child` in this group at `index` (at the end when left out) and returns it. A child must be
+--- from the same document, not already in a tree, not a mask, and not this group or one above it.
+function Node.add(self: Node, child: Node, index: number?): Node
+  if self.kind ~= 'group' then error('magick: only a group has children', 2) end
+  if not rawequal(child.document, self.document) then error('magick: a node belongs to the document that made it', 2) end
+  if child.parent then error('magick: the node is already in a group; remove it first', 2) end
+  if child.isMask then error('magick: a mask node is drawn only as its group\'s mask', 2) end
+  if rawequal(child, self.document.root) then error('magick: the root is never a child', 2) end
+
+  local ancestor: Node? = self
+
+  while ancestor do
+    if rawequal(ancestor, child) then error('magick: a group cannot contain itself', 2) end
+
+    ancestor = ancestor.parent
+  end
+
+  if depthOf(self) + 1 + heightOf(child) > Module.MaxDepth then error(`magick: MaxDepth {Module.MaxDepth} exceeded`, 2) end
+
+  local at = index or #self.children + 1
+
+  if at ~= math.floor(at) or at < 1 or at > #self.children + 1 then error('magick: child index out of range', 2) end
+
+  table.insert(self.children, at, child)
+  child.parent = self
+
+  return child
+end
+
+--- Takes this node out of its group, leaving its own subtree as it is, and returns it.
+function Node.remove(self: Node): Node
+  local parent = self.parent
+
+  if not parent then return self end
+
+  local at = table.find(parent.children, self) :: number
+
+  table.remove(parent.children, at)
+  self.parent = nil
+
+  return self
+end
+
+--- Moves this node to `index` among its group's children, and returns it.
+function Node.reorder(self: Node, index: number): Node
+  local parent = self.parent
+
+  if not parent then error('magick: the node is not in a group', 2) end
+  if index ~= math.floor(index) or index < 1 or index > #parent.children then error('magick: child index out of range', 2) end
+
+  local at = table.find(parent.children, self) :: number
+
+  table.remove(parent.children, at)
+  table.insert(parent.children, index, self)
+
+  return self
+end
+
+--- Sets this node's transform, its opacity or its blend after it was made, and returns it.
+function Node.set(self: Node, options: NodeOptions): Node
+  checkKeys(options, { transform = true, opacity = true, blend = true, name = true })
+
+  if options.transform then self.transform = transform.check(options.transform) end
+  if options.opacity then self.opacity = checkOpacity(options.opacity) end
+  if options.blend then self.blend = color.checkBlend(options.blend) end
+  if options.name then self.name = options.name end
+
+  return self
+end
+
+--- Adds a node to the document's root and returns it.
+function Document.add(self: Document, node: Node, index: number?): Node
+  return self.root:add(node, index)
+end
+
+Module.Node = Node
+Module.Document = Document
+
+return Module

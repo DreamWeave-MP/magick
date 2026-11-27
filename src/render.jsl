@@ -1,0 +1,1084 @@
+--!strict
+--[[
+@magick/render: compiles a scene into an immutable plan and renders it tile by tile (RFC-0001
+sections 10 and 11).
+
+`compile` walks the document once, in tree order, into a flat list of operations: fills of outlines
+already flattened and sorted in device space, with their paints moved into device space, and
+group frames (`push` ... `pop`) carrying their opacity, blend, clip, mask and filters. Every
+operation has a device box, so a tile skips what cannot reach it, and a group whose box misses a
+tile is skipped whole. The plan holds no reference to anything the document can still change.
+
+A plan is opaque: what `compile` returns is a frozen handle carrying the canvas's size, space and
+counts, and the operations live in this module, out of every caller's reach. Pixels a plan reads
+(an image node's image, a pattern's source) are copied into the plan when it is compiled, once per
+source buffer however many nodes and paints use it, so changing an image after a compile never
+changes what that plan draws. Only this module can read a plan, so its immutability is enforced,
+not promised.
+
+Workers. A parallel render sends each worker the plan once, then keeps at most `InFlightBatches`
+batches of tiles waiting on each, stitching each reply as it comes back before sending that worker
+more, so neither queue grows with the canvas. A failed worker, a cancel, or any error stops and
+joins every worker before the render raises.
+
+`image` runs a plan over a grid of tiles from the origin, in row-major order, each tile a
+premultiplied working tile with one more for every open group, and writes each finished tile into
+the output image. Every pixel's arithmetic is the same whatever tile it falls in, and filters read a
+halo around the tile wide enough for their kernels, so the output is the same bytes at every tile
+size (the parity tests hold this).
+
+Filters see the canvas only: what a group draws outside the canvas is not there for its blur or
+shadow to spread, as if the group had been drawn into a canvas-sized surface first.
+]]
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+
+type Matrix = transform.Matrix
+type Tile = color.Tile
+
+local Module = {}
+
+Module.DefaultTileSize = 128
+Module.MaxTileSize = 256
+Module.DefaultBudgetBytes = 512 * 1024 * 1024
+--- The widest halo a filter may ask for, in pixels a side.
+Module.MaxHaloPx = 64
+
+--- One operation of a plan.
+export type Op = {
+  kind: 'fill' | 'push' | 'pop',
+  --- The node it came from, and that node's name.
+  node: number,
+  name: string?,
+  --- The device box it can touch: left, top, right, bottom, in whole pixels, right and bottom
+  --- exclusive.
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+  --- Fill: the outline and how it lays down.
+  prepared: path.Prepared?,
+  rule: path.FillRule,
+  paint: paint.Paint?,
+  opacity: number,
+  blend: color.BlendMode,
+  --- Push: the index of its pop, the halo its filters read, its clip, mask and filters.
+  skip: number,
+  halo: number,
+  clip: { prepared: path.Prepared, rule: path.FillRule }?,
+  mask: { ops: { Op }, kind: 'alpha' | 'luminance' }?,
+  filters: { scene.Filter },
+}
+
+--- A compiled document, as this module holds it: everything a render reads, fixed.
+type Compiled = {
+  width: number,
+  height: number,
+  space: color.Space,
+  --- The background, premultiplied in the plan's space, or nil for transparent.
+  background: { number }?,
+  ops: { Op },
+  nodes: number,
+  --- What the plan holds in memory, by `planBytes`: a worker holds a copy of as much.
+  bytes: number,
+}
+
+--- A compiled document as its caller holds it: a frozen handle naming the canvas and counting what
+--- the plan holds. Only `@magick/render` reads the plan behind it.
+export type Plan = {
+  read width: number,
+  read height: number,
+  read space: color.Space,
+  --- Nodes in the document it was compiled from, and operations in the plan.
+  read nodes: number,
+  read operations: number,
+  --- The plan's estimated size in bytes, owned pixels included.
+  read bytes: number,
+}
+
+--- Every live plan behind its handle; a handle dropped takes its plan with it.
+local Plans = (setmetatable({}, { __mode = 'k' }) :: unknown) :: { [Plan]: Compiled }
+
+--- The plan behind a handle, refused when it is not one `compile` made.
+local function open(handle: Plan, level: number): Compiled
+  local compiled = Plans[handle]
+
+  if not compiled then error('magick: not a plan render.compile made', level + 1) end
+
+  return compiled
+end
+
+--- What `image` takes.
+export type RenderOptions = {
+  --- The tile edge, 128 by default, at most 256.
+  tileSize: number?,
+  --- Render the canvas as one tile, as a reference for the tiled result. Small canvases only.
+  reference: boolean?,
+  --- Redraw only the tiles that meet this box (left, top, right, bottom) into `into`.
+  region: { number }?,
+  --- The image to draw into, the plan's size; a new one when left out.
+  into: magick.Image?,
+  --- Refuse before any tile runs when the working set would pass this many bytes.
+  memoryBudgetBytes: number?,
+  --- How many workers render tiles: 1 (the default), up to MaxWorkers, or `auto`.
+  workers: (number | 'auto')?,
+  --- Asked between tiles; true stops the render with `magick: render cancelled`.
+  cancel: (() -> boolean)?,
+}
+
+--- What a render did, for finding overdraw and waste.
+export type Stats = {
+  tiles: number,
+  candidates: number,
+  rendered: number,
+  skipped: number,
+  groups: number,
+  --- The largest number of working-tile bytes held at once.
+  peakTileBytes: number,
+}
+
+local function finite(value: number): boolean
+  return value == value and value > -math.huge and value < math.huge
+end
+
+--- The kernel half-width of a gaussian of standard deviation `radius`: three deviations.
+local function reach(radius: number): number
+  return math.ceil(3 * radius)
+end
+
+--- How far a group's filters read beyond what they write.
+local function haloOf(filters: { scene.Filter }): number
+  local halo = 0
+
+  for _, filter in filters do
+    local own = reach(filter.radius)
+
+    if filter.kind == 'shadow' then own += math.ceil(math.max(math.abs(filter.offsetX), math.abs(filter.offsetY))) end
+
+    halo += own
+  end
+
+  return halo
+end
+
+type Box = { number }
+
+local Empty: Box = { math.huge, math.huge, -math.huge, -math.huge }
+
+local function union(first: Box, second: Box): Box
+  return { math.min(first[1], second[1]), math.min(first[2], second[2]), math.max(first[3], second[3]), math.max(first[4], second[4]) }
+end
+
+local function isEmpty(box: Box): boolean
+  return box[1] >= box[3] or box[2] >= box[4]
+end
+
+local function boxOf(prepared: path.Prepared): Box
+  if prepared.count == 0 then return Empty end
+
+  return { math.floor(prepared.left), math.floor(prepared.top), math.ceil(prepared.right), math.ceil(prepared.bottom) }
+end
+
+local function fillOp(node: scene.Node, prepared: path.Prepared, rule: path.FillRule, value: paint.Paint, opacity: number, blend: color.BlendMode): Op
+  local box = boxOf(prepared)
+
+  return {
+    kind = 'fill',
+    node = node.id,
+    name = node.name,
+    left = box[1],
+    top = box[2],
+    right = box[3],
+    bottom = box[4],
+    prepared = prepared,
+    rule = rule,
+    paint = value,
+    opacity = opacity,
+    blend = blend,
+    skip = 0,
+    halo = 0,
+    clip = nil,
+    mask = nil,
+    filters = {},
+  }
+end
+
+local function frameOp(kind: 'push' | 'pop', node: scene.Node): Op
+  return {
+    kind = kind,
+    node = node.id,
+    name = node.name,
+    left = 0,
+    top = 0,
+    right = 0,
+    bottom = 0,
+    prepared = nil,
+    rule = 'nonzero',
+    paint = nil,
+    opacity = node.opacity,
+    blend = node.blend,
+    skip = 0,
+    halo = 0,
+    clip = nil,
+    mask = nil,
+    filters = {},
+  }
+end
+
+--- The copies of the pixel buffers the plan being compiled reads, by the buffer each copies, so a
+--- source many paints use is copied once. Set only while `compile` runs, which never yields.
+local owning: { [buffer]: buffer }? = nil
+
+--- A paint the plan owns: a pattern reads a copy of its source's pixels made now, so writing the
+--- source afterwards never reaches the plan. Every other paint holds no buffer.
+local function own(value: paint.Paint): paint.Paint
+  local source = value.source
+
+  if value.kind ~= 'pattern' or not source then return value end
+
+  local copies = owning :: { [buffer]: buffer }
+  local data = copies[source.data]
+
+  if not data then
+    data = buffer.create(buffer.len(source.data))
+    buffer.copy(data, 0, source.data)
+    copies[source.data] = data
+  end
+
+  local record = { width = source.width, height = source.height, data = data, format = source.format, space = source.space }
+  local copy = table.clone(value) :: { [string]: unknown }
+
+  copy.source = table.freeze(record)
+
+  return table.freeze(copy) :: paint.Paint
+end
+
+--- A copy of a group's filters, so the document's list and colors can change after a compile.
+local function ownFilters(filters: { scene.Filter }): { scene.Filter }
+  local out: { scene.Filter } = {}
+
+  for _, filter in filters do
+    local copy = table.clone(filter) :: { [string]: unknown }
+
+    if type(copy.color) == 'table' then copy.color = table.clone(copy.color :: { number }) end
+
+    table.insert(out, copy :: scene.Filter)
+  end
+
+  return out
+end
+
+--- Compiles a node under a matrix onto `ops`; returns the device box of what it can draw.
+local function compileNode(node: scene.Node, outer: Matrix, ops: { Op }, tolerance: number?): Box
+  local matrix = transform.multiply(outer, node.transform)
+
+  if node.kind == 'shape' then
+    local geometry = node.geometry :: path.Path
+    local both = node.fill ~= nil and node.stroke ~= nil
+    -- A shape with both paints and an opacity or blend is one isolated layer, as SVG's opacity is.
+    local wrapped = both and (node.opacity < 1 or node.blend ~= 'normal')
+    local opacity, blend = if wrapped then 1 else node.opacity, if wrapped then 'normal' else node.blend
+    local box = Empty
+    local start = #ops + 1
+
+    if wrapped then table.insert(ops, frameOp('push', node)) end
+
+    if node.fill then
+      local prepared = path.prepare(geometry, { transform = matrix, tolerance = tolerance })
+      local op = fillOp(node, prepared, node.fillRule, own(paint.moved(node.fill, matrix)), opacity, blend)
+
+      table.insert(ops, op)
+      box = union(box, { op.left, op.top, op.right, op.bottom })
+    end
+
+    local stroke, style = node.stroke, node.strokeStyle
+
+    if stroke and style then
+      local outline = geometry:stroked {
+        width = style.width,
+        join = style.join,
+        miterLimit = style.miterLimit,
+        cap = style.cap,
+        dashes = style.dashes,
+        dashOffset = style.dashOffset,
+        transform = matrix,
+        tolerance = tolerance,
+      }
+      local prepared = path.prepare(outline, { transform = matrix, tolerance = tolerance })
+      local op = fillOp(node, prepared, 'nonzero', own(paint.moved(stroke, matrix)), opacity, blend)
+
+      table.insert(ops, op)
+      box = union(box, { op.left, op.top, op.right, op.bottom })
+    end
+
+    if wrapped then
+      local push, pop = ops[start], frameOp('pop', node)
+
+      table.insert(ops, pop)
+      push.skip = #ops
+      push.left, push.top, push.right, push.bottom = box[1], box[2], box[3], box[4]
+    end
+
+    return box
+  end
+
+  if node.kind == 'image' then
+    local image = node.image :: magick.Image
+    local prepared = path.prepare(path.new():rect(0, 0, image.width, image.height), { transform = matrix, tolerance = tolerance })
+    local pattern = own(paint.pattern(image, { transform = matrix, edge = 'transparent', sampling = node.sampling }))
+    local op = fillOp(node, prepared, 'nonzero', pattern, node.opacity, node.blend)
+
+    table.insert(ops, op)
+
+    return { op.left, op.top, op.right, op.bottom }
+  end
+
+  -- A group: its frame, its children, and its box from theirs, widened by its halo and cut by its
+  -- clip. One with nothing to draw is left out of the plan altogether.
+  local push = frameOp('push', node)
+  local start = #ops + 1
+
+  table.insert(ops, push)
+
+  local box = Empty
+
+  for _, child in node.children do
+    box = union(box, compileNode(child, matrix, ops, tolerance))
+  end
+
+  if isEmpty(box) then
+    for index = #ops, start, -1 do
+      ops[index] = nil
+    end
+
+    return Empty
+  end
+
+  push.filters = ownFilters(node.filters)
+  push.halo = haloOf(node.filters)
+
+  if push.halo > Module.MaxHaloPx then error(`magick: MaxHaloPx {Module.MaxHaloPx} exceeded`, 4) end
+
+  box = { box[1] - push.halo, box[2] - push.halo, box[3] + push.halo, box[4] + push.halo }
+
+  local clip = node.clip
+
+  if clip then
+    local prepared = path.prepare(clip.path, { transform = matrix, tolerance = tolerance })
+    local clipBox = boxOf(prepared)
+
+    push.clip = { prepared = prepared, rule = clip.fillRule or 'nonzero' }
+    box = { math.max(box[1], clipBox[1]), math.max(box[2], clipBox[2]), math.min(box[3], clipBox[3]), math.min(box[4], clipBox[4]) }
+  end
+
+  local mask = node.mask
+
+  if mask then
+    local maskOps: { Op } = {}
+
+    compileNode(mask.node, matrix, maskOps, tolerance)
+    push.mask = { ops = maskOps, kind = mask.kind or 'alpha' }
+  end
+
+  table.insert(ops, frameOp('pop', node))
+  push.skip = #ops
+  push.left, push.top, push.right, push.bottom = box[1], box[2], box[3], box[4]
+
+  return box
+end
+
+--- What `planBytes` counts by, from how Luau lays tables out: an array slot is a 16-byte value; a
+--- record of n fields hashes into the next power of two of 32-byte nodes after a 64-byte header. An
+--- operation is a record of about twenty fields (32 nodes) with its matrix and paint copies; a
+--- prepared outline is a record and six arrays, plus six slots an edge.
+local SlotBytes = 16
+local RecordBytes = 2048
+local PreparedBytes = 1024
+
+--- An estimate of the memory operations hold: a record each, a prepared outline's record, arrays and
+--- six slots an edge, and a mask's operations. Owned pixels are counted by `compile`, once per copy.
+--- It is meant to err high: the budget it feeds is a ceiling, not a guess.
+local function planBytes(ops: { Op }): number
+  local total = 0
+
+  for _, op in ops do
+    total += RecordBytes
+
+    local prepared = op.prepared
+
+    if prepared then total += PreparedBytes + prepared.count * 6 * SlotBytes end
+
+    local clip = op.clip
+
+    if clip then total += PreparedBytes + clip.prepared.count * 6 * SlotBytes end
+
+    local mask = op.mask
+
+    if mask then total += planBytes(mask.ops) end
+  end
+
+  return total
+end
+
+--- Compiles a document into a plan: every path flattened and sorted in device space now, every
+--- paint moved into device space, every group framed. The plan shares nothing the document can
+--- still change. `tolerance` is the flattening tolerance in device pixels (each path's own when left
+--- out).
+function Module.compile(document: scene.Document, options: { tolerance: number? }?): Plan
+  local ops: { Op } = {}
+  local tolerance = if options then options.tolerance else nil
+  local copies: { [buffer]: buffer } = {}
+
+  owning = copies
+
+  local root = document.root
+
+  -- A plain root is the canvas itself: its children draw straight onto the base tile, with no
+  -- group tile of its own.
+  if root.opacity == 1 and root.blend == 'normal' and #root.filters == 0 and not root.clip and not root.mask then
+    for _, child in root.children do
+      compileNode(child, root.transform, ops, tolerance)
+    end
+  else
+    compileNode(root, transform.identity(), ops, tolerance)
+  end
+
+  local background: { number }? = nil
+
+  if document.background then
+    local red, green, blue, alpha = color.premultiplied(document.background, document.space)
+
+    background = { red, green, blue, alpha }
+  end
+
+  owning = nil
+
+  local owned = 0
+
+  for _, data in copies do
+    owned += buffer.len(data)
+  end
+
+  local compiled: Compiled = {
+    width = document.width,
+    height = document.height,
+    space = document.space,
+    background = background,
+    ops = ops,
+    nodes = document.count,
+    bytes = planBytes(ops) + owned,
+  }
+
+  local plan: Plan = table.freeze {
+    width = compiled.width,
+    height = compiled.height,
+    space = compiled.space,
+    nodes = compiled.nodes,
+    operations = #ops,
+    bytes = compiled.bytes,
+  }
+
+  Plans[plan] = compiled
+
+  return plan
+end
+
+--- A readable listing of a plan: one line an operation, with its node, box, and whether it lies
+--- off the canvas, for finding overdraw and waste.
+function Module.dump(handle: Plan): string
+  local plan = open(handle, 1)
+  local lines = { `plan {plan.width}x{plan.height} {plan.space}, {#plan.ops} ops from {plan.nodes} nodes` }
+  local depth = 0
+
+  for index, op in plan.ops do
+    if op.kind == 'pop' then depth -= 1 end
+
+    local offCanvas = op.right <= 0 or op.bottom <= 0 or op.left >= plan.width or op.top >= plan.height
+    local box = if op.kind == 'pop' then '' else ` [{op.left}, {op.top}, {op.right}, {op.bottom}]`
+    local extra = if op.kind == 'fill' then ` {(op.paint :: paint.Paint).kind} {op.rule} {op.prepared and (op.prepared :: path.Prepared).count or 0} edges` else ''
+
+    table.insert(lines, `{string.format('%4d', index)} {string.rep('  ', depth)}{op.kind} #{op.node}{if op.name then ' ' .. op.name else ''}{box}{extra}{if offCanvas and op.kind ~= 'pop' then ' OFF-CANVAS' else ''}`)
+
+    if op.kind == 'push' then depth += 1 end
+  end
+
+  return table.concat(lines, '\n')
+end
+
+--- Gaussian weights for a radius, normalized to sum to 1, from offset 0 to the reach.
+local function kernel(radius: number): { number }
+  local size = reach(radius)
+  local weights = table.create(size + 1) :: { number }
+  local total = 0
+
+  for offset = 0, size do
+    weights[offset + 1] = math.exp(-offset * offset / (2 * radius * radius))
+    total += weights[offset + 1] * (if offset == 0 then 1 else 2)
+  end
+
+  for offset = 0, size do
+    weights[offset + 1] /= total
+  end
+
+  return weights
+end
+
+--- Blurs `channels` (0..3, four bytes apart from `first`) of a tile in place, separably, with
+--- nothing beyond its edges. `scratch` holds one tile.
+@native
+local function blurTile(tile: Tile, radius: number, scratch: buffer, onlyAlpha: boolean)
+  local weights = kernel(radius)
+  local size = #weights - 1
+  local width, height, data = tile.width, tile.height, tile.data
+  local first = if onlyAlpha then 12 else 0
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      for channel = first, 12, 4 do
+        local total = 0
+
+        for offset = -size, size do
+          local at = column + offset
+
+          if at >= 0 and at < width then
+            total += buffer.readf32(data, ((row * width) + at) * 16 + channel) * weights[math.abs(offset) + 1]
+          end
+        end
+
+        buffer.writef32(scratch, (row * width + column) * 16 + channel, total)
+      end
+    end
+  end
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      for channel = first, 12, 4 do
+        local total = 0
+
+        for offset = -size, size do
+          local at = row + offset
+
+          if at >= 0 and at < height then
+            total += buffer.readf32(scratch, ((at * width) + column) * 16 + channel) * weights[math.abs(offset) + 1]
+          end
+        end
+
+        buffer.writef32(data, (row * width + column) * 16 + channel, total)
+      end
+    end
+  end
+end
+
+--- Lays a blurred, offset, colored copy of a tile's alpha under it, in place.
+local function shadowTile(tile: Tile, filter: scene.Filter, scratch: buffer, shade: buffer)
+  if filter.kind ~= 'shadow' then return end
+
+  local width, height = tile.width, tile.height
+  local offsetX, offsetY = math.floor(filter.offsetX + 0.5), math.floor(filter.offsetY + 0.5)
+  local red, green, blue, alpha = color.premultiplied(filter.color, tile.space)
+  local alphaOnly: Tile = { width = width, height = height, left = tile.left, top = tile.top, space = tile.space, data = shade }
+
+  buffer.fill(shade, 0, 0)
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      local fromRow, fromColumn = row - offsetY, column - offsetX
+
+      if fromRow >= 0 and fromRow < height and fromColumn >= 0 and fromColumn < width then
+        buffer.writef32(shade, (row * width + column) * 16 + 12, buffer.readf32(tile.data, (fromRow * width + fromColumn) * 16 + 12))
+      end
+    end
+  end
+
+  if filter.radius > 0 then blurTile(alphaOnly, filter.radius, scratch, true) end
+
+  for at = 0, width * height * 16 - 16, 16 do
+    local cover = buffer.readf32(shade, at + 12)
+    local keep = 1 - buffer.readf32(tile.data, at + 12)
+
+    buffer.writef32(tile.data, at, buffer.readf32(tile.data, at) + red * cover * keep)
+    buffer.writef32(tile.data, at + 4, buffer.readf32(tile.data, at + 4) + green * cover * keep)
+    buffer.writef32(tile.data, at + 8, buffer.readf32(tile.data, at + 8) + blue * cover * keep)
+    buffer.writef32(tile.data, at + 12, buffer.readf32(tile.data, at + 12) + alpha * cover * keep)
+  end
+end
+
+--- Working tiles by depth, reused from tile to tile: at most one a group level, each cleared before
+--- it is used.
+type Pool = { tiles: { Tile }, stats: Stats, held: number }
+
+local function borrow(pool: Pool, depth: number, left: number, top: number, width: number, height: number, space: color.Space): Tile
+  local existing = pool.tiles[depth]
+
+  if existing and existing.width == width and existing.height == height then
+    buffer.fill(existing.data, 0, 0)
+    existing.left, existing.top = left, top
+
+    return existing
+  end
+
+  if existing then pool.held -= buffer.len(existing.data) end
+
+  local tile = color.tile(width, height, { space = space, left = left, top = top })
+
+  pool.tiles[depth] = tile
+  pool.held += buffer.len(tile.data)
+  pool.stats.peakTileBytes = math.max(pool.stats.peakTileBytes, pool.held)
+
+  return tile
+end
+
+--- A mask tile's coverage bytes: its alpha, or its luminance times its alpha.
+local function maskBytes(tile: Tile, kind: 'alpha' | 'luminance'): magick.Mask
+  local count = tile.width * tile.height
+  local out = buffer.create(count)
+
+  for index = 0, count - 1 do
+    local at = index * 16
+    local value = buffer.readf32(tile.data, at + 12)
+
+    if kind == 'luminance' then
+      value = 0.2126 * buffer.readf32(tile.data, at) + 0.7152 * buffer.readf32(tile.data, at + 4) + 0.0722 * buffer.readf32(tile.data, at + 8)
+    end
+
+    buffer.writeu8(out, index, math.floor(math.clamp(value, 0, 1) * 255 + 0.5))
+  end
+
+  return magick.mask(tile.width, tile.height, out)
+end
+
+local runOps: (plan: Compiled, ops: { Op }, base: Tile, pool: Pool, depth: number) -> ()
+
+--- Finishes a group: its filters, then its clip and mask as one coverage, then its opacity and
+--- blend as it is laid onto the tile below.
+local function finishGroup(plan: Compiled, op: Op, group: Tile, parent: Tile, pool: Pool, depth: number)
+  if #op.filters > 0 then
+    local scratch = buffer.create(buffer.len(group.data))
+
+    for _, filter in op.filters do
+      if filter.kind == 'blur' then
+        if filter.radius > 0 then blurTile(group, filter.radius, scratch, false) end
+      else
+        shadowTile(group, filter, scratch, buffer.create(buffer.len(group.data)))
+      end
+    end
+  end
+
+  local coverage: magick.Mask? = nil
+  local clip = op.clip
+
+  if clip then coverage = path.coverOf(clip.prepared, clip.rule, group.left, group.top, group.width, group.height) end
+
+  local mask = op.mask
+
+  if mask then
+    local maskTile = borrow(pool, depth + 1, group.left, group.top, group.width, group.height, plan.space)
+
+    runOps(plan, mask.ops, maskTile, pool, depth + 1)
+
+    local bytes = maskBytes(maskTile, mask.kind)
+
+    if coverage then
+      local data = (coverage :: magick.Mask).data
+
+      for index = 0, buffer.len(data) - 1 do
+        buffer.writeu8(data, index, (buffer.readu8(data, index) * buffer.readu8(bytes.data, index) + 127) // 255)
+      end
+    else
+      coverage = bytes
+    end
+  end
+
+  color.compositeGroup(parent, group, {
+    opacity = op.opacity,
+    blend = op.blend,
+    clip = if coverage then { mask = coverage, left = group.left, top = group.top } else nil,
+  })
+end
+
+--- Runs operations onto a tile, groups opening tiles of their own a level down.
+runOps = function(plan: Compiled, ops: { Op }, base: Tile, pool: Pool, depth: number)
+  local stack: { Tile } = { base }
+  local frames: { Op } = {}
+  local index = 1
+  local stats = pool.stats
+
+  while index <= #ops do
+    local op = ops[index]
+    local top = stack[#stack]
+
+    if op.kind == 'pop' then
+      local group = table.remove(stack) :: Tile
+      local frame = table.remove(frames) :: Op
+
+      finishGroup(plan, frame, group, stack[#stack], pool, depth + #stack)
+      index += 1
+      continue
+    end
+
+    stats.candidates += 1
+
+    local misses = op.right <= top.left or op.bottom <= top.top or op.left >= top.left + top.width or op.top >= top.top + top.height
+
+    if misses then
+      stats.skipped += 1
+      index = if op.kind == 'push' then op.skip + 1 else index + 1
+      continue
+    end
+
+    if op.kind == 'fill' then
+      stats.rendered += 1
+      paint.fillPrepared(top, op.prepared :: path.Prepared, op.paint :: paint.Paint, {
+        fillRule = op.rule,
+        opacity = op.opacity,
+        blend = op.blend,
+      })
+    else
+      -- A group's tile is the tile below widened by its halo, cut to the canvas.
+      local left = math.max(0, top.left - op.halo)
+      local up = math.max(0, top.top - op.halo)
+      local right = math.min(plan.width, top.left + top.width + op.halo)
+      local bottom = math.min(plan.height, top.top + top.height + op.halo)
+
+      stats.groups += 1
+      table.insert(stack, borrow(pool, depth + #stack, left, up, right - left, bottom - up, plan.space))
+      table.insert(frames, op)
+    end
+
+    index += 1
+  end
+end
+
+--- Renders one tile of a plan onto its base working tile: the background, then every operation.
+local function renderTile(plan: Compiled, pool: Pool, left: number, top: number, width: number, height: number): Tile
+  local base = borrow(pool, 1, left, top, width, height, plan.space)
+  local backdrop = plan.background
+
+  if backdrop then
+    for at = 0, width * height * 16 - 16, 16 do
+      buffer.writef32(base.data, at, backdrop[1])
+      buffer.writef32(base.data, at + 4, backdrop[2])
+      buffer.writef32(base.data, at + 8, backdrop[3])
+      buffer.writef32(base.data, at + 12, backdrop[4])
+    end
+  end
+
+  runOps(plan, plan.ops, base, pool, 1)
+  pool.stats.tiles += 1
+
+  return base
+end
+
+local function newStats(): Stats
+  return { tiles = 0, candidates = 0, rendered = 0, skipped = 0, groups = 0, peakTileBytes = 0 }
+end
+
+--- The tiles of a region, as arithmetic rather than a list: the first tile's corner, how many
+--- columns and rows, the tile edge, and the canvas they are cut to. Tile `index` (from 1, row-major)
+--- is worked out when it is needed, so a render holds no list as long as its tiles.
+type Grid = { left: number, top: number, columns: number, rows: number, size: number, width: number, height: number }
+
+local function gridOf(plan: Compiled, region: { number }, tileSize: number): Grid
+  local left, top = math.max(0, region[1] // tileSize * tileSize), math.max(0, region[2] // tileSize * tileSize)
+  local right, bottom = math.min(plan.width, region[3]), math.min(plan.height, region[4])
+
+  return {
+    left = left,
+    top = top,
+    columns = math.max(0, math.ceil((right - left) / tileSize)),
+    rows = math.max(0, math.ceil((bottom - top) / tileSize)),
+    size = tileSize,
+    width = plan.width,
+    height = plan.height,
+  }
+end
+
+--- Tile `index` of a grid: its left, top, width and height.
+local function tileAt(grid: Grid, index: number): (number, number, number, number)
+  local row, column = (index - 1) // grid.columns, (index - 1) % grid.columns
+  local left, top = grid.left + column * grid.size, grid.top + row * grid.size
+
+  return left, top, math.min(grid.size, grid.width - left), math.min(grid.size, grid.height - top)
+end
+
+--- Copies tile `index`'s straight bytes into the output image at its place.
+local function stitch(output: magick.Image, grid: Grid, index: number, bytes: buffer)
+  local left, top, width, height = tileAt(grid, index)
+
+  for row = 0, height - 1 do
+    buffer.copy(output.data, ((top + row) * output.width + left) * 4, bytes, row * width * 4, width * 4)
+  end
+end
+
+--- Tiles a worker renders for one message, and how many messages each worker may have waiting at
+--- once: the most tile bytes queued for or from one worker is their product.
+Module.BatchTiles = 8
+Module.InFlightBatches = 2
+
+--- What a render worker holds: the plan it was sent, and its pool of working tiles.
+local served: { plan: Compiled, pool: Pool }? = nil
+
+--- A render worker's message handler. The first message carries the plan, which the worker keeps;
+--- each one after names a batch of tiles of a grid, answered with their straight RGBA8 bytes and
+--- what rendering them did. The bytes are those a tile of `image` gives, wherever this runs.
+function Module.serve(message: { [string]: unknown }): { [string]: unknown }
+  if message.plan then
+    served = { plan = message.plan :: Compiled, pool = { tiles = {}, stats = newStats(), held = 0 } }
+
+    return { ready = true }
+  end
+
+  local state = served
+
+  if not state then error('magick: a render worker was sent tiles before its plan', 2) end
+
+  local grid = message.grid :: Grid
+  local stats = newStats()
+  local out: { buffer } = {}
+
+  state.pool.stats = stats
+  stats.peakTileBytes = state.pool.held
+
+  for index = message.first :: number, message.last :: number do
+    local left, top, width, height = tileAt(grid, index)
+    local image = magick.new(width, height)
+    local base = renderTile(state.plan, state.pool, left, top, width, height)
+
+    base.left, base.top = 0, 0
+    color.toImage(base, image)
+    table.insert(out, image.data)
+  end
+
+  return { batch = message.batch, tiles = out, stats = stats }
+end
+
+--- The source of a render worker: `serve` answers every message.
+local WorkerSource = [[
+local render = require('@magick/render')
+
+return render.serve
+]]
+
+local function merge(into: Stats, from: Stats)
+  into.tiles += from.tiles
+  into.candidates += from.candidates
+  into.rendered += from.rendered
+  into.skipped += from.skipped
+  into.groups += from.groups
+  into.peakTileBytes = math.max(into.peakTileBytes, from.peakTileBytes)
+end
+
+--- Renders a grid's tiles on `workers` workers. Each worker is sent the plan once; then batches are
+--- dealt by turns, at most InFlightBatches waiting on each, and each reply is stitched into its own
+--- place before that worker is sent the next, so the queues stay bounded however large the canvas.
+--- Replies come back in the order each worker was sent them, so the output does not depend on
+--- timing. Every worker is stopped and joined before an error, a failed worker or a cancel goes on.
+local function renderParallel(plan: Compiled, grid: Grid, output: magick.Image, workers: number, cancel: (() -> boolean)?, stats: Stats)
+  local worker = require '@jess/worker'
+  local spawned = {}
+  local count = grid.columns * grid.rows
+  local batches = math.ceil(count / Module.BatchTiles)
+  local ahead = workers * Module.InFlightBatches
+
+  local function range(batch: number): (number, number)
+    return (batch - 1) * Module.BatchTiles + 1, math.min(count, batch * Module.BatchTiles)
+  end
+
+  local function dispatch(batch: number)
+    local first, last = range(batch)
+
+    spawned[(batch - 1) % workers + 1]:send { batch = batch, grid = grid, first = first, last = last }
+  end
+
+  local function coordinate()
+    for index = 1, workers do
+      local handle = worker.spawn { name = `magick render {index}`, capabilities = {}, source = WorkerSource }
+
+      table.insert(spawned, handle)
+      handle:send { plan = plan }
+    end
+
+    for index, handle in spawned do
+      local ready = handle:receive(600)
+
+      if not ready or not ready.ready then error(`magick: render worker {index} did not start`, 0) end
+    end
+
+    for batch = 1, math.min(batches, ahead) do
+      dispatch(batch)
+    end
+
+    for batch = 1, batches do
+      local stop = cancel
+
+      if stop and stop() then error('magick: render cancelled', 0) end
+
+      local which = (batch - 1) % workers + 1
+      local reply = spawned[which]:receive(600)
+
+      if not reply or reply.batch ~= batch then error(`magick: render worker {which} did not answer batch {batch}`, 0) end
+
+      local first, last = range(batch)
+
+      for index = first, last do
+        stitch(output, grid, index, reply.tiles[index - first + 1])
+      end
+
+      merge(stats, reply.stats)
+
+      if batch + ahead <= batches then dispatch(batch + ahead) end
+    end
+  end
+
+  -- A worker's receive raises the failure it reported, and its send raises once it has stopped;
+  -- cancel is the caller's own code. Whatever raises, no worker is left running.
+  local finished, problem = pcall(coordinate)
+
+  if not finished then
+    for _, handle in spawned do
+      handle:close()
+    end
+
+    for _, handle in spawned do
+      -- join raises when a worker does not end in time; the render's own error is the one to report.
+      pcall(handle.join, handle, 5)
+    end
+
+    local message = tostring(problem)
+
+    error(if string.sub(message, 1, 7) == 'magick:' then message else `magick: render worker failed: {message}`, 3)
+  end
+
+  for _, handle in spawned do
+    handle:join(60)
+  end
+end
+
+--- The bytes a render needs at most (RFC-0001 B3): each working set, which is a tile for the base
+--- and one for each group level (each widened by the largest halo) and a tile of filter scratch;
+--- and the output image. A parallel render adds, per worker, its copy of the plan and the tile
+--- bytes that may wait in its queues.
+function Module.workingBytes(handle: Plan, tileSize: number, workers: number?): number
+  local plan = open(handle, 1)
+  local depth, deepest, halo = 0, 0, 0
+
+  for _, op in plan.ops do
+    if op.kind == 'push' then
+      depth += 1
+      deepest = math.max(deepest, depth)
+      halo = math.max(halo, op.halo)
+    elseif op.kind == 'pop' then
+      depth -= 1
+    end
+  end
+
+  local wide = tileSize + 2 * halo * math.max(1, deepest)
+  local perWorker = (1 + deepest + 2) * wide * wide * 16
+  local count = workers or 1
+  local output = plan.width * plan.height * 4
+
+  if count <= 1 then return perWorker + output end
+
+  local queued = (Module.InFlightBatches + 1) * Module.BatchTiles * tileSize * tileSize * 4
+
+  return count * (perWorker + plan.bytes + queued) + output
+end
+
+local RenderKeys = {
+  tileSize = true,
+  reference = true,
+  region = true,
+  into = true,
+  memoryBudgetBytes = true,
+  workers = true,
+  cancel = true,
+}
+
+--- The most render workers, and the fewest pixels worth starting them for.
+Module.MaxWorkers = 8
+Module.ParallelPixels = 512 * 512
+
+--- How many workers a render runs on: 1 unless asked for more, `auto` taking 4 for a render of at
+--- least ParallelPixels when this runtime may spawn workers (a ScriptDomain with `worker.spawn`), and
+--- never more than the tiles.
+local function chooseWorkers(plan: Compiled, asked: (number | 'auto')?, tiles: number): number
+  if not asked or asked == 1 then return 1 end
+
+  if asked == 'auto' then
+    if plan.width * plan.height < Module.ParallelPixels or not jess.granted('worker.spawn') then return 1 end
+
+    return math.max(1, math.min(4, tiles))
+  end
+
+  local count = asked :: number
+
+  if count ~= math.floor(count) or count < 1 then error('magick: workers must be a whole number of at least 1, or auto', 3) end
+  if count > Module.MaxWorkers then error(`magick: MaxWorkers {Module.MaxWorkers} exceeded`, 3) end
+
+  return math.max(1, math.min(count, tiles))
+end
+
+--- Renders a plan (or a document, compiled first) into a straight RGBA8 image, tile by tile in
+--- row-major order. Returns the image and what the render did, summed over every worker.
+function Module.image(source: Plan | scene.Document, options: RenderOptions?): (magick.Image, Stats)
+  if options then
+    for name in (options :: unknown) :: { [string]: unknown } do
+      if not RenderKeys[name] then error(`magick: unknown option {name}`, 2) end
+    end
+  end
+
+  local isDocument = getmetatable(source :: { [string]: unknown }) == scene.Document
+
+  if not Plans[source :: Plan] and not isDocument then error('magick: not a plan render.compile made, nor a document', 2) end
+
+  local handle: Plan = if isDocument then Module.compile(source :: scene.Document) else source :: Plan
+  local plan = open(handle, 1)
+  local reference = options and options.reference
+  local tileSize = if reference then math.max(plan.width, plan.height) else (if options and options.tileSize then options.tileSize else Module.DefaultTileSize)
+
+  if not finite(tileSize) or tileSize ~= math.floor(tileSize) or tileSize < 1 then error('magick: tileSize must be a whole number of at least 1', 2) end
+  if not reference and tileSize > Module.MaxTileSize then error(`magick: MaxTileEdge {Module.MaxTileSize} exceeded`, 2) end
+
+  local region = if options and options.region then options.region else { 0, 0, plan.width, plan.height }
+
+  if #region ~= 4 or not (finite(region[1]) and finite(region[2]) and finite(region[3]) and finite(region[4])) then
+    error('magick: a region is four finite numbers: left, top, right, bottom', 2)
+  end
+
+  local grid = gridOf(plan, region, tileSize)
+  local workers = chooseWorkers(plan, if options then options.workers else nil, grid.columns * grid.rows)
+  local budget = if options and options.memoryBudgetBytes then options.memoryBudgetBytes else Module.DefaultBudgetBytes
+  local needed = Module.workingBytes(handle, tileSize, workers)
+
+  if needed > budget then error(`magick: render needs {needed} bytes, budget is {budget}`, 2) end
+
+  local output = if options and options.into then options.into else magick.new(plan.width, plan.height)
+
+  if output.width ~= plan.width or output.height ~= plan.height then error('magick: the image to draw into must be the plan\'s size', 2) end
+
+  local stats = newStats()
+
+  if workers > 1 then
+    renderParallel(plan, grid, output, workers, if options then options.cancel else nil, stats)
+
+    return output, stats
+  end
+
+  local pool: Pool = { tiles = {}, stats = stats, held = 0 }
+
+  for index = 1, grid.columns * grid.rows do
+    if options and options.cancel and options.cancel() then error('magick: render cancelled', 2) end
+
+    local left, top, width, height = tileAt(grid, index)
+
+    color.toImage(renderTile(plan, pool, left, top, width, height), output)
+  end
+
+  return output, stats
+end
+
+return Module
