@@ -13,6 +13,18 @@ type Demo = { name: string, render: () -> magick.Image }
 
 local render = require '@magick/render'
 local valley = require '../demos/valley'
+local oil = require '../demos/oil'
+local heron = require '../demos/heron'
+local portrait = require '../demos/portrait'
+local monalisa = require '../demos/monalisa'
+local valleyPainted = require '../demos/valleypainted'
+
+--- The Mona Lisa's reference and its pinned SHA-256 (gallery/references/PROVENANCE.md).
+local MonaLisaReference = 'gallery/references/mona-lisa-500.png'
+local MonaLisaSha256 = 'f8054a8d3a9a7a8c26fe959d49fe373584a7ca553d7ac4b862e95528ea7ea402'
+
+--- Intermediate images a demo leaves beside its own: the Mona Lisa's ground and passes.
+local extras: { { name: string, image: magick.Image } } = {}
 
 local Demos: { Demo } = {
   require '../demos/lighthouse',
@@ -21,6 +33,76 @@ local Demos: { Demo } = {
     name = 'valley',
     render = function(): magick.Image
       return (render.image(valley.build(960, 540)))
+    end,
+  },
+  {
+    name = 'heron',
+    render = function(): magick.Image
+      return (render.image(heron.build(800, 1000)))
+    end,
+  },
+  {
+    name = 'oil',
+    render = function(): magick.Image
+      return (render.image((oil.build())))
+    end,
+  },
+  {
+    name = 'portrait',
+    render = function(): magick.Image
+      return portrait.build()
+    end,
+  },
+  {
+    name = 'valley-painted',
+    render = function(): magick.Image
+      return valleyPainted.build().image
+    end,
+  },
+  {
+    name = 'monalisa',
+    render = function(): magick.Image
+      local source = fs.readFile(MonaLisaReference) :: buffer
+
+      -- The reference is pinned: gallery/references/PROVENANCE.md says where it came from.
+      if bytes.sha256(source) ~= MonaLisaSha256 then error(`demos: {MonaLisaReference} is not the pinned reference`, 0) end
+
+      local painting = monalisa.build(magick.readPNG(source))
+
+      table.insert(extras, { name = 'monalisa-ground', image = painting.ground.image })
+      print(`        monalisa  ground  error {string.format('%.4f', painting.ground.error)}`)
+
+      for index, pass in painting.passes do
+        table.insert(extras, { name = `monalisa-pass{index}`, image = pass.image })
+        print(`        monalisa  pass {index}  radius {pass.radius}  {pass.strokes} strokes  error {string.format('%.4f', pass.error)}`)
+      end
+
+      -- The ground and every pass side by side, each a quarter of the painting's width, on white.
+      local stages = { painting.ground.image }
+
+      for _, pass in painting.passes do
+        table.insert(stages, pass.image)
+      end
+
+      local cellWidth = painting.image.width // 4
+      local cellHeight = painting.image.height // 4
+      local gap = 8
+      local strip = magick.new(#stages * (cellWidth + gap) + gap, cellHeight + 2 * gap)
+
+      strip:fill '#ffffff'
+
+      for index, stage in stages do
+        local small = stage:resize(cellWidth, cellHeight)
+        local left = gap + (index - 1) * (cellWidth + gap)
+
+        for row = 0, cellHeight - 1 do
+          buffer.copy(strip.data, ((gap + row) * strip.width + left) * 4, small.data, row * cellWidth * 4, cellWidth * 4)
+        end
+      end
+
+      table.insert(extras, { name = 'monalisa-progress', image = strip })
+
+      return painting.image
     end,
   },
 }
@@ -40,6 +122,12 @@ for _, demo in Demos do
   local observed = `{image.width}x{image.height}:{string.format('%08x', bytes.crc32(image.data))}`
 
   fs.writeFile(fs.join(out, `{demo.name}.png`), magick.png(image), { atomic = true, createParents = true })
+
+  for _, extra in extras do
+    fs.writeFile(fs.join(out, `{extra.name}.png`), magick.png(extra.image), { atomic = true, createParents = true })
+  end
+
+  table.clear(extras)
 
   if recording then
     print(`  ['{demo.name}'] = '{observed}',`)

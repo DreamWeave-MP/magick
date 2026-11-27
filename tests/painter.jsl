@@ -1,0 +1,251 @@
+--!strict
+-- `@magick/painter` (MAG-037 to MAG-040): a pyramid with gradients, plans that lower the error at
+-- each finer level, are the same for a seed, stay inside their budget and caps, and turn into brush
+-- strokes in a scene.
+local magick = require '@magick'
+local painter = require '@magick/painter'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+--- A small reference of our own: a sky gradient, a sun and a dark hill.
+local function reference(): magick.Image
+  local document = scene.new(64, 40)
+
+  document:add(document:shape(path.new():rect(0, 0, 64, 40), { fill = paint.linear(0, 0, 0, 40, paint.stops(0, '#2040a0', 1, '#f0c080')) }))
+  document:add(document:shape(path.new():circle(44, 14, 6), { fill = paint.solid '#fff0c0' }))
+  document:add(document:shape(path.new():moveTo(0, 40):lineTo(0, 28):quadTo(30, 14, 64, 30):lineTo(64, 40):close(), { fill = paint.solid '#203018' }))
+
+  return (render.image(document))
+end
+
+suite.describe('analysis', function()
+  suite.it('blurs each level and finds the gradient across an edge', function()
+    local levels = painter.analyze(reference(), { 4, 1 })
+
+    expect(#levels).toBe(2)
+
+    -- Down the middle of the sky the luminance rises downward: the gradient points down.
+    local at = 10 * 64 + 10 + 1
+
+    expect(levels[2].gradientY[at] > 0).toBe(true)
+    expect(math.abs(levels[2].gradientX[at]) < math.abs(levels[2].gradientY[at])).toBe(true)
+  end)
+end)
+
+suite.describe('plans', function()
+  suite.it('lowers the error at each finer level, and is the same for a seed', function()
+    local image = reference()
+    local plan = painter.plan(image, { radii = { 6, 3, 1.5 }, threshold = 0.05, seed = 2 })
+    local again = painter.plan(image, { radii = { 6, 3, 1.5 }, threshold = 0.05, seed = 2 })
+
+    expect(#plan.strokes > 0).toBe(true)
+    expect(plan.levels[2].error < plan.levels[1].error).toBe(true)
+    expect(plan.levels[3].error < plan.levels[2].error).toBe(true)
+    expect(#again.strokes).toBe(#plan.strokes)
+
+    for index, stroke in plan.strokes do
+      expect(stroke.points[1] == again.strokes[index].points[1] and stroke.red == again.strokes[index].red).toBe(true)
+    end
+  end)
+
+  suite.it('paints the first level everywhere, and only where detail is missing after it', function()
+    local plan = painter.plan(reference(), { radii = { 8, 2 }, threshold = 0.08, seed = 1 })
+
+    -- The coarse grid has one stroke a cell: 8 columns by 5 rows.
+    expect(plan.levels[1].strokes).toBe(40)
+    expect(plan.levels[2].strokes < 16 * 20).toBe(true)
+  end)
+
+  suite.it('stops at its budget, and keeps strokes within their length caps', function()
+    local plan = painter.plan(reference(), { radii = { 4, 2 }, threshold = 0, budget = 25, maximumLength = 5 })
+
+    expect(#plan.strokes).toBe(25)
+
+    for _, stroke in plan.strokes do
+      expect(#stroke.points <= 10).toBe(true)
+    end
+  end)
+
+  suite.it('turns a plan into brush strokes that render, under its underpainting', function()
+    local image = reference()
+    local plan = painter.plan(image, { radii = { 6, 3 }, seed = 4 })
+    local document = scene.new(128, 80)
+
+    painter.apply(document, document.root, plan, { matrix = transform.scale(2), underpaint = image })
+
+    local painted = render.image(document)
+    local small = render.image(scene.load(scene.save(document)))
+
+    expect(buffer.tostring(small.data) == buffer.tostring(painted.data)).toBe(true)
+    expect(painter.error(image, image)).toBe(0)
+  end)
+
+  suite.it('refuses bad references and options', function()
+    expect(function()
+      painter.plan(magick.new(1, 1))
+    end).toThrow 'magick: a reference needs at least 2 by 2 pixels'
+
+    expect(function()
+      painter.plan(reference(), { radii = { 2, 4 } })
+    end).toThrow 'magick: brush radii go from large to small'
+
+    expect(function()
+      painter.plan(reference(), { radii = { 9, 8, 7, 6, 5, 4, 3, 2, 1 } })
+    end).toThrow 'magick: a plan has 1..8 levels'
+
+    expect(function()
+      painter.plan(reference(), { curvature = 2 })
+    end).toThrow 'magick: curvature must be in 0..1'
+
+    expect(function()
+      painter.plan(reference(), { maximumLength = 100 })
+    end).toThrow 'magick: stroke lengths must be in 1..64'
+
+    expect(function()
+      painter.error(magick.new(2, 2), magick.new(3, 2))
+    end).toThrow 'magick: error compares images of one size'
+  end)
+end)
+
+suite.describe('bounds and metrics', function()
+  suite.it('builds strokes only for the starts its budget takes', function()
+    local noisy = magick.new(256, 256)
+    local state = 11
+
+    for index = 0, 256 * 256 * 4 - 1 do
+      state = state * 48271 % 2147483647
+      buffer.writeu8(noisy.data, index, if index % 4 == 3 then 255 else state % 256)
+    end
+
+    -- At half the radius, a 1-pixel brush has a start in every pixel: 65,536 candidates, one stroke.
+    local plan = painter.plan(noisy, { radii = { 2, 1 }, grid = 0.5, budget = 1, threshold = 0 })
+
+    expect(#plan.strokes).toBe(1)
+    expect({ plan.levels[1].strokes, plan.levels[2].strokes }).toEqual { 1, 0 }
+  end)
+
+  suite.it('lays the same strokes whatever the budget, up to it', function()
+    local full = painter.plan(reference(), { seed = 4 })
+    local cut = painter.plan(reference(), { seed = 4, budget = 25 })
+
+    for index = 1, 25 do
+      expect(cut.strokes[index].points).toEqual(full.strokes[index].points)
+    end
+  end)
+
+  suite.it('measures error premultiplied, so transparency counts and hidden color does not', function()
+    local clear, hidden, red = magick.new(2, 1), magick.new(2, 1), magick.new(2, 1)
+
+    hidden:fill '#ff000000'
+    red:fill '#ff0000'
+
+    -- Color under no coverage is no difference; coverage is.
+    expect(painter.error(clear, hidden)).toBe(0)
+    expect(painter.error(clear, red)).toBe(1 / 3 + 1)
+
+    -- Opaque images: the mean absolute difference of the color channels.
+    local black = magick.new(2, 1)
+
+    black:fill '#000000'
+    expect(painter.error(black, red)).toBe(1 / 3)
+  end)
+
+  suite.it('refuses images with no pixels, and options that are not whole or finite', function()
+    expect(function()
+      painter.error(magick.new(0, 0), magick.new(0, 0))
+    end).toThrow 'magick: error compares images with pixels'
+
+    for _, options in { { budget = 1.5 }, { seed = -1 }, { minimumLength = 0 / 0 }, { threshold = math.huge }, { grid = 0 }, { radii = { 0 / 0 } } } :: { painter.Options } do
+      expect(function()
+        painter.plan(reference(), options)
+      end).toThrow 'magick:'
+    end
+  end)
+end)
+
+suite.describe('painting against the rendered canvas', function()
+  suite.it('reports each pass as the real render, measured against the reference itself', function()
+    local target = reference()
+    local painting = painter.paint(target, { radii = { 6, 3 }, threshold = 0.05, seed = 2 })
+
+    expect(#painting.passes).toBe(2)
+    expect(painting.ground.error).toBe(painter.error(painting.ground.image, target))
+
+    for _, pass in painting.passes do
+      expect(pass.error).toBe(painter.error(pass.image, target))
+    end
+
+    expect(buffer.tostring(painting.image.data)).toBe(buffer.tostring(painting.passes[2].image.data))
+    -- Strokes bring the canvas toward the reference from its flat ground.
+    expect(painting.passes[2].error < painting.ground.error).toBe(true)
+  end)
+
+  suite.it('paints the same bytes for the same call', function()
+    local first = painter.paint(reference(), { radii = { 6, 3 }, seed = 7 })
+    local second = painter.paint(reference(), { radii = { 6, 3 }, seed = 7 })
+
+    expect(buffer.tostring(first.image.data)).toBe(buffer.tostring(second.image.data))
+  end)
+
+  suite.it('covers the whole ground in its first pass', function()
+    local painting = painter.paint(reference(), { radii = { 6 }, seed = 3, ground = '#ff00ff' })
+    local image, bare = painting.passes[1].image, 0
+
+    for pixel = 0, image.width * image.height - 1 do
+      if buffer.readu8(image.data, pixel * 4) == 255 and buffer.readu8(image.data, pixel * 4 + 1) == 0 and buffer.readu8(image.data, pixel * 4 + 2) == 255 then bare += 1 end
+    end
+
+    expect(bare).toBe(0)
+  end)
+
+  suite.it('paints a region\'s own passes only inside it', function()
+    local painting = painter.paint(reference(), {
+      radii = { 6 },
+      seed = 5,
+      regions = { { name = 'left', shape = path.new():rect(0, 0, 24, 40), radii = { 6, 2 }, threshold = 0 } },
+    })
+    local before, after = painting.passes[1].image, painting.passes[2].image
+
+    expect(painting.passes[2].radius).toBe(2)
+    expect(painting.passes[2].strokes > 0).toBe(true)
+
+    -- Every fine stroke's line stays in the region; its dabs reach no further past the edge than the
+    -- brush's length, here at most 2.5 times its radius of 2.
+    for row = 0, 39 do
+      for column = 30, 63 do
+        local at = (row * 64 + column) * 4
+
+        expect(buffer.readu32(after.data, at)).toBe(buffer.readu32(before.data, at))
+      end
+    end
+  end)
+
+  suite.it('refuses references with transparency, bad scales and unknown options', function()
+    local clear = magick.new(8, 8)
+
+    expect(function()
+      painter.paint(clear)
+    end).toThrow 'magick: paint takes an opaque reference'
+
+    expect(function()
+      painter.paint(reference(), { scale = 1.5 })
+    end).toThrow 'magick: paint scale must be a whole number in 1..4'
+
+    expect(function()
+      painter.paint(reference(), ({ widen = 2 } :: unknown) :: painter.PaintOptions)
+    end).toThrow 'magick: unknown option widen'
+
+    expect(function()
+      painter.paint(reference(), { regions = { { name = 'bad', shape = path.new():rect(0, 0, 4, 4), radii = { 2, 4 } } } })
+    end).toThrow 'magick: region bad brush radii go from large to small'
+  end)
+end)
+
+return suite

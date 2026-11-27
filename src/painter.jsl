@@ -1,0 +1,1014 @@
+--!strict
+--[[
+@magick/painter: painting a reference coarse to fine (MAG-037 to MAG-040), after the method Aaron
+Hertzmann described at SIGGRAPH 1998 ("Painterly Rendering with Curved Brush Strokes of Multiple
+Sizes"); this is an implementation of that idea, not of his code.
+
+`analyze` makes the reference's pyramid: one blurred copy for each brush radius, and its luminance
+gradient. `plan` paints largest brush first: over a grid as fine as the brush, wherever a quick
+estimate of the canvas so far differs from that level's blur by more than `threshold`, it starts a
+stroke at the worst pixel of the cell, in the color there, and runs it along the edge (across the
+gradient), bending no faster than `curvature` allows and stopping where the reference's color
+leaves the stroke's. Each stroke is stamped into the estimate before the next level looks, so
+finer brushes go only where detail is still missing. Everything is a function of the reference,
+the options and the seed: no generator, no clock.
+
+`apply` turns a plan into brush strokes in a scene; `error` measures how far an image is from the
+reference. The reference must be an image the caller may use: the gallery's own renders are.
+]]
+local brush = require '@magick/brush'
+local magick = require '@magick'
+local noise = require '@magick/noise'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+
+local Module = {}
+
+Module.MaxStrokesPerPlan = 16384
+--- The most strokes one `paint` lays over all its passes.
+Module.MaxStrokesPerPainting = 131072
+Module.MaxPlanLevels = 8
+Module.MaxStrokeLength = 64
+--- The largest reference a plan reads: 1024 by 1024 pixels.
+Module.MaxReferencePixels = 1048576
+
+--- One level of the pyramid: the reference blurred for a brush, as straight sRGB floats, and the
+--- gradient of its luminance.
+export type Level = {
+  radius: number,
+  width: number,
+  height: number,
+  red: { number },
+  green: { number },
+  blue: { number },
+  gradientX: { number },
+  gradientY: { number },
+}
+
+--- A planned stroke: its points in reference pixels, its brush radius, and its straight color.
+export type Stroke = { points: { number }, radius: number, red: number, green: number, blue: number }
+
+--- How a plan went at one level: strokes laid, and the mean error left after it, 0..1.
+export type LevelStats = { radius: number, strokes: number, error: number }
+
+export type Plan = { width: number, height: number, strokes: { Stroke }, levels: { LevelStats } }
+
+export type Options = {
+  --- Brush radii from large to small, in reference pixels (8, 4, 2 by default).
+  radii: { number }?,
+  --- How far the estimate may differ from a level's blur, 0..1 of a channel's range (0.1).
+  threshold: number?,
+  --- How fast a stroke may turn: 0 follows the edge wholly, 1 never turns (0.4).
+  curvature: number?,
+  --- The fewest and most points a stroke has (2 and 14).
+  minimumLength: number?,
+  maximumLength: number?,
+  --- Grid spacing as a fraction of the radius (1).
+  grid: number?,
+  seed: number?,
+  --- Stop after this many strokes (MaxStrokesPerPlan).
+  budget: number?,
+}
+
+local function luminance(red: number, green: number, blue: number): number
+  return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+end
+
+--- A box blur of one channel, `size` pixels a side, done twice each way, nothing past the edges.
+local function blurChannel(values: { number }, width: number, height: number, size: number): { number }
+  if size <= 0 then return table.clone(values) end
+
+  local current = table.clone(values)
+  local spare = table.create(width * height, 0) :: { number }
+
+  for _ = 1, 2 do
+    for row = 0, height - 1 do
+      local total, count = 0, 0
+
+      for column = -size, width - 1 + size do
+        local entering, leaving = column + size, column - size - 1
+
+        if entering >= 0 and entering < width then
+          total += current[row * width + entering + 1]
+          count += 1
+        end
+
+        if leaving >= 0 and leaving < width then
+          total -= current[row * width + leaving + 1]
+          count -= 1
+        end
+
+        if column >= 0 and column < width then spare[row * width + column + 1] = total / count end
+      end
+    end
+
+    for column = 0, width - 1 do
+      local total, count = 0, 0
+
+      for row = -size, height - 1 + size do
+        local entering, leaving = row + size, row - size - 1
+
+        if entering >= 0 and entering < height then
+          total += spare[entering * width + column + 1]
+          count += 1
+        end
+
+        if leaving >= 0 and leaving < height then
+          total -= spare[leaving * width + column + 1]
+          count -= 1
+        end
+
+        if row >= 0 and row < height then current[row * width + column + 1] = total / count end
+      end
+    end
+  end
+
+  return current
+end
+
+--- The pyramid of a reference image for brush radii, largest first: each level the reference
+--- blurred by half its radius and the Sobel gradient of its luminance.
+function Module.analyze(reference: magick.Image, radii: { number }): { Level }
+  local width, height = reference.width, reference.height
+
+  if width < 2 or height < 2 then error('magick: a reference needs at least 2 by 2 pixels', 2) end
+  if width * height > Module.MaxReferencePixels then error(`magick: MaxReferencePixels {Module.MaxReferencePixels} exceeded`, 2) end
+  if #radii < 1 or #radii > Module.MaxPlanLevels then error(`magick: a plan has 1..{Module.MaxPlanLevels} levels`, 2) end
+
+  local red, green, blue = table.create(width * height) :: { number }, table.create(width * height) :: { number }, table.create(width * height) :: { number }
+
+  for index = 0, width * height - 1 do
+    red[index + 1] = buffer.readu8(reference.data, index * 4) / 255
+    green[index + 1] = buffer.readu8(reference.data, index * 4 + 1) / 255
+    blue[index + 1] = buffer.readu8(reference.data, index * 4 + 2) / 255
+  end
+
+  local levels: { Level } = {}
+
+  for _, radius in radii do
+    if radius ~= radius or radius < 1 or radius > 128 then error('magick: a brush radius must be in 1..128', 2) end
+
+    local size = math.max(0, math.floor(radius / 2))
+    local level: Level = {
+      radius = radius,
+      width = width,
+      height = height,
+      red = blurChannel(red, width, height, size),
+      green = blurChannel(green, width, height, size),
+      blue = blurChannel(blue, width, height, size),
+      gradientX = table.create(width * height, 0),
+      gradientY = table.create(width * height, 0),
+    }
+
+    local function light(column: number, row: number): number
+      local at = math.clamp(row, 0, height - 1) * width + math.clamp(column, 0, width - 1) + 1
+
+      return luminance(level.red[at], level.green[at], level.blue[at])
+    end
+
+    for row = 0, height - 1 do
+      for column = 0, width - 1 do
+        local at = row * width + column + 1
+
+        level.gradientX[at] = (light(column + 1, row - 1) + 2 * light(column + 1, row) + light(column + 1, row + 1))
+          - (light(column - 1, row - 1) + 2 * light(column - 1, row) + light(column - 1, row + 1))
+        level.gradientY[at] = (light(column - 1, row + 1) + 2 * light(column, row + 1) + light(column + 1, row + 1))
+          - (light(column - 1, row - 1) + 2 * light(column, row - 1) + light(column + 1, row - 1))
+      end
+    end
+
+    table.insert(levels, level)
+  end
+
+  return levels
+end
+
+local function finite(value: number): boolean
+  return value == value and value > -math.huge and value < math.huge
+end
+
+local function whole(value: number): boolean
+  return finite(value) and value == math.floor(value)
+end
+
+--- One channel as f64s: half the memory of a table of numbers, and the same values.
+type Plane = buffer
+
+local function plane(count: number): Plane
+  return buffer.create(count * 8)
+end
+
+local function at(values: Plane, index: number): number
+  return buffer.readf64(values, index * 8)
+end
+
+local function put(values: Plane, index: number, value: number)
+  buffer.writef64(values, index * 8, value)
+end
+
+--- `blurChannel` over planes: the same box passes and the same arithmetic, so the same values.
+local function blurPlane(values: Plane, width: number, height: number, size: number, spare: Plane): Plane
+  local current = buffer.create(buffer.len(values))
+
+  buffer.copy(current, 0, values)
+
+  if size <= 0 then return current end
+
+  for _ = 1, 2 do
+    for row = 0, height - 1 do
+      local total, count = 0, 0
+
+      for column = -size, width - 1 + size do
+        local entering, leaving = column + size, column - size - 1
+
+        if entering >= 0 and entering < width then
+          total += at(current, row * width + entering)
+          count += 1
+        end
+
+        if leaving >= 0 and leaving < width then
+          total -= at(current, row * width + leaving)
+          count -= 1
+        end
+
+        if column >= 0 and column < width then put(spare, row * width + column, total / count) end
+      end
+    end
+
+    for column = 0, width - 1 do
+      local total, count = 0, 0
+
+      for row = -size, height - 1 + size do
+        local entering, leaving = row + size, row - size - 1
+
+        if entering >= 0 and entering < height then
+          total += at(spare, entering * width + column)
+          count += 1
+        end
+
+        if leaving >= 0 and leaving < height then
+          total -= at(spare, leaving * width + column)
+          count -= 1
+        end
+
+        if row >= 0 and row < height then put(current, row * width + column, total / count) end
+      end
+    end
+  end
+
+  return current
+end
+
+--- One level as `plan` holds it: the blurred channels and the gradient, as planes. Only one level
+--- is held at a time.
+type PlaneLevel = { radius: number, red: Plane, green: Plane, blue: Plane, gradientX: Plane, gradientY: Plane }
+
+--- `least` is the smallest blur a level gets: `plan` takes none, as it always has; `paint` takes a
+--- pixel, so its finest brush follows the picture rather than the photograph's grain and cracks.
+local function planeLevel(red: Plane, green: Plane, blue: Plane, width: number, height: number, radius: number, spare: Plane, least: number?): PlaneLevel
+  local size = math.max(least or 0, math.floor(radius / 2))
+  local level: PlaneLevel = {
+    radius = radius,
+    red = blurPlane(red, width, height, size, spare),
+    green = blurPlane(green, width, height, size, spare),
+    blue = blurPlane(blue, width, height, size, spare),
+    gradientX = plane(width * height),
+    gradientY = plane(width * height),
+  }
+
+  local function light(column: number, row: number): number
+    local index = math.clamp(row, 0, height - 1) * width + math.clamp(column, 0, width - 1)
+
+    return luminance(at(level.red, index), at(level.green, index), at(level.blue, index))
+  end
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      local index = row * width + column
+
+      put(level.gradientX, index, (light(column + 1, row - 1) + 2 * light(column + 1, row) + light(column + 1, row + 1))
+        - (light(column - 1, row - 1) + 2 * light(column - 1, row) + light(column - 1, row + 1)))
+      put(level.gradientY, index, (light(column - 1, row + 1) + 2 * light(column, row + 1) + light(column + 1, row + 1))
+        - (light(column - 1, row - 1) + 2 * light(column, row - 1) + light(column + 1, row - 1)))
+    end
+  end
+
+  return level
+end
+
+--- Refuses painter options that are not finite, whole where they count, or in range.
+local function checkOptions(options: Options?, level: number)
+  if not options then return end
+
+  for _, name in { 'threshold', 'curvature', 'grid' } do
+    local value = (options :: { [string]: unknown })[name]
+
+    if value ~= nil and (type(value) ~= 'number' or not finite(value :: number) or (value :: number) < 0) then
+      error('magick: painter options must be finite and not negative', level + 1)
+    end
+  end
+
+  for _, name in { 'minimumLength', 'maximumLength', 'budget', 'seed' } do
+    local value = (options :: { [string]: unknown })[name]
+
+    if value ~= nil and (type(value) ~= 'number' or not whole(value :: number) or (value :: number) < 0) then
+      error(`magick: painter option {name} must be a whole number, not negative`, level + 1)
+    end
+  end
+
+  if options.grid and options.grid <= 0 then error('magick: painter grid must be more than 0', level + 1) end
+
+  for _, radius in options.radii or {} do
+    if not finite(radius) or radius < 1 or radius > 128 then error('magick: a brush radius must be in 1..128', level + 1) end
+  end
+end
+
+--- Plans a painting of a reference: strokes coarse to fine, as the module describes.
+---
+--- Memory is bounded by the reference: its three channels, one level (five planes) and the estimate
+--- (three planes and a mark a pixel), 8 bytes a value, so about 100 MB at MaxReferencePixels however
+--- many levels there are. A level's strokes are planned from positions chosen first: every cell the
+--- estimate misses is a candidate, the candidates are laid in a seeded order, and strokes are built
+--- only for as many as the budget has left, so a small budget builds few strokes.
+function Module.plan(reference: magick.Image, options: Options?): Plan
+  checkOptions(options, 1)
+
+  local radii = if options and options.radii then options.radii else { 8, 4, 2 }
+  local threshold = if options and options.threshold then options.threshold else 0.1
+  local curvature = if options and options.curvature then options.curvature else 0.4
+  local shortest = if options and options.minimumLength then options.minimumLength else 2
+  local longest = if options and options.maximumLength then options.maximumLength else 14
+  local gridFactor = if options and options.grid then options.grid else 1
+  local seed = if options and options.seed then options.seed else 1
+  local budget = math.min(if options and options.budget then options.budget else Module.MaxStrokesPerPlan, Module.MaxStrokesPerPlan)
+
+  noise.hash(seed, 0)
+
+  if curvature > 1 then error('magick: curvature must be in 0..1', 2) end
+  if shortest < 1 or longest < shortest or longest > Module.MaxStrokeLength then error(`magick: stroke lengths must be in 1..{Module.MaxStrokeLength}`, 2) end
+
+  for index = 2, #radii do
+    if radii[index] > radii[index - 1] then error('magick: brush radii go from large to small', 2) end
+  end
+
+  local width, height = reference.width, reference.height
+
+  if width < 2 or height < 2 then error('magick: a reference needs at least 2 by 2 pixels', 2) end
+  if width * height > Module.MaxReferencePixels then error(`magick: MaxReferencePixels {Module.MaxReferencePixels} exceeded`, 2) end
+  if #radii < 1 or #radii > Module.MaxPlanLevels then error(`magick: a plan has 1..{Module.MaxPlanLevels} levels`, 2) end
+
+  local count = width * height
+  local red, green, blue = plane(count), plane(count), plane(count)
+
+  for index = 0, count - 1 do
+    put(red, index, buffer.readu8(reference.data, index * 4) / 255)
+    put(green, index, buffer.readu8(reference.data, index * 4 + 1) / 255)
+    put(blue, index, buffer.readu8(reference.data, index * 4 + 2) / 255)
+  end
+
+  -- The estimate of the canvas so far: unpainted until a stroke covers it.
+  local canvasRed, canvasGreen, canvasBlue = plane(count), plane(count), plane(count)
+  local painted = buffer.create(count)
+  local spare = plane(count)
+  local strokes: { Stroke } = {}
+  local stats: { LevelStats } = {}
+
+  local function stamp(stroke: Stroke)
+    local radius = stroke.radius
+    local points = stroke.points
+
+    for index = 1, #points - 1, 2 do
+      local centerX, centerY = points[index], points[index + 1]
+
+      for row = math.max(0, math.floor(centerY - radius)), math.min(height - 1, math.ceil(centerY + radius)) do
+        for column = math.max(0, math.floor(centerX - radius)), math.min(width - 1, math.ceil(centerX + radius)) do
+          if (column + 0.5 - centerX) ^ 2 + (row + 0.5 - centerY) ^ 2 > radius * radius then continue end
+
+          local here = row * width + column
+
+          put(canvasRed, here, stroke.red)
+          put(canvasGreen, here, stroke.green)
+          put(canvasBlue, here, stroke.blue)
+          buffer.writeu8(painted, here, 1)
+        end
+      end
+    end
+  end
+
+  for levelIndex, radius in radii do
+    local level = planeLevel(red, green, blue, width, height, radius, spare)
+    local step = math.max(1, math.floor(radius * gridFactor + 0.5))
+
+    local function difference(here: number): number
+      if buffer.readu8(painted, here) == 0 then return math.huge end
+
+      return (math.abs(at(canvasRed, here) - at(level.red, here)) + math.abs(at(canvasGreen, here) - at(level.green, here)) + math.abs(at(canvasBlue, here) - at(level.blue, here))) / 3
+    end
+
+    local function sample(values: Plane, pointX: number, pointY: number): number
+      return at(values, math.clamp(math.floor(pointY), 0, height - 1) * width + math.clamp(math.floor(pointX), 0, width - 1))
+    end
+
+    local function makeStroke(startX: number, startY: number): Stroke
+      local strokeRed, strokeGreen, strokeBlue = sample(level.red, startX, startY), sample(level.green, startX, startY), sample(level.blue, startX, startY)
+      local points = { startX, startY }
+      local pointX, pointY = startX, startY
+      local lastX, lastY = 0, 0
+
+      for index = 1, longest - 1 do
+        local here = math.clamp(math.floor(pointY), 0, height - 1) * width + math.clamp(math.floor(pointX), 0, width - 1)
+        local towardColor = math.abs(at(level.red, here) - strokeRed) + math.abs(at(level.green, here) - strokeGreen) + math.abs(at(level.blue, here) - strokeBlue)
+        local towardCanvas = math.abs(at(level.red, here) - at(canvasRed, here)) + math.abs(at(level.green, here) - at(canvasGreen, here)) + math.abs(at(level.blue, here) - at(canvasBlue, here))
+
+        if index > shortest and buffer.readu8(painted, here) == 1 and towardCanvas < towardColor then break end
+
+        local gradientX, gradientY = at(level.gradientX, here), at(level.gradientY, here)
+        local magnitude = math.sqrt(gradientX * gradientX + gradientY * gradientY)
+
+        if magnitude < 1e-4 then break end
+
+        -- Across the gradient, along the edge, the way the stroke was already going.
+        local directionX, directionY = -gradientY / magnitude, gradientX / magnitude
+
+        if lastX * directionX + lastY * directionY < 0 then directionX, directionY = -directionX, -directionY end
+
+        if index > 1 then
+          directionX, directionY = curvature * lastX + (1 - curvature) * directionX, curvature * lastY + (1 - curvature) * directionY
+
+          local length = math.sqrt(directionX * directionX + directionY * directionY)
+
+          if length < 1e-9 then break end
+
+          directionX, directionY = directionX / length, directionY / length
+        end
+
+        pointX, pointY = pointX + radius * directionX, pointY + radius * directionY
+
+        if pointX < 0 or pointY < 0 or pointX >= width or pointY >= height then break end
+
+        lastX, lastY = directionX, directionY
+        table.insert(points, pointX)
+        table.insert(points, pointY)
+      end
+
+      return { points = points, radius = radius, red = strokeRed, green = strokeGreen, blue = strokeBlue }
+    end
+
+    -- Positions first: the worst pixel of every cell the estimate misses by more than the threshold.
+    local starts: { number } = {}
+
+    for top = 0, height - 1, step do
+      for left = 0, width - 1, step do
+        local total, worst, worstAt = 0, -1, 0
+        local cells = 0
+
+        for row = top, math.min(height - 1, top + step - 1) do
+          for column = left, math.min(width - 1, left + step - 1) do
+            local here = row * width + column
+            local miss = difference(here)
+
+            total += math.min(miss, 1)
+            cells += 1
+
+            if miss > worst then worst, worstAt = miss, here end
+          end
+        end
+
+        if total / cells > threshold then table.insert(starts, worstAt) end
+      end
+    end
+
+    -- Laid in a seeded order, so no part of the canvas is always painted last.
+    for index = #starts, 2, -1 do
+      local other = noise.hash(seed, levelIndex, index) % index + 1
+
+      starts[index], starts[other] = starts[other], starts[index]
+    end
+
+    -- Strokes are built only for the starts the budget takes, all from the estimate as the level
+    -- found it, and then laid on it.
+    local made: { Stroke } = {}
+
+    for index = 1, math.min(#starts, budget - #strokes) do
+      local start = starts[index]
+
+      table.insert(made, makeStroke(start % width + 0.5, start // width + 0.5))
+    end
+
+    for _, stroke in made do
+      table.insert(strokes, stroke)
+      stamp(stroke)
+    end
+
+    local totalError = 0
+
+    for here = 0, count - 1 do
+      totalError += if buffer.readu8(painted, here) == 1 then difference(here) else 1
+    end
+
+    table.insert(stats, { radius = radius, strokes = #made, error = totalError / count })
+  end
+
+  return { width = width, height = height, strokes = strokes, levels = stats }
+end
+
+--- How far an image is from a reference of one size, 0..2: per pixel, the mean absolute difference of
+--- the premultiplied colors plus that of the alphas, over 255, averaged. Premultiplied, a color
+--- under no coverage counts for nothing, and coverage itself is compared; for two opaque images it
+--- is the mean absolute difference of the color channels, 0..1. Images with no pixels are refused.
+function Module.error(image: magick.Image, reference: magick.Image): number
+  if image.width ~= reference.width or image.height ~= reference.height then error('magick: error compares images of one size', 2) end
+  if image.width * image.height == 0 then error('magick: error compares images with pixels', 2) end
+
+  local total = 0
+
+  for pixel = 0, image.width * image.height - 1 do
+    local base = pixel * 4
+    local alpha, other = buffer.readu8(image.data, base + 3) / 255, buffer.readu8(reference.data, base + 3) / 255
+    local colors = 0
+
+    for channel = 0, 2 do
+      colors += math.abs(buffer.readu8(image.data, base + channel) * alpha - buffer.readu8(reference.data, base + channel) * other)
+    end
+
+    total += colors / 3 + math.abs(alpha - other) * 255
+  end
+
+  return total / (image.width * image.height * 255)
+end
+
+--- What `apply` takes: the brush preset for every stroke ('oil'), how much wider than the planned
+--- radius the brush is (2.2), and a function of a stroke's radius giving more overrides (dabs spaced
+--- 0.15 of their diameter when left out).
+export type ApplyOptions = {
+  preset: string?,
+  widen: number?,
+  overrides: ((radius: number) -> { [string]: unknown })?,
+  seed: number?,
+  matrix: transform.Matrix?,
+  --- Lay the reference, blurred by the largest radius, under the strokes first, as a painter tones
+  --- a canvas (true), so no bare canvas shows between the first strokes.
+  underpaint: magick.Image?,
+}
+
+--- Adds a plan's strokes to a group as brush strokes, placed by `matrix` (reference pixels to the
+--- group's space), each with its own seed.
+function Module.apply(document: scene.Document, parent: scene.Node, plan: Plan, options: ApplyOptions?)
+  local preset = if options and options.preset then options.preset else 'oil'
+  local widen = if options and options.widen then options.widen else 2.2
+  local seed = if options and options.seed then options.seed else 1
+  local matrix = if options and options.matrix then options.matrix else transform.identity()
+  local layer = parent:add(document:group { transform = matrix, name = 'painter' })
+  local underpaint = if options then options.underpaint else nil
+
+  if underpaint then
+    -- Blurred here, as the plan's own coarsest target is, with each average taken over the pixels
+    -- that exist. A blur filter would take the canvas's outside as transparent and fade the
+    -- underpainting toward its edges, leaving a ragged unpainted frame around the strokes.
+    local largest = if #plan.strokes > 0 then plan.strokes[1].radius else 4
+    local width, height = underpaint.width, underpaint.height
+    local size = math.max(1, math.floor(largest / 2))
+    local spare = plane(width * height)
+    local toned = magick.new(width, height)
+
+    for channel = 0, 3 do
+      local values = plane(width * height)
+
+      for index = 0, width * height - 1 do
+        put(values, index, buffer.readu8(underpaint.data, index * 4 + channel))
+      end
+
+      local blurred = blurPlane(values, width, height, size, spare)
+
+      for index = 0, width * height - 1 do
+        buffer.writeu8(toned.data, index * 4 + channel, math.floor(math.clamp(at(blurred, index), 0, 255) + 0.5))
+      end
+    end
+
+    layer:add(document:image(toned, { sampling = 'bilinear', name = 'underpainting' }))
+  end
+
+  for index, stroke in plan.strokes do
+    local samples: { brush.Sample } = {}
+
+    for at = 1, #stroke.points - 1, 2 do
+      table.insert(samples, { stroke.points[at], stroke.points[at + 1], 1 })
+    end
+
+    local fill = string.format('#%02x%02x%02x', math.floor(stroke.red * 255 + 0.5), math.floor(stroke.green * 255 + 0.5), math.floor(stroke.blue * 255 + 0.5))
+    local overrides = if options and options.overrides then options.overrides(stroke.radius) else { spacing = 0.15 }
+    local settings = brush.preset(preset, stroke.radius * widen, fill, overrides)
+
+    layer:add(document:stroke(samples, settings, { seed = (seed + index - 1) % 2147483646 + 1 }))
+  end
+end
+
+-- Painting against the rendered canvas ------------------------------------------------------------
+
+--- A part of the picture painted its own way: `shape` (in reference pixels) says where, and the rest
+--- say how. A cell belongs to the first region whose shape covers its center, or to none.
+export type Region = {
+  name: string,
+  shape: path.Path,
+  --- The brush radii this region is painted with, large to small (the painting's when left out).
+  radii: { number }?,
+  threshold: number?,
+  curvature: number?,
+  maximumLength: number?,
+  preset: string?,
+  --- Brush overrides for this region's strokes, laid over the preset's.
+  overrides: { [string]: unknown }?,
+}
+
+--- What `paint` takes: `plan`'s options for the parts no region covers, and how the strokes are drawn.
+export type PaintOptions = Options & {
+  --- Output pixels a reference pixel: a whole number in 1..4 (1).
+  scale: number?,
+  --- The brush preset and overrides for strokes outside every region ('oil', a 0.15 spacing).
+  preset: string?,
+  overrides: { [string]: unknown }?,
+  regions: { Region }?,
+  --- The color the canvas is toned before the first stroke (the reference's mean).
+  ground: magick.Color?,
+    --- How many workers render each pass (1).
+  workers: number?,
+}
+
+--- One pass of a painting: its brush radius, the strokes it laid, and how far the rendered canvas,
+--- brought back to the reference's size, was then from the reference itself (`error`). `image` is
+--- that canvas at full size: the pass's intermediate result.
+export type Pass = { radius: number, strokes: number, error: number, image: magick.Image }
+
+export type Painting = {
+  --- The finished canvas, the reference's size times `scale`.
+  image: magick.Image,
+  --- The underpainting alone, then each pass.
+  ground: Pass,
+  passes: { Pass },
+}
+
+--- An image brought to `width` by `height` by averaging each `scale` by `scale` block.
+local function reduce(image: magick.Image, scale: number): magick.Image
+  if scale == 1 then return image end
+
+  local width, height = image.width // scale, image.height // scale
+  local out = magick.new(width, height)
+  local area = scale * scale
+
+  for row = 0, height - 1 do
+    for column = 0, width - 1 do
+      for channel = 0, 3 do
+        local total = 0
+
+        for down = 0, scale - 1 do
+          for across = 0, scale - 1 do
+            total += buffer.readu8(image.data, (((row * scale + down) * image.width) + column * scale + across) * 4 + channel)
+          end
+        end
+
+        buffer.writeu8(out.data, (row * width + column) * 4 + channel, (total + area // 2) // area)
+      end
+    end
+  end
+
+  return out
+end
+
+--- A level's blurred colors as an opaque image the reference's size.
+local function levelImage(level: PlaneLevel, width: number, height: number): magick.Image
+  local out = magick.new(width, height)
+
+  for index = 0, width * height - 1 do
+    buffer.writeu8(out.data, index * 4, math.floor(math.clamp(at(level.red, index), 0, 1) * 255 + 0.5))
+    buffer.writeu8(out.data, index * 4 + 1, math.floor(math.clamp(at(level.green, index), 0, 1) * 255 + 0.5))
+    buffer.writeu8(out.data, index * 4 + 2, math.floor(math.clamp(at(level.blue, index), 0, 1) * 255 + 0.5))
+    buffer.writeu8(out.data, index * 4 + 3, 255)
+  end
+
+  return out
+end
+
+local PaintKeys = {
+  radii = true,
+  threshold = true,
+  curvature = true,
+  minimumLength = true,
+  maximumLength = true,
+  grid = true,
+  seed = true,
+  budget = true,
+  scale = true,
+  preset = true,
+  overrides = true,
+  regions = true,
+  ground = true,
+  workers = true,
+}
+
+--- Paints an opaque reference, pass by pass from the largest brush to the smallest, each pass
+--- planned against the canvas as the brush engine actually rendered it, not an estimate.
+---
+--- The canvas starts as an underpainting: the reference blurred by the largest radius, laid edge to
+--- edge. Each pass blurs the reference for its radius, and in every cell (as wide as the radius)
+--- where the rendered canvas differs from that blur by more than the threshold it starts a stroke at
+--- the worst pixel, in the blurred color there, running along the edge as `plan`'s strokes do. The
+--- starts are laid in a seeded order, strokes are built only for what the budget has left, and the
+--- pass's strokes are rendered over the canvas so far. Its error is then measured between the
+--- rendered canvas and the reference itself, the fixed target every pass is held to; nothing here
+--- promises that the error falls from pass to pass, only reports it.
+---
+--- Regions paint parts of the picture with their own radii, threshold and brush (a face finer and
+--- softer than the sky behind it). The result keeps every pass's canvas as an intermediate image, so
+--- a painting can be shown as it was built. Everything is a function of the reference and the
+--- options: the same call gives the same bytes.
+function Module.paint(reference: magick.Image, options: PaintOptions?): Painting
+  if options then
+    for name in (options :: unknown) :: { [string]: unknown } do
+      if not PaintKeys[name] then error(`magick: unknown option {name}`, 2) end
+    end
+  end
+
+  checkOptions(options, 1)
+
+  local width, height = reference.width, reference.height
+
+  if width < 2 or height < 2 then error('magick: a reference needs at least 2 by 2 pixels', 2) end
+  if width * height > Module.MaxReferencePixels then error(`magick: MaxReferencePixels {Module.MaxReferencePixels} exceeded`, 2) end
+
+  for index = 0, width * height - 1 do
+    if buffer.readu8(reference.data, index * 4 + 3) ~= 255 then error('magick: paint takes an opaque reference; flatten it over a ground first', 2) end
+  end
+
+  local scale = if options and options.scale then options.scale else 1
+
+  if not whole(scale) or scale < 1 or scale > 4 then error('magick: paint scale must be a whole number in 1..4', 2) end
+
+  local defaults = {
+    radii = if options and options.radii then options.radii else { 8, 4, 2 },
+    threshold = if options and options.threshold then options.threshold else 0.1,
+    curvature = if options and options.curvature then options.curvature else 0.4,
+    maximumLength = if options and options.maximumLength then options.maximumLength else 14,
+    preset = if options and options.preset then options.preset else 'oil',
+    overrides = if options and options.overrides then options.overrides else nil,
+  }
+  local shortest = if options and options.minimumLength then options.minimumLength else 2
+  local gridFactor = if options and options.grid then options.grid else 1
+  local seed = if options and options.seed then options.seed else 1
+  local budget = math.min(if options and options.budget then options.budget else Module.MaxStrokesPerPainting, Module.MaxStrokesPerPainting)
+  local regions = if options and options.regions then options.regions else {}
+  local workers = if options and options.workers then options.workers else 1
+
+  noise.hash(seed, 0)
+
+  -- Every radius any part is painted with, large to small: one pass each.
+  local radii: { number } = {}
+
+  local function addRadii(list: { number }, owner: string)
+    for index, radius in list do
+      if not finite(radius) or radius < 1 or radius > 128 then error(`magick: {owner} brush radius must be in 1..128`, 3) end
+      if index > 1 and radius > list[index - 1] then error(`magick: {owner} brush radii go from large to small`, 3) end
+      if not table.find(radii, radius) then table.insert(radii, radius) end
+    end
+  end
+
+  addRadii(defaults.radii, 'a')
+
+  -- Which region owns each reference pixel (0 for none), the first whose shape covers its center.
+  local owner = buffer.create(width * height)
+
+  if #regions > 255 then error('magick: a painting has at most 255 regions', 2) end
+
+  for index = #regions, 1, -1 do
+    local region: Region = regions[index]
+    local regionRadii, regionThreshold, shape = region.radii, region.threshold, region.shape
+
+    if regionRadii then addRadii(regionRadii, `region {region.name}`) end
+    if regionThreshold and (not finite(regionThreshold) or regionThreshold < 0) then error(`magick: region {region.name} threshold must be finite and not negative`, 2) end
+
+    local cover = shape:coverageIn(0, 0, width, height)
+
+    for pixel = 0, width * height - 1 do
+      if buffer.readu8(cover.data, pixel) >= 128 then buffer.writeu8(owner, pixel, index) end
+    end
+  end
+
+  table.sort(radii, function(first: number, second: number): boolean
+    return first > second
+  end)
+
+  if #radii > Module.MaxPlanLevels then error(`magick: a painting has 1..{Module.MaxPlanLevels} passes`, 2) end
+
+  local count = width * height
+  local red, green, blue = plane(count), plane(count), plane(count)
+
+  for index = 0, count - 1 do
+    put(red, index, buffer.readu8(reference.data, index * 4) / 255)
+    put(green, index, buffer.readu8(reference.data, index * 4 + 1) / 255)
+    put(blue, index, buffer.readu8(reference.data, index * 4 + 2) / 255)
+  end
+
+  local spare = plane(count)
+  local placed = transform.scale(scale)
+
+  --- Renders `strokes` (in reference pixels) over `under`, the canvas so far, at full size.
+  local function renderOver(under: magick.Image, strokes: { { samples: { brush.Sample }, settings: brush.Brush, seed: number } }): magick.Image
+    local document = scene.new(width * scale, height * scale)
+
+    document:add(document:image(under))
+
+    local layer = document:add(document:group { transform = placed, name = 'pass' })
+
+    for _, stroke in strokes do
+      layer:add(document:stroke(stroke.samples, stroke.settings, { seed = stroke.seed }))
+    end
+
+    return (render.image(document, { workers = workers }))
+  end
+
+  -- The ground: the canvas toned one flat color before any stroke, the reference's mean unless one
+  -- is given, as a painter lays an imprimatura. A blurred copy of the reference would already match
+  -- the coarse passes' targets and leave them nothing to paint.
+  local first = planeLevel(red, green, blue, width, height, radii[1], spare, 1)
+  local tone = if options and options.ground then options.ground else nil
+
+  if not tone then
+    local sums = { 0, 0, 0 }
+
+    for index = 0, count - 1 do
+      sums[1] += at(red, index)
+      sums[2] += at(green, index)
+      sums[3] += at(blue, index)
+    end
+
+    tone = string.format('#%02x%02x%02x', math.floor(sums[1] / count * 255 + 0.5), math.floor(sums[2] / count * 255 + 0.5), math.floor(sums[3] / count * 255 + 0.5))
+  end
+
+  local canvas = render.image(scene.new(width * scale, height * scale, { background = tone }))
+  local ground: Pass = { radius = radii[1], strokes = 0, error = Module.error(reduce(canvas, scale), reference), image = canvas }
+  local passes: { Pass } = {}
+  local laid = 0
+
+  local function settingsFor(region: Region?): (number, number, number, string, { [string]: unknown }?)
+    if not region then return defaults.threshold, defaults.curvature, defaults.maximumLength, defaults.preset, defaults.overrides end
+
+    return region.threshold or defaults.threshold,
+      region.curvature or defaults.curvature,
+      region.maximumLength or defaults.maximumLength,
+      region.preset or defaults.preset,
+      region.overrides or defaults.overrides
+  end
+
+  for passIndex, radius in radii do
+    local level = if passIndex == 1 then first else planeLevel(red, green, blue, width, height, radius, spare, 1)
+    local seen = reduce(canvas, scale)
+    local step = math.max(1, math.floor(radius * gridFactor + 0.5))
+
+    local function seenAt(index: number, channel: number): number
+      return buffer.readu8(seen.data, index * 4 + channel) / 255
+    end
+
+    local function difference(index: number): number
+      return (math.abs(seenAt(index, 0) - at(level.red, index)) + math.abs(seenAt(index, 1) - at(level.green, index)) + math.abs(seenAt(index, 2) - at(level.blue, index))) / 3
+    end
+
+    local function takes(region: Region?): boolean
+      local list = if region then region.radii or defaults.radii else defaults.radii
+
+      return table.find(list, radius) ~= nil
+    end
+
+    -- Positions first: the worst pixel of every cell the canvas misses by more than its region's
+    -- threshold, in a pass that region takes.
+    local starts: { number } = {}
+
+    for top = 0, height - 1, step do
+      for left = 0, width - 1, step do
+        local centerRow, centerColumn = math.min(height - 1, top + step // 2), math.min(width - 1, left + step // 2)
+        local regionIndex = buffer.readu8(owner, centerRow * width + centerColumn)
+        local region = if regionIndex > 0 then regions[regionIndex] else nil
+
+        if not takes(region) then continue end
+
+        local threshold = settingsFor(region)
+        local total, worst, worstAt, cells = 0, -1, 0, 0
+
+        for row = top, math.min(height - 1, top + step - 1) do
+          for column = left, math.min(width - 1, left + step - 1) do
+            local here = row * width + column
+            local miss = difference(here)
+
+            total += miss
+            cells += 1
+
+            if miss > worst then worst, worstAt = miss, here end
+          end
+        end
+
+        -- The first pass covers the whole ground, as no stroke has touched it yet: from the cell's
+        -- center, so a stroke as wide as the cell reaches its corners.
+        if passIndex == 1 then
+          table.insert(starts, centerRow * width + centerColumn)
+        elseif total / cells > threshold then
+          table.insert(starts, worstAt)
+        end
+      end
+    end
+
+    for index = #starts, 2, -1 do
+      local other = noise.hash(seed, passIndex, index) % index + 1
+
+      starts[index], starts[other] = starts[other], starts[index]
+    end
+
+    local strokes = {}
+
+    for index = 1, math.min(#starts, budget - laid) do
+      local start = starts[index]
+      local startX, startY = start % width + 0.5, start // width + 0.5
+      local region = regions[buffer.readu8(owner, start)]
+      local _, curvature, longest, preset, overrides = settingsFor(region)
+      local strokeRed, strokeGreen, strokeBlue = at(level.red, start), at(level.green, start), at(level.blue, start)
+      local points = { startX, startY }
+      local pointX, pointY, lastX, lastY = startX, startY, 0, 0
+
+      for length = 1, longest - 1 do
+        local here = math.clamp(math.floor(pointY), 0, height - 1) * width + math.clamp(math.floor(pointX), 0, width - 1)
+
+        -- A stroke stays in the region it started in, and stops where the target leaves its color
+        -- for one the canvas already has.
+        if buffer.readu8(owner, here) ~= buffer.readu8(owner, start) then break end
+
+        local towardColor = math.abs(at(level.red, here) - strokeRed) + math.abs(at(level.green, here) - strokeGreen) + math.abs(at(level.blue, here) - strokeBlue)
+        local towardCanvas = 3 * difference(here)
+
+        if length > shortest and towardCanvas < towardColor then break end
+
+        local gradientX, gradientY = at(level.gradientX, here), at(level.gradientY, here)
+        local magnitude = math.sqrt(gradientX * gradientX + gradientY * gradientY)
+
+        if magnitude < 1e-4 then break end
+
+        local directionX, directionY = -gradientY / magnitude, gradientX / magnitude
+
+        if lastX * directionX + lastY * directionY < 0 then directionX, directionY = -directionX, -directionY end
+
+        if length > 1 then
+          directionX, directionY = curvature * lastX + (1 - curvature) * directionX, curvature * lastY + (1 - curvature) * directionY
+
+          local size = math.sqrt(directionX * directionX + directionY * directionY)
+
+          if size < 1e-9 then break end
+
+          directionX, directionY = directionX / size, directionY / size
+        end
+
+        pointX, pointY = pointX + radius * directionX, pointY + radius * directionY
+
+        if pointX < 0 or pointY < 0 or pointX >= width or pointY >= height then break end
+
+        lastX, lastY = directionX, directionY
+        table.insert(points, pointX)
+        table.insert(points, pointY)
+      end
+
+      -- Pressure swells from the ends to the middle, so a stroke lands and lifts as a brush does.
+      local samples: { brush.Sample } = {}
+      local pointCount = #points // 2
+
+      for at = 1, #points - 1, 2 do
+        local along = if pointCount > 1 then ((at - 1) // 2) / (pointCount - 1) else 0.5
+        local pressure = 0.55 + 0.45 * math.sin(math.pi * along)
+
+        table.insert(samples, { points[at], points[at + 1], pressure })
+      end
+
+      local fill = string.format('#%02x%02x%02x', math.floor(math.clamp(strokeRed, 0, 1) * 255 + 0.5), math.floor(math.clamp(strokeGreen, 0, 1) * 255 + 0.5), math.floor(math.clamp(strokeBlue, 0, 1) * 255 + 0.5))
+      local settings = brush.preset(preset, 2 * radius, fill, overrides or { spacing = 0.15 })
+      local minimum = settings.minimumSize or 0.15
+      -- How much of its size a stroke reaches across its line at its ends, where the pressure is
+      -- lightest (0.55): the dab's diameter there times the blade's aspect.
+      local across = (settings.aspect or 1) * (minimum + (1 - minimum) * 0.55)
+
+      -- The planned radius is how far a stroke reaches across its line even at its ends; a flat blade
+      -- or the lighter pressure there would otherwise leave seams of bare ground between the cells.
+      settings.size = 2 * radius / math.clamp(across, 0.25, 1)
+
+      table.insert(strokes, {
+        samples = samples,
+        settings = settings,
+        seed = (seed * 7919 + laid + index) % 2147483646 + 1,
+      })
+    end
+
+    laid += #strokes
+    canvas = renderOver(canvas, strokes)
+
+    table.insert(passes, { radius = radius, strokes = #strokes, error = Module.error(reduce(canvas, scale), reference), image = canvas })
+  end
+
+  return { image = canvas, ground = ground, passes = passes }
+end
+
+return Module

@@ -1,0 +1,131 @@
+--!strict
+-- "Portrait of a Reader", the reference-guided portrait (MAG-041). The reference is not a found
+-- image: it is an original vector portrait drawn here, so its provenance is this file and its
+-- license the package's. `painter.paint` reads it coarse to fine against its own renders, each part
+-- (face, hair, coat, backdrop) with its own brush, the finest glazes only in the face.
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local painter = require '@magick/painter'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+
+--- The outlines the reference is drawn from, which the painting reuses as its regions.
+local function coatOutline(): path.Path
+  return path.new():moveTo(20, 450):cubicTo(40, 380, 110, 345, 180, 340):cubicTo(250, 345, 320, 380, 345, 450):close()
+end
+
+local function hairOutline(): path.Path
+  return path.new():moveTo(92, 200):cubicTo(80, 90, 160, 50, 220, 64):cubicTo(290, 80, 300, 170, 282, 260):cubicTo(270, 300, 250, 320, 236, 320):lineTo(120, 320):cubicTo(96, 290, 90, 240, 92, 200):close()
+end
+
+local function neckOutline(): path.Path
+  return path.new():moveTo(150, 290):lineTo(148, 360):cubicTo(170, 372, 200, 372, 214, 358):lineTo(210, 288):close()
+end
+
+local function faceOutline(): path.Path
+  return path.new():moveTo(120, 170):cubicTo(118, 110, 160, 88, 196, 92):cubicTo(240, 96, 262, 140, 256, 196):cubicTo(252, 250, 230, 296, 186, 306):cubicTo(150, 302, 124, 260, 120, 170):close()
+end
+
+--- The reference: a three-quarter head and shoulders, 360 by 450, lit from the upper left.
+local function reference(): scene.Document
+  local document = scene.new(360, 450, { background = '#3a2a22', space = 'linear' })
+
+  local function shape(outline: path.Path, fill: paint.Paint, options: scene.ShapeOptions?)
+    local settings = table.clone(options or {}) :: scene.ShapeOptions
+
+    settings.fill = fill
+    document:add(document:shape(outline, settings))
+  end
+
+  -- A warm backdrop, brighter behind the lit side.
+  shape(path.new():rect(0, 0, 360, 450), paint.radial(120, 140, 360, paint.stops(0, '#8a6a48', 0.6, '#4a3428', 1, '#24180f')))
+
+  -- Shoulders and a dark blue coat with a pale collar.
+  local coat = coatOutline()
+
+  shape(coat, paint.linear(60, 360, 300, 450, paint.stops(0, '#3a4a78', 0.5, '#24304e', 1, '#121a2c')))
+  shape(path.new():moveTo(140, 352):lineTo(180, 400):lineTo(222, 352):cubicTo(210, 345, 152, 345, 140, 352):close(), paint.linear(140, 350, 220, 400, paint.stops(0, '#e8e0d0', 1, '#a8a090')))
+
+  -- The neck, shadowed under the jaw.
+  shape(neckOutline(), paint.linear(0, 290, 0, 360, paint.stops(0, '#8a5a40', 0.4, '#c08a68', 1, '#d8a888')))
+
+  -- Hair behind the head.
+  shape(hairOutline(), paint.linear(100, 60, 280, 320, paint.stops(0, '#6a3a22', 0.5, '#3e2014', 1, '#1e0e08')))
+
+  -- The face: an oval lit from the left, warmer at the cheeks, shaded down its right side.
+  local face = faceOutline()
+
+  shape(face, paint.radial(160, 170, 170, paint.stops(0, '#f2c8a8', 0.55, '#e0a888', 1, '#a86a50'), { focusX = 150, focusY = 150 }))
+  shape(face, paint.linear(150, 0, 262, 0, paint.stops(0, '#00000000', 0.6, '#00000000', 1, '#5a2a1a90')))
+  shape(path.new():circle(150, 222, 24, 16), paint.radial(150, 222, 26, paint.stops(0, '#e8807060', 1, '#e8807000')))
+  shape(path.new():circle(232, 222, 18, 14), paint.radial(232, 222, 20, paint.stops(0, '#d0705050', 1, '#d0705000')))
+
+  -- Hair over the brow, swept to the right.
+  shape(path.new():moveTo(118, 168):cubicTo(120, 108, 170, 80, 220, 90):cubicTo(250, 98, 266, 130, 262, 176):cubicTo(240, 130, 200, 120, 170, 134):cubicTo(150, 144, 132, 158, 118, 168):close(), paint.linear(120, 90, 260, 170, paint.stops(0, '#8a4a28', 0.5, '#5a2e18', 1, '#2a140a')))
+
+  -- Brows, eyes and lids.
+  for _, side in { { 158, 186, 1 }, { 222, 184, 0.85 } } do
+    local centerX, centerY, light = side[1], side[2], side[3]
+
+    shape(path.new():moveTo(centerX - 20, centerY - 18):quadTo(centerX, centerY - 26, centerX + 20, centerY - 16):stroked { width = 4, cap = 'round' }, paint.solid '#3a1e12')
+    shape(path.new():circle(centerX, centerY, 13, 7), paint.solid(if light == 1 then '#f4ece4' else '#d8ccc4'))
+    shape(path.new():circle(centerX + 1, centerY, 6.5), paint.radial(centerX - 1, centerY - 2, 7, paint.stops(0, '#6a8a6a', 0.7, '#3a5a40', 1, '#1a2a1e')))
+    shape(path.new():circle(centerX + 1, centerY, 3), paint.solid '#0a0a0a')
+    shape(path.new():circle(centerX - 2, centerY - 2.5, 1.3), paint.solid '#ffffff')
+    shape(path.new():moveTo(centerX - 14, centerY - 1):quadTo(centerX, centerY - 10, centerX + 14, centerY - 2):stroked { width = 2.2, cap = 'round' }, paint.solid '#4a2418')
+  end
+
+  -- The nose: a shadow down its right side and under its tip.
+  shape(path.new():moveTo(196, 190):cubicTo(200, 214, 206, 234, 202, 246):stroked { width = 3.2, cap = 'round' }, paint.solid '#9a5a40a0')
+  shape(path.new():moveTo(178, 248):quadTo(192, 256, 206, 248):stroked { width = 3, cap = 'round' }, paint.solid '#8a4a34c0')
+
+  -- Lips, the upper darker.
+  shape(path.new():moveTo(166, 272):cubicTo(178, 264, 186, 268, 190, 270):cubicTo(196, 266, 206, 266, 216, 272):cubicTo(204, 276, 180, 276, 166, 272):close(), paint.solid '#a04a40')
+  shape(path.new():moveTo(168, 273):cubicTo(180, 286, 204, 286, 214, 273):cubicTo(200, 278, 182, 278, 168, 273):close(), paint.linear(0, 272, 0, 286, paint.stops(0, '#c8645a', 1, '#a04a42')))
+
+  return document
+end
+
+--- Flesh glazes, as the Mona Lisa's: soft translucent dabs that never cover past their own tip.
+local Glaze: { [string]: unknown } = {
+  spacing = 0.15,
+  tip = { kind = 'round', hardness = 0.1 },
+  aspect = 0.9,
+  flow = 0.45,
+  minimumSize = 0.75,
+  accumulation = 'constant',
+  grainStrength = 0.04,
+  jitter = { lightness = 0.03, size = 0.05 },
+}
+
+--- The painting at twice the reference, 720 by 900, by `painter.paint` against its real renders.
+--- Each part keeps its own strokes: the face in glazes refined almost everywhere, the hair and the
+--- coat in oil along their forms, and the backdrop in short straight strokes, which a long stroke
+--- following the radial backdrop's gradient would curl into a vortex about the head.
+local function paintIt(): painter.Painting
+  local image = render.image(reference())
+
+  return painter.paint(image, {
+    radii = { 10, 5 },
+    threshold = 0.05,
+    curvature = 0.9,
+    maximumLength = 4,
+    seed = 41,
+    scale = 2,
+    ground = '#3a2a22',
+    overrides = { spacing = 0.12, aspect = 0.7, flow = 0.8, jitter = { hue = 0.03, lightness = 0.06, angle = 0.05, size = 0.08 } },
+    regions = {
+      { name = 'face', shape = faceOutline(), radii = { 10, 5, 3, 2, 1.5, 1 }, threshold = 0.01, curvature = 0.6, maximumLength = 8, overrides = Glaze },
+      { name = 'neck', shape = neckOutline(), radii = { 10, 5, 3, 2 }, threshold = 0.012, curvature = 0.6, maximumLength = 8, overrides = Glaze },
+      { name = 'hair', shape = hairOutline(), radii = { 10, 5, 2.5 }, threshold = 0.035, curvature = 0.4, maximumLength = 12 },
+      { name = 'coat', shape = coatOutline(), radii = { 10, 5, 2.5 }, threshold = 0.035, curvature = 0.5, maximumLength = 10 },
+    },
+  })
+end
+
+local function build(): magick.Image
+  return paintIt().image
+end
+
+return { name = 'portrait', build = build, reference = reference }

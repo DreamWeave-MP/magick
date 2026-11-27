@@ -1,0 +1,31 @@
+--!strict
+-- "The Valley, Painted": Valley at First Light painted by `painter.paint` (the real-render
+-- painter of MAG-041) for comparison with "The Valley, in Oil", which `painter.apply` made from a
+-- plan against its disc estimate. The reference is our own scene, rendered small.
+local magick = require '@magick'
+local painter = require '@magick/painter'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local valley = require './valley'
+
+local Module = {}
+
+--- Paints the 320 by 180 valley at three times its size, 960 by 540.
+function Module.build(): painter.Painting
+  local reference: magick.Image = render.image(valley.build(320, 180))
+
+  return painter.paint(reference, {
+    radii = { 6, 3, 2 },
+    threshold = 0.035,
+    curvature = 0.45,
+    seed = 3,
+    scale = 3,
+    overrides = { spacing = 0.12, aspect = 0.7, flow = 0.8, jitter = { hue = 0.04, lightness = 0.08, angle = 0.05, size = 0.08 } },
+    regions = {
+      -- The flowers and grass at the front get the finest brush; the sky keeps its large strokes.
+      { name = 'meadow', shape = path.new():rect(0, 138, 320, 180), radii = { 8, 4, 2, 1 }, threshold = 0.04, maximumLength = 6 },
+    },
+  })
+end
+
+return Module

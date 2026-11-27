@@ -1,0 +1,98 @@
+--!strict
+-- MAG-041, the Mona Lisa challenge: Leonardo's portrait painted again by @magick/painter from a
+-- public-domain photograph of it (gallery/references/PROVENANCE.md pins the file and its
+-- checksums). The painting is built pass by pass against the brush engine's real renders:
+--
+--   * the canvas is toned one flat umber, as Leonardo's panels were primed;
+--   * every part is laid in with large, loaded oil strokes, then refined at half and a quarter of the
+--     size where the canvas still differs from the reference;
+--   * the face and the hands go on past that, through radius 3, 2, 1.5 and 1, in glazes: very soft,
+--     translucent strokes that never pile up past their own coverage (`constant` accumulation), and
+--     a threshold near nothing (0.008), so every part of the flesh is refined and its tones turn
+--     continuously instead of stepping from one plateau to the next (sfumato, the smoke Leonardo
+--     blended his flesh with). An opaque brush and a coarser threshold banded the face;
+--   * the bust is softer than the robe but not as fine as the face;
+--   * every stroke stays inside the region it started in, so the background's brush never smears
+--     across the face.
+--
+-- Each pass's canvas is kept, so the painting can be shown as it was built.
+local magick = require '@magick'
+local painter = require '@magick/painter'
+local path = require '@magick/path'
+
+local Module = {}
+
+--- The reference's size: the 500-pixel-wide Wikimedia rendition.
+Module.Width = 500
+Module.Height = 745
+
+--- Flesh glazes: very soft, translucent dabs whose stroke never covers past its own tip (`constant`),
+--- so passes lay veil on veil rather than plateau on plateau.
+local Sfumato: { [string]: unknown } = {
+  spacing = 0.15,
+  tip = { kind = 'round', hardness = 0.08 },
+  aspect = 0.9,
+  flow = 0.42,
+  minimumSize = 0.75,
+  accumulation = 'constant',
+  grainStrength = 0.05,
+  jitter = { lightness = 0.03, size = 0.05 },
+}
+
+--- The regions, in reference pixels, read off the reference by eye.
+function Module.regions(): { painter.Region }
+  return {
+    {
+      name = 'face',
+      shape = path.new():circle(228, 176, 50, 74),
+      radii = { 8, 4, 3, 2, 1.5, 1 },
+      threshold = 0.008,
+      curvature = 0.6,
+      maximumLength = 8,
+      overrides = Sfumato,
+    },
+    {
+      name = 'hands',
+      -- The two hands only, not the dark sleeve above them, whose fine strokes would read as noise.
+      shape = path.new():circle(186, 622, 78, 40):circle(228, 584, 74, 40),
+      radii = { 8, 4, 3, 2, 1.5, 1 },
+      threshold = 0.008,
+      curvature = 0.55,
+      maximumLength = 8,
+      overrides = Sfumato,
+    },
+    {
+      name = 'bust',
+      shape = path.new():circle(250, 382, 78, 58),
+      radii = { 8, 4, 3, 2 },
+      threshold = 0.02,
+      curvature = 0.5,
+      maximumLength = 10,
+      overrides = Sfumato,
+    },
+  }
+end
+
+--- What the painting is asked for: the default oil everywhere the regions are not.
+function Module.options(scale: number?): painter.PaintOptions
+  return {
+    radii = { 8, 4, 2 },
+    threshold = 0.055,
+    curvature = 0.45,
+    seed = 1503,
+    budget = 60000,
+    scale = scale or 2,
+    ground = '#5a4630',
+    preset = 'oil',
+    -- Less lightness jitter than the oil preset's: in Leonardo's deep shadows it reads as speckle.
+    overrides = { spacing = 0.12, aspect = 0.7, flow = 0.75, jitter = { hue = 0.03, lightness = 0.07, angle = 0.05, size = 0.08 } },
+    regions = Module.regions(),
+  }
+end
+
+--- Paints the reference: the finished canvas, its ground, and every pass.
+function Module.build(reference: magick.Image, scale: number?): painter.Painting
+  return painter.paint(reference, Module.options(scale))
+end
+
+return Module
