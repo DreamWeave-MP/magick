@@ -1,0 +1,191 @@
+--!strict
+-- The comparison and the report of the gallery, as pure functions of images and bytes, so that
+-- the package suite holds them and tools/gallery.jsl only reads files and writes them. A scene
+-- passes when its pixels, the bytes of its PNG and the baseline PNG's pixels and bytes all match
+-- what tests/scenes.jsl recorded; a difference names the first pixel it can, or the first byte
+-- where the geometry differs.
+local json = require '@jess/json'
+local magick = require '@magick'
+local support = require './support'
+
+type Image = support.Image
+
+export type Geometry = { width: number, height: number }
+
+--- The first pixel at which two images of the same geometry differ.
+export type Difference = { column: number, row: number, expected: { number }, observed: { number } }
+
+--- The first byte at which two buffers differ, or where the shorter one ends; a side past its end
+--- is nil.
+export type ByteDifference = { offset: number, expected: number?, observed: number? }
+
+--- The baseline file of a scene: its geometry when it decodes, and the fingerprints of its pixels
+--- and of its bytes, which must match what was recorded.
+export type Baseline = {
+  geometry: Geometry?,
+  pixels: string,
+  png: string,
+  matches: boolean,
+}
+
+--- One scene's comparison.
+export type Row = {
+  scene: string,
+  geometry: Geometry,
+  pixels: { expected: string, observed: string },
+  png: { expected: string, observed: string },
+  baseline: Baseline,
+  firstDifference: Difference?,
+  firstByte: ByteDifference?,
+  matches: boolean,
+}
+
+--- The report `report` writes, as a Luau table: what `json.decode` gives back.
+export type Runtime = { jess: string, verified: boolean }
+
+export type Report = {
+  failed: number,
+  runtime: Runtime,
+  scenes: { Row },
+}
+
+--- The first pixel at which two images of one geometry differ, in row order.
+local function firstPixel(expected: Image, observed: Image): Difference?
+  for row = 0, expected.height - 1 do
+    for column = 0, expected.width - 1 do
+      local offset = (row * expected.width + column) * 4
+
+      if buffer.readu32(expected.data, offset) ~= buffer.readu32(observed.data, offset) then
+        return {
+          column = column,
+          row = row,
+          expected = { expected:get(column, row) },
+          observed = { observed:get(column, row) },
+        }
+      end
+    end
+  end
+
+  return nil
+end
+
+--- The first byte at which two buffers differ, when they differ at all.
+local function firstByte(expected: buffer, observed: buffer): ByteDifference?
+  local shared = math.min(buffer.len(expected), buffer.len(observed))
+
+  for offset = 0, shared - 1 do
+    local expectedByte, observedByte = buffer.readu8(expected, offset), buffer.readu8(observed, offset)
+
+    if expectedByte ~= observedByte then
+      return { offset = offset, expected = expectedByte, observed = observedByte }
+    end
+  end
+
+  if buffer.len(expected) == buffer.len(observed) then return nil end
+
+  return {
+    offset = shared,
+    expected = if buffer.len(expected) > shared then buffer.readu8(expected, shared) else nil,
+    observed = if buffer.len(observed) > shared then buffer.readu8(observed, shared) else nil,
+  }
+end
+
+--- Compares a scene's render with what was recorded for it and with its baseline file. `png` is
+--- the render's encoded file; `baselineFile` is the baseline's bytes, or nil when there is none.
+local function compare(
+  name: string,
+  recorded: { [string]: string },
+  image: Image,
+  png: buffer,
+  baselineFile: buffer?
+): Row
+  local expectedPixels = recorded[`{name} pixels`] or 'unrecorded'
+  local expectedPng = recorded[`{name} png`] or 'unrecorded'
+  local observedPixels, observedPng = support.pixels(image), support.digest(png)
+  local baseline: Baseline = { geometry = nil, pixels = 'missing', png = 'missing', matches = false }
+  local difference, byteDifference = nil, nil
+
+  if baselineFile then
+    -- pcall only around the decode of a baseline file, which may be damaged: a file that will
+    -- not decode is recorded as missing, not raised.
+    local ok, decoded = pcall(magick.readPNG, baselineFile)
+
+    if ok then
+      local decodedImage = decoded :: Image
+      local baselinePixels = support.pixels(decodedImage)
+      local baselinePng = support.digest(baselineFile)
+
+      local found: Baseline = {
+        geometry = { width = decodedImage.width, height = decodedImage.height },
+        pixels = baselinePixels,
+        png = baselinePng,
+        matches = baselinePixels == expectedPixels and baselinePng == expectedPng,
+      }
+
+      baseline = found
+
+      if baselinePixels ~= observedPixels then
+        if decodedImage.width == image.width and decodedImage.height == image.height then
+          difference = firstPixel(decodedImage, image)
+        else
+          byteDifference = firstByte(decodedImage.data, image.data)
+        end
+      end
+    end
+  end
+
+  return {
+    scene = name,
+    geometry = { width = image.width, height = image.height },
+    pixels = { expected = expectedPixels, observed = observedPixels },
+    png = { expected = expectedPng, observed = observedPng },
+    baseline = baseline,
+    firstDifference = difference,
+    firstByte = byteDifference,
+    matches = observedPixels == expectedPixels and observedPng == expectedPng and baseline.matches,
+  }
+end
+
+--- The report of a run: its runtime, every row, and how many scenes failed. Keys are sorted and
+--- nothing in it depends on the time or the machine, so one runtime writes the same bytes.
+local function report(rows: { Row }, runtime: Runtime, failed: number): string
+  return json.encodeTable({ failed = failed, runtime = runtime, scenes = rows }, { indent = 2 })
+end
+
+--- The parts of a path, with separators of either kind, `.` and empty parts dropped, and `..`
+--- taken back where a part precedes it.
+local function parts(path: string): { string }
+  local out: { string } = {}
+
+  for part in string.gmatch(string.gsub(path, '\\', '/'), '[^/]+') do
+    if part == '.' then continue end
+
+    if part == '..' and #out > 0 and out[#out] ~= '..' then
+      table.remove(out)
+    else
+      table.insert(out, part)
+    end
+  end
+
+  return out
+end
+
+--- Whether `folder` is `base` or lies inside it, comparing the parts of the two paths as parts,
+--- so `tests/galleryx` is not inside `tests/gallery`.
+local function within(folder: string, base: string): boolean
+  local inner, outer = parts(folder), parts(base)
+
+  if #outer == 0 or #inner < #outer then return false end
+
+  for index, part in outer do
+    if inner[index] ~= part then return false end
+  end
+
+  return true
+end
+
+return table.freeze {
+  compare = compare,
+  report = report,
+  within = within,
+}
