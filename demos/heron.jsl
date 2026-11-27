@@ -98,56 +98,94 @@ local function build(width: number, height: number): scene.Document
     end
   end
 
-  -- The heron: a gray wash for its body, then ink for its neck, crown, beak and legs.
-  local heron = sheet:add(document:group { name = 'heron' })
-  local body = path.new()
-    :moveTo(380, 492)
-    :cubicTo(430, 462, 540, 488, 640, 600)
-    :cubicTo(600, 612, 560, 618, 520, 640)
-    :cubicTo(470, 660, 420, 650, 400, 620)
-    :cubicTo(378, 588, 368, 540, 380, 492)
-    :close()
+  -- The heron, drawn into a group by `figure` so it can be drawn twice: standing, and reflected in
+  -- the water at its feet.
+  local function figure(heron: scene.Node, seed: number)
+    -- The body: a full chest under the neck, a back sloping down to the tail, the belly rounding up
+    -- to the legs. A gray wash, then an ink contour heaviest along the back.
+    local body = path.new()
+      :moveTo(392, 500)
+      :cubicTo(440, 470, 548, 492, 628, 588)
+      :cubicTo(612, 600, 584, 606, 556, 614)
+      :cubicTo(520, 640, 468, 648, 430, 628)
+      :cubicTo(392, 610, 368, 570, 372, 536)
+      :cubicTo(374, 518, 382, 506, 392, 500)
+      :close()
 
-  heron:add(document:shape(body, { fill = paint.linear(400, 480, 600, 660, paint.stops(0, '#b4b4c0', 0.5, '#8a8a9a', 1, '#5a5a6a')), opacity = 0.8 }))
-  heron:add(document:stroke(art.samples(body, function(along: number): number
-    return 0.45 + 0.55 * math.sin(along * math.pi)
-  end), brush.preset('ink', 6, '#1c1a20'), { seed = 300 }))
+    heron:add(document:shape(body, { fill = paint.linear(400, 480, 600, 660, paint.stops(0, '#c4c4d0', 0.5, '#8e8ea0', 1, '#5c5c6e')), opacity = 0.85 }))
+    heron:add(document:stroke(art.samples(body, function(along: number): number
+      return 0.35 + 0.65 * math.sin(along * math.pi)
+    end), brush.preset('ink', 5, '#1c1a20'), { seed = seed }))
 
-  -- The folded wing and its long tail plumes, in quick lifting strokes.
-  for index = 0, 6 do
-    local startX, startY = 430 + index * 24, 520 + index * 9
-    local feather = path.new():moveTo(startX, startY):quadTo(startX + 60, startY + 20, startX + 120 - index * 6, startY + 56 - index * 2)
+    -- The folded wing, in quick lifting strokes, and the long plumes drooping off the tail.
+    for index = 0, 6 do
+      local startX, startY = 440 + index * 24, 520 + index * 9
+      local feather = path.new():moveTo(startX, startY):quadTo(startX + 60, startY + 20, startX + 116 - index * 6, startY + 54 - index * 2)
 
-    heron:add(document:stroke(art.samples(feather, function(along: number): number
-      return 0.9 - along * 0.8
-    end), brush.preset('ink', 3, '#2a2830'), { seed = 320 + index }))
+      heron:add(document:stroke(art.samples(feather, function(along: number): number
+        return 0.9 - along * 0.8
+      end), brush.preset('ink', 3, '#2a2830'), { seed = seed + 20 + index }))
+    end
+
+    for index = 0, 4 do
+      local plume = path.new():moveTo(600 - index * 6, 596 + index * 4):quadTo(640, 640 + index * 8, 652 - index * 10, 690 + index * 9)
+
+      heron:add(document:stroke(art.samples(plume, function(along: number): number
+        return 0.7 - along * 0.6
+      end), brush.preset('ink', 2.5, '#2a2830'), { seed = seed + 40 + index }))
+    end
+
+    -- The neck: an S that thickens toward the body, a pale fill inside an ink line down its front.
+    local neckLine = path.new():moveTo(398, 504):cubicTo(338, 462, 414, 410, 372, 368):cubicTo(360, 354, 346, 346, 336, 344)
+
+    heron:add(document:shape(neckLine:stroked { width = 15, cap = 'round', join = 'round' }, { fill = paint.linear(330, 340, 400, 500, paint.stops(0, '#d8d8e0', 1, '#a8a8b8')) }))
+    heron:add(document:stroke(art.samples(neckLine, function(along: number): number
+      return 0.5 + along * 0.5
+    end), brush.preset('ink', 5, '#1c1a20'), { seed = seed + 1 }))
+
+    -- The head: a narrow skull with its black crest swept back into two thin plumes, the dagger
+    -- beak, and the eye.
+    local head = path.new()
+      :moveTo(318, 338)
+      :cubicTo(322, 326, 344, 324, 352, 334)
+      :cubicTo(356, 344, 342, 352, 326, 350)
+      :cubicTo(318, 348, 316, 344, 318, 338)
+      :close()
+
+    heron:add(document:shape(head, { fill = paint.solid '#cfcfd8', stroke = paint.solid '#1c1a20', strokeStyle = { width = 1.6 } }))
+    heron:add(document:shape(path.new():moveTo(322, 333):cubicTo(332, 324, 348, 326, 354, 334):cubicTo(344, 331, 332, 331, 322, 336):close(), { fill = paint.solid '#1c1a20' }))
+    heron:add(document:stroke({ { 350, 333, 0.9 }, { 380, 330, 0.5 }, { 414, 340, 0.12 } }, brush.preset('ink', 3, '#1c1a20'), { seed = seed + 3 }))
+    heron:add(document:shape(path.new():moveTo(320, 336):lineTo(244, 350):lineTo(320, 346):close(), { fill = paint.linear(244, 348, 320, 340, paint.stops(0, '#8a6a30', 1, '#d8b060')), stroke = paint.solid '#2a2010', strokeStyle = { width = 0.8 } }))
+    heron:add(document:shape(path.new():circle(332, 338, 2.4), { fill = paint.solid '#f0e0a0', stroke = paint.solid '#1c1a20', strokeStyle = { width = 0.8 } }))
+
+    -- The legs: thighs hidden in the belly, shins to the heel joint (which a heron's leg bends back
+    -- at), then the long tarsus to the foot and its splayed toes.
+    for index, leg in { { 452, 636, 462, 744, 448, 872 }, { 482, 634, 506, 740, 494, 868 } } do
+      local line = path.new():moveTo(leg[1], leg[2]):lineTo(leg[3], leg[4]):lineTo(leg[5], leg[6])
+
+      heron:add(document:stroke(art.samples(line), brush.preset('ink', 4, '#1c1a20'), { seed = seed + 10 + index }))
+      heron:add(document:shape(path.new():circle(leg[3], leg[4], 3.4), { fill = paint.solid '#1c1a20' }))
+
+      for _, toe in { -16, 4, 18 } do
+        heron:add(document:stroke({ { leg[5], leg[6], 0.8 }, { leg[5] + toe, leg[6] + 6, 0.3 } }, brush.preset('ink', 2.5, '#1c1a20'), { seed = seed + 14 + index }))
+      end
+    end
   end
 
-  for index = 0, 3 do
-    local plume = path.new():moveTo(600, 596 + index * 5):quadTo(650, 620 + index * 6, 690 - index * 8, 660 + index * 10)
+  figure(sheet:add(document:group { name = 'heron' }), 300)
 
-    heron:add(document:stroke(art.samples(plume, function(along: number): number
-      return 0.7 - along * 0.6
-    end), brush.preset('ink', 3, '#2a2830'), { seed = 340 + index }))
-  end
+  -- Its reflection: the same heron turned over the water line at its feet, faint and softened, and
+  -- only below the line, where the water is.
+  local waterLine = 874
+  local reflection = sheet:add(document:group {
+    name = 'reflection',
+    transform = transform.compose(transform.translate(0, 2 * waterLine), transform.scale(1, -1)),
+    opacity = 0.22,
+    filters = { { kind = 'blur', radius = 1.5 } },
+    clip = { path = path.new():rect(300, 330, 720, waterLine - 2) },
+  })
 
-  local neck = path.new():moveTo(384, 492):cubicTo(330, 450, 410, 400, 368, 352):cubicTo(350, 333, 330, 330, 322, 338)
-
-  heron:add(document:stroke(art.samples(neck, function(along: number): number
-    return 1 - along * 0.4
-  end), brush.preset('ink', 9, '#1c1a20'), { seed = 301 }))
-
-  local beak = { { 330, 334, 0.9 }, { 280, 344, 0.6 }, { 238, 352, 0.2 } }
-
-  heron:add(document:stroke(beak, ink, { seed = 302 }))
-  heron:add(document:stroke({ { 338, 328, 1 }, { 372, 322, 0.6 }, { 410, 334, 0.15 } }, brush.preset('ink', 4, '#1c1a20'), { seed = 303 }))
-  heron:add(document:shape(path.new():circle(334, 334, 2.6), { fill = paint.solid '#f0e0a0' }))
-
-  for index, leg in { { 446, 640, 456, 760, 444, 880 }, { 476, 640, 498, 752, 490, 874 } } do
-    local line = path.new():moveTo(leg[1], leg[2]):quadTo(leg[3], leg[4], leg[5], leg[6])
-
-    heron:add(document:stroke(art.samples(line), brush.preset('ink', 4, '#1c1a20'), { seed = 310 + index }))
-  end
+  figure(reflection, 500)
 
   -- Ripples about its legs, broken and thinning out.
   for index, place in art.scatter(9, 14, { 380, 872, 560, 940 }) do
