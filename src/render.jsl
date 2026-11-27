@@ -145,9 +145,13 @@ local function finite(value: number): boolean
   return value == value and value > -math.huge and value < math.huge
 end
 
---- The kernel half-width of a gaussian of standard deviation `radius`: three deviations.
+--- How far a blur of deviation `radius` reads: three box passes of its box radius.
 local function reach(radius: number): number
-  return math.ceil(3 * radius)
+  if radius <= 0 then return 0 end
+
+  local size = math.max(1, math.floor((math.sqrt(4 * radius * radius + 1) - 1) / 2 + 0.5))
+
+  return 3 * size
 end
 
 --- How far a group's filters read beyond what they write.
@@ -509,72 +513,93 @@ function Module.dump(handle: Plan): string
   return table.concat(lines, '\n')
 end
 
---- Gaussian weights for a radius, normalized to sum to 1, from offset 0 to the reach.
-local function kernel(radius: number): { number }
-  local size = reach(radius)
-  local weights = table.create(size + 1) :: { number }
-  local total = 0
-
-  for offset = 0, size do
-    weights[offset + 1] = math.exp(-offset * offset / (2 * radius * radius))
-    total += weights[offset + 1] * (if offset == 0 then 1 else 2)
-  end
-
-  for offset = 0, size do
-    weights[offset + 1] /= total
-  end
-
-  return weights
+--- The box radius of each of three passes that approximate a gaussian of deviation `radius`: three
+--- boxes of width w have variance (w^2 - 1) / 4, set equal to radius^2.
+local function boxRadius(radius: number): number
+  return math.max(1, math.floor((math.sqrt(4 * radius * radius + 1) - 1) / 2 + 0.5))
 end
 
---- Blurs `channels` (0..3, four bytes apart from `first`) of a tile in place, separably, with
---- nothing beyond its edges. `scratch` holds one tile.
+--- Values are blurred as whole multiples of 2^-20, so every sum is exact and a pixel's result does
+--- not depend on where the sums began: the same bytes in any tile whose halo covers its reach.
+local Quantum = 1048576
+
+--- Three box passes of radius `size` over `count` values from `line`, nothing beyond either end:
+--- each value becomes the rounded mean of the 2 * size + 1 around it.
 @native
-local function blurTile(tile: Tile, radius: number, scratch: buffer, onlyAlpha: boolean)
-  local weights = kernel(radius)
-  local size = #weights - 1
-  local width, height, data = tile.width, tile.height, tile.data
-  local first = if onlyAlpha then 12 else 0
+local function boxPasses(line: { number }, spare: { number }, count: number, size: number)
+  local width = 2 * size + 1
+  local half = width // 2
+  local from, to = line, spare
 
-  for row = 0, height - 1 do
-    for column = 0, width - 1 do
-      for channel = first, 12, 4 do
-        local total = 0
+  for _ = 1, 3 do
+    local total = 0
 
-        for offset = -size, size do
-          local at = column + offset
-
-          if at >= 0 and at < width then
-            total += buffer.readf32(data, ((row * width) + at) * 16 + channel) * weights[math.abs(offset) + 1]
-          end
-        end
-
-        buffer.writef32(scratch, (row * width + column) * 16 + channel, total)
-      end
+    for index = 1, math.min(size, count) do
+      total += from[index]
     end
+
+    for index = 1, count do
+      local entering, leaving = index + size, index - size - 1
+
+      if entering <= count then total += from[entering] end
+      if leaving >= 1 then total -= from[leaving] end
+
+      to[index] = (total + half) // width
+    end
+
+    from, to = to, from
   end
 
-  for row = 0, height - 1 do
+  -- Three passes leave the result in `spare`; bring it back.
+  for index = 1, count do
+    line[index] = from[index]
+  end
+end
+
+--- Blurs a tile in place, approximately as a gaussian of deviation `radius`, by three box passes
+--- along rows and then three along columns, with nothing beyond its edges; only alpha with
+--- `onlyAlpha`.
+@native
+local function blurTile(tile: Tile, radius: number, onlyAlpha: boolean)
+  local size = boxRadius(radius)
+  local width, height, data = tile.width, tile.height, tile.data
+  local first = if onlyAlpha then 12 else 0
+  local line = table.create(math.max(width, height), 0) :: { number }
+  local spare = table.create(math.max(width, height), 0) :: { number }
+
+  for channel = first, 12, 4 do
+    for row = 0, height - 1 do
+      local base = row * width * 16 + channel
+
+      for column = 0, width - 1 do
+        line[column + 1] = math.floor(buffer.readf32(data, base + column * 16) * Quantum + 0.5)
+      end
+
+      boxPasses(line, spare, width, size)
+
+      for column = 0, width - 1 do
+        buffer.writef32(data, base + column * 16, line[column + 1])
+      end
+    end
+
     for column = 0, width - 1 do
-      for channel = first, 12, 4 do
-        local total = 0
+      local base = column * 16 + channel
 
-        for offset = -size, size do
-          local at = row + offset
+      for row = 0, height - 1 do
+        line[row + 1] = buffer.readf32(data, base + row * width * 16)
+      end
 
-          if at >= 0 and at < height then
-            total += buffer.readf32(scratch, ((at * width) + column) * 16 + channel) * weights[math.abs(offset) + 1]
-          end
-        end
+      boxPasses(line, spare, height, size)
 
-        buffer.writef32(data, (row * width + column) * 16 + channel, total)
+      for row = 0, height - 1 do
+        buffer.writef32(data, base + row * width * 16, line[row + 1] / Quantum)
       end
     end
   end
 end
 
 --- Lays a blurred, offset, colored copy of a tile's alpha under it, in place.
-local function shadowTile(tile: Tile, filter: scene.Filter, scratch: buffer, shade: buffer)
+local function shadowTile(tile: Tile, filter: scene.Filter, shade: buffer)
   if filter.kind ~= 'shadow' then return end
 
   local width, height = tile.width, tile.height
@@ -594,7 +619,7 @@ local function shadowTile(tile: Tile, filter: scene.Filter, scratch: buffer, sha
     end
   end
 
-  if filter.radius > 0 then blurTile(alphaOnly, filter.radius, scratch, true) end
+  if filter.radius > 0 then blurTile(alphaOnly, filter.radius, true) end
 
   for at = 0, width * height * 16 - 16, 16 do
     local cover = buffer.readf32(shade, at + 12)
@@ -657,13 +682,11 @@ local runOps: (plan: Compiled, ops: { Op }, base: Tile, pool: Pool, depth: numbe
 --- blend as it is laid onto the tile below.
 local function finishGroup(plan: Compiled, op: Op, group: Tile, parent: Tile, pool: Pool, depth: number)
   if #op.filters > 0 then
-    local scratch = buffer.create(buffer.len(group.data))
-
     for _, filter in op.filters do
       if filter.kind == 'blur' then
-        if filter.radius > 0 then blurTile(group, filter.radius, scratch, false) end
+        if filter.radius > 0 then blurTile(group, filter.radius, false) end
       else
-        shadowTile(group, filter, scratch, buffer.create(buffer.len(group.data)))
+        shadowTile(group, filter, buffer.create(buffer.len(group.data)))
       end
     end
   end
@@ -959,7 +982,7 @@ local function renderParallel(plan: Compiled, grid: Grid, output: magick.Image, 
 end
 
 --- The bytes a render needs at most (RFC-0001 B3): each working set, which is a tile for the base
---- and one for each group level (each widened by the largest halo) and a tile of filter scratch;
+--- and one for each group level (each widened by the largest halo) and a tile of shadow scratch;
 --- and the output image. A parallel render adds, per worker, its copy of the plan and the tile
 --- bytes that may wait in its queues.
 function Module.workingBytes(handle: Plan, tileSize: number, workers: number?): number

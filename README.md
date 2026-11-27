@@ -1,4 +1,4 @@
-# @magick 0.2.0
+# @magick 0.3.0
 
 Pure-Luau raster toolkit for Jess. Backward-compatible with the 0.1.0 Morrowind generator surface while adding PNG/BMP/TGA I/O, atlas operations, image-processing math, gradients, masking, blur/shadow, grayscale/threshold/colorize, and the H3/H3UI dependency cone.
 
@@ -8,6 +8,75 @@ What 0.1.x promises consumers, and what it keeps as it always did, is in [COMPAT
 
 The renderer design for 0.2.0 (coordinates, transforms, premultiplied working tiles, compositing and the API boundaries) is proposed for ratification by review in [RFC-0001](docs/RFC-0001-renderer.md), with its checked sketches in `docs/rfc/sketches/`.
 
+## 0.3.0 changes
+
+A retained canvas: scenes compiled once and rendered tile by tile, on one worker or several, the same bytes either way.
+The showcase, [Valley at First Light](demos/valley.jsl), is 5,941 nodes drawn from a 3840 by 2160 design space at any
+size; `gallery/valley.png` is its 960 by 540 render, held to a record by `tools/demos.jsl`.
+
+![Valley at First Light](gallery/valley.png)
+
+### `@magick/scene`
+
+`scene.new(width, height, { background?, space?, seed? })` makes a document with a root group. Nodes are made by the
+document and placed with `group:add(node, index?)`, `document:add(node)`, `node:remove()`, `node:reorder(index)` and
+`node:set { transform?, opacity?, blend?, name? }`. Ids follow the order nodes are made in; children keep the order they
+were added in, never a table's.
+
+- `document:shape(path, { fill?, fillRule?, stroke?, strokeStyle?, transform?, opacity?, blend?, name? })`. One path
+  and one paint can serve any number of nodes. A shape with both paints and an opacity or blend is one isolated layer.
+- `document:image(image, { transform?, sampling?, ... })`: a legacy `Image` placed by a matrix.
+- `document:group { transform?, opacity?, blend?, clip = { path, fillRule? }?, mask = { node, kind? }?, filters? }`:
+  children draw into an isolated tile, which is filtered, clipped, masked (by the mask node's `alpha` or `luminance`),
+  faded once, and laid on by its blend. Filters are `{ kind = 'blur', radius }`, three exact integer box passes
+  approximating a gaussian of that deviation, and `{ kind = 'shadow', radius, offsetX, offsetY, color }`, with offsets
+  rounded to whole pixels. A filter sees only what lies on the canvas.
+- Refusals: cycles, a node of another document, a second parent, a mask node as a child, `MaxDepth` 32, `MaxNodes`
+  65536, unknown options, filters and kinds, out-of-range opacities, radii past 21, and shadow offsets past 64.
+
+### `@magick/render`
+
+- `render.compile(document, { tolerance? })` makes an immutable plan: every path flattened and sorted in device space,
+  every paint moved into device space, every group framed with its device box and its filters' halo (at most
+  `MaxHaloPx` 64). Later edits to the document, its paths or its nodes do not change a compiled plan. Empty groups are
+  left out. `render.dump(plan)` lists the operations with their boxes and marks those off the canvas.
+- `render.image(plan or document, { tileSize?, reference?, region?, into?, memoryBudgetBytes?, workers?, cancel? })`
+  renders row-major tiles (128 by default, at most 256) and returns the image and its stats: tiles, candidates,
+  rendered, skipped, groups, and the peak working-tile bytes. Operations whose box misses a tile are skipped, a missed
+  group whole. `reference` renders the canvas as one tile. `region` with `into` redraws only the tiles a box meets.
+  The working-set bound is refused before any tile runs when it passes the budget (512 MiB by default).
+- **Parity**: the bytes are the same at every tile size (tests at 1, 7, 16, 37, 64, 128 and 256, and the reference)
+  and on any number of workers.
+- **Workers** (`workers = n`, at most `MaxWorkers` 8, or `auto`): each worker gets the plan once and batches of tiles
+  in turn, and every reply is stitched into its own place. `auto` uses 4 for renders of at least 512 by 512 when the
+  runtime may spawn workers, and 1 otherwise. Workers need a ScriptDomain, so `jess run` and `jess package test`
+  render on one; `jess package run --capability worker.spawn --target workers-check .` holds 2, 4 and 8 workers to
+  the 1-worker bytes, and a cancel to stopping the render.
+
+### Saved scenes
+
+`scene.save(document)` writes versioned JSON (`format = 'magick.scene'`, `version = 1`) with sorted keys, so the same
+document always gives the same, diffable text. Paths save their retained commands, paints their parameters and stops
+as `#rrggbbaa`, and images as base64 assets with a CRC-32, each saved once. `scene.load(text)` reads it as untrusted
+input and refuses, by name: another format, a later version, unknown fields or kinds, invalid JSON, out-of-range
+numbers, unknown path commands, mismatched assets, duplicate ids, depth past `MaxDepth`, and text past `MaxSceneBytes`
+(64 MiB). A checksum says only that bytes arrived as saved, so an asset must also name `straight8` (sRGB) or
+`premultiplied32` (sRGB or linear), and every premultiplied pixel must hold finite values with alpha in 0..1 and each
+color in 0..alpha (within 2^-20 for f32 rounding). The root is a group like any other: its name, clip, mask and
+filters load back, and `save(load(save(document)))` is the same text (forty seeded documents hold this).
+`tests/replay.jsl` is a committed saved scene held to its rendered bytes.
+
+### Measured (this machine: i7-10870H, 16 threads, jess 0.4.0 verified release)
+
+| Render | Time | Peak RSS |
+|---|---|---|
+| Valley 960 by 540, 1 worker (`tools/demos.jsl`) | 3.0 s | |
+| Valley 3840 by 2160, 1 worker (`jess run`) | 32.9 s | 222 MB (33 MB of it the output image) |
+| Valley 3840 by 2160, 1 then 4 workers (`--target showcase`) | 33.3 s, then 10.2 s | 710 MB for the whole run |
+
+Each 128 tile's working set peaked at 1.8 MB across the base and its group levels. The output image is a whole-image
+RGBA8 buffer, which is the output-memory floor; there is no streaming encode in 0.3.0.
+
 ## 0.2.0 changes
 
 Two demos drawn only through the public API, rendered and checked byte for byte by `tools/demos.jsl` (records in
@@ -15,7 +84,7 @@ Two demos drawn only through the public API, rendered and checked byte for byte 
 
 | [Lighthouse at Dusk](demos/lighthouse.jsl) | [Rosette](demos/rosette.jsl) |
 |---|---|
-| ![Lighthouse at Dusk](demos/renders/lighthouse.png) | ![Rosette](demos/renders/rosette.png) |
+| ![Lighthouse at Dusk](gallery/lighthouse.png) | ![Rosette](gallery/rosette.png) |
 
 Everything below is opt-in. A caller who uses only 0.1.x names gets the bytes 0.1.3 gave, except for the owner-approved
 `Path:transformed` change recorded in [COMPATIBILITY.md](COMPATIBILITY.md#owner-approved-changes).

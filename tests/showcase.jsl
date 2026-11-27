@@ -1,0 +1,31 @@
+--!strict
+-- The 0.3.0 showcase at 4K (MAG-027): "Valley at First Light" compiled once and rendered at
+-- 3840 by 2160 on one worker and on four, timed, and held to the same bytes. An application target,
+-- since workers need a ScriptDomain:
+--
+--   jess package run --capability worker.spawn --target showcase .
+local application = require '@jess/application'
+local bytes = require '@dream/bytes'
+local render = require '@magick/render'
+local valley = require '../demos/valley'
+
+local started = os.clock()
+local plan = render.compile(valley.build(3840, 2160))
+local compiled = os.clock() - started
+
+print(`showcase: {plan.width}x{plan.height}, {plan.nodes} nodes, {plan.operations} operations, compiled in {string.format('%.2f', compiled)} s`)
+
+local results: { string } = {}
+
+for _, workers in { 1, 4 } do
+  local began = os.clock()
+  local image, stats = render.image(plan, { tileSize = 128, workers = workers })
+  local seconds = os.clock() - began
+  local digest = `{image.width}x{image.height}:{string.format('%08x', bytes.crc32(image.data))}`
+
+  table.insert(results, digest)
+  print(`workers {workers}: {string.format('%.2f', seconds)} s, {stats.tiles} tiles, {digest}`)
+end
+
+print(if results[1] == results[2] then 'same bytes on one worker and four' else 'DIFFERENT BYTES')
+application.exit(if results[1] == results[2] then 0 else 1)

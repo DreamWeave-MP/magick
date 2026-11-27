@@ -1,0 +1,316 @@
+--!strict
+-- "Valley at First Light", the 0.3.0 showcase: a retained scene of thousands of nodes rendered tile
+-- by tile. Layered sky and sun, clouds blurred in groups, ridges fading into haze through gradient
+-- masks, a lake holding the mountains' blurred mirror image, three thousand pines drawn from one
+-- reused path, a meadow textured by an image pattern, grass, flowers and light shafts. Built in a
+-- 3840 by 2160 design space and scaled by the root transform, so it renders at any size from the
+-- same source. Deterministic. Rendered and checked by tools/demos.jsl; at 4K by tools/showcase.jsl.
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+
+local DesignWidth, DesignHeight = 3840, 2160
+local Horizon = 1290
+
+--- The low 32 bits of a product of two 32-bit integers, exact: f64 holds a 16 by 32-bit product.
+local function multiply(first: number, second: number): number
+  local high, low = bit32.rshift(first, 16), bit32.band(first, 0xffff)
+
+  return (bit32.lshift((high * second) % 65536, 16) + low * second) % 4294967296
+end
+
+--- A value in 0..1 from an index and a salt, by the murmur3 finalizer over both.
+local function hashed(index: number, salt: number): number
+  local value = bit32.bxor(multiply(index % 4294967296, 0x9e3779b1), multiply(salt % 4294967296, 0x85ebca77))
+
+  value = multiply(bit32.bxor(value, bit32.rshift(value, 16)), 0x85ebca6b)
+  value = multiply(bit32.bxor(value, bit32.rshift(value, 13)), 0xc2b2ae35)
+  value = bit32.bxor(value, bit32.rshift(value, 16))
+
+  return value / 4294967296
+end
+
+--- A ridge height at x: a sum of sines with hashed phases.
+local function ridgeAt(across: number, salt: number, roughness: number): number
+  local rise = 0
+
+  for octave = 1, 6 do
+    local phase = hashed(octave, salt) * 2 * math.pi
+    local frequency = octave ^ 1.7 * 0.0011 * (1 + hashed(octave + 10, salt))
+
+    rise += math.sin(across * frequency + phase) / octave ^ roughness
+  end
+
+  return rise
+end
+
+--- The silhouette under a ridge line, down to `floor`.
+local function ridge(salt: number, base: number, height: number, roughness: number, floor: number): path.Path
+  local outline = path.new():moveTo(-40, floor)
+
+  for step = 0, 200 do
+    local across = -40 + step * 20
+
+    outline:lineTo(across, base - height * (0.55 + 0.45 * ridgeAt(across, salt, roughness)))
+  end
+
+  return outline:lineTo(DesignWidth + 40, floor):close()
+end
+
+--- A vertical fade mask over the design space: transparent above `from`, opaque below `to`.
+local function fade(document: scene.Document, from: number, to: number, reverse: boolean?): scene.Node
+  local stops = if reverse then paint.stops(0, '#ffffffff', 1, '#ffffff00') else paint.stops(0, '#ffffff00', 1, '#ffffffff')
+
+  return document:shape(path.new():rect(-100, -100, DesignWidth + 100, DesignHeight + 100), { fill = paint.linear(0, from, 0, to, stops) })
+end
+
+--- A procedural grass texture as a legacy image: streaks of green, for an image pattern.
+local function grassTexture(): magick.Image
+  local size = 64
+  local image = magick.new(size, size, '#3d6b2a')
+
+  for index = 1, 220 do
+    local across, down = math.floor(hashed(index, 81) * size), math.floor(hashed(index, 82) * size)
+    local length = 3 + math.floor(hashed(index, 83) * 7)
+    local light = 40 + math.floor(hashed(index, 84) * 80)
+
+    for step = 0, length - 1 do
+      image:set((across + step // 3) % size, (down - step) % size, 40 + light // 2, 90 + light, 30 + light // 3, 255)
+    end
+  end
+
+  return image
+end
+
+--- Builds the scene at `width` by `height` pixels.
+local function build(width: number, height: number): scene.Document
+  local document = scene.new(width, height, { background = '#0b1530', space = 'linear', seed = 1290 })
+  local world = document:add(document:group { name = 'world' })
+
+  -- The design space is scaled to the output by a group's transform, so every node is placed once.
+  world:set { transform = transform.scale(width / DesignWidth, height / DesignHeight) }
+
+  -- Sky.
+  world:add(document:shape(path.new():rect(0, 0, DesignWidth, Horizon + 20), {
+    name = 'sky',
+    fill = paint.linear(0, 0, 0, Horizon, paint.stops(
+      0, '#0d1b3d',
+      0.35, '#284a86',
+      0.62, '#7a86b8',
+      0.82, '#e8b8a0',
+      0.95, '#ffd9a6',
+      1, '#fff0c8'
+    )),
+  }))
+
+  -- The sun just risen behind the right-hand ridge, and its glow.
+  local sunX, sunY = 2750, Horizon - 420
+
+  world:add(document:shape(path.new():circle(sunX, sunY, 1600), {
+    name = 'glow',
+    fill = paint.radial(sunX, sunY, 1600, paint.stops(0, '#fff4d0c0', 0.12, '#ffe0a070', 0.4, '#f0a08020', 1, '#f0a08000')),
+    blend = 'screen',
+  }))
+  world:add(document:shape(path.new():circle(sunX, sunY, 70), { name = 'sun', fill = paint.radial(sunX, sunY, 70, paint.stops(0, '#ffffff', 0.7, '#fff8e0', 1, '#ffe8b0')) }))
+
+  -- Clouds: puffs of overlapping ellipses in three blurred bands, lit from the sun's side.
+  for band = 0, 2 do
+    local clouds = world:add(document:group {
+      name = `clouds {band}`,
+      opacity = 0.3 + band * 0.12,
+      filters = { { kind = 'blur', radius = 7 - band * 2 } },
+    })
+
+    for index = 1, 12 do
+      local salt = band * 100 + index
+      local centerX, centerY = hashed(salt, 1) * DesignWidth, 160 + band * 210 + hashed(salt, 2) * 120
+      local puff = path.new()
+
+      for lobe = 0, 6 do
+        local spreadX = (hashed(salt * 10 + lobe, 3) - 0.5) * 300
+        local size = 30 + hashed(salt * 10 + lobe, 4) * 55
+
+        puff:circle(centerX + spreadX, centerY - size * 0.3, size * 1.6, size * 0.75)
+      end
+
+      local lit = paint.linear(centerX + 300, centerY - 120, centerX - 300, centerY + 80, paint.stops(0, '#fff0e4', 0.55, '#e0d4e4', 1, '#9a94b8'))
+
+      clouds:add(document:shape(puff, { fill = lit }))
+    end
+  end
+
+  -- ridges, far to near, each faded into the haze at its foot through a gradient mask.
+  local ridges = {
+    { salt = 11, base = 1100, height = 260, roughness = 1.0, top = '#8a90b8', bottom = '#c8b8c8' },
+    { salt = 12, base = 1190, height = 200, roughness = 1.2, top = '#5a6490', bottom = '#9898b0' },
+    { salt = 13, base = 1265, height = 140, roughness = 1.5, top = '#2e3a5c', bottom = '#56607e' },
+  }
+  local mountains = world:add(document:group { name = 'mountains' })
+
+  for _, layer in ridges do
+    local shape = ridge(layer.salt, layer.base, layer.height, layer.roughness, Horizon + 2)
+    local hazed = mountains:add(document:group {
+      name = `ridge {layer.salt}`,
+      mask = { node = fade(document, Horizon + 320, layer.base - layer.height * 1.2, false), kind = 'alpha' },
+    })
+
+    hazed:add(document:shape(shape, { fill = paint.linear(0, layer.base - layer.height, 0, Horizon, paint.stops(0, layer.top, 1, layer.bottom)) }))
+  end
+
+  -- The far forest: pines along the nearest ridge, one path reused for every tree.
+  local pine = path.new()
+    :moveTo(0, -1)
+    :lineTo(0.35, -0.55)
+    :lineTo(0.2, -0.57)
+    :lineTo(0.5, -0.15)
+    :lineTo(0.3, -0.17)
+    :lineTo(0.6, 0.18)
+    :lineTo(0.07, 0.16)
+    :lineTo(0.07, 0.3)
+    :lineTo(-0.07, 0.3)
+    :lineTo(-0.07, 0.16)
+    :lineTo(-0.6, 0.18)
+    :lineTo(-0.3, -0.17)
+    :lineTo(-0.5, -0.15)
+    :lineTo(-0.2, -0.57)
+    :lineTo(-0.35, -0.55)
+    :close()
+  local forest = world:add(document:group { name = 'forest' })
+
+  for index = 1, 3000 do
+    local depth = hashed(index, 51)
+    local across = hashed(index, 52) * (DesignWidth + 200) - 100
+    local ground = 1265 - 140 * (0.55 + 0.45 * ridgeAt(across, 13, 1.5)) + depth * 90
+    local size = 14 + depth * 46 * (0.7 + 0.6 * hashed(index, 53))
+    local shade = 0.35 + depth * 0.5
+    local tint = string.format('#%02x%02x%02x', math.floor(30 * shade), math.floor(52 * shade + 10), math.floor(60 * shade + 18))
+
+    if ground > Horizon + 30 then continue end
+
+    forest:add(document:shape(pine, {
+      transform = transform.compose(transform.translate(across, ground), transform.scale(size * 0.8, size)),
+      fill = paint.solid(tint),
+    }))
+  end
+
+  -- The lake: the mountains again, mirrored about the shore, blurred and darkened, under a sheen.
+  local lake = world:add(document:group {
+    name = 'lake',
+    clip = { path = path.new():rect(0, Horizon, DesignWidth, 1820) },
+  })
+
+  lake:add(document:shape(path.new():rect(0, Horizon, DesignWidth, 1820), {
+    fill = paint.linear(0, Horizon, 0, 1820, paint.stops(0, '#c8b0b8', 0.3, '#6a6a90', 1, '#1a2440')),
+  }))
+
+  local mirror = lake:add(document:group {
+    name = 'reflection',
+    transform = transform.compose(transform.translate(0, 2 * Horizon), transform.scale(1, -1)),
+    opacity = 0.55,
+    filters = { { kind = 'blur', radius = 3 } },
+  })
+
+  for _, layer in ridges do
+    mirror:add(document:shape(ridge(layer.salt, layer.base, layer.height, layer.roughness, Horizon + 2), {
+      fill = paint.linear(0, layer.base - layer.height, 0, Horizon, paint.stops(0, layer.top, 1, layer.bottom)),
+    }))
+  end
+
+  for index = 1, 160 do
+    local depth = (index / 160) ^ 1.6
+    local down = Horizon + 8 + depth * 420
+    local start = hashed(index, 61) * DesignWidth
+    local length = 80 + hashed(index, 62) * 500 * (0.3 + depth)
+    local ripple = path.new():moveTo(start, down):lineTo(start + length, down)
+
+    lake:add(document:shape(ripple, {
+      stroke = paint.solid('#fff4e0', { opacity = 0.12 + 0.2 * (1 - depth) }),
+      strokeStyle = { width = 1.2 + depth * 3, cap = 'round' },
+      blend = 'screen',
+    }))
+  end
+
+  -- The meadow: rolling ground textured by an image pattern laid on by multiply.
+  local meadowShape = path.new():moveTo(-40, 1700)
+
+  for step = 0, 40 do
+    local across = -40 + step * 100
+
+    meadowShape:lineTo(across, 1680 - 60 * ridgeAt(across, 21, 1.4))
+  end
+
+  meadowShape:lineTo(DesignWidth + 40, DesignHeight + 10):lineTo(-40, DesignHeight + 10):close()
+
+  local meadow = world:add(document:group { name = 'meadow' })
+
+  meadow:add(document:shape(meadowShape, { fill = paint.linear(0, 1600, 0, DesignHeight, paint.stops(0, '#6a9a48', 0.5, '#3a6a2a', 1, '#16301a')) }))
+  meadow:add(document:shape(meadowShape, {
+    fill = paint.pattern(grassTexture(), { transform = transform.scale(6), edge = 'repeat', sampling = 'bilinear', opacity = 0.7 }),
+    blend = 'soft-light',
+  }))
+
+  -- Grass blades and flowers in the foreground, larger toward the bottom.
+  local blades = meadow:add(document:group { name = 'grass' })
+
+  for index = 1, 2400 do
+    local depth = hashed(index, 71)
+    local across = hashed(index, 72) * DesignWidth
+    local root = 1720 + depth * 470
+    local tall = 20 + depth * 70 * (0.6 + hashed(index, 73))
+    local lean = (hashed(index, 74) - 0.35) * tall * 0.6
+    local blade = path.new():moveTo(across, root):quadTo(across + lean * 0.2, root - tall * 0.6, across + lean, root - tall)
+    local tone = 0.4 + depth * 0.6
+
+    blades:add(document:shape(blade, {
+      stroke = paint.linear(across, root, across, root - tall, paint.stops(
+        0, string.format('#%02x%02x%02x', math.floor(20 * tone), math.floor(60 * tone), math.floor(24 * tone)),
+        1, string.format('#%02x%02x%02x', math.floor(120 * tone), math.floor(190 * tone), math.floor(80 * tone))
+      )),
+      strokeStyle = { width = 1.5 + depth * 3, cap = 'round', join = 'round' },
+    }))
+  end
+
+  local petals = { '#ffe066', '#ff7aa8', '#ffffff', '#c890ff' }
+
+  for index = 1, 420 do
+    local depth = hashed(index, 91)
+    local across, down = hashed(index, 92) * DesignWidth, 1740 + depth * 420
+    local size = 3 + depth * 9
+    local hue = petals[math.floor(hashed(index, 93) * #petals) + 1]
+
+    blades:add(document:shape(path.new():circle(across, down, size), {
+      fill = paint.radial(across - size * 0.3, down - size * 0.3, size * 1.2, paint.stops(0, '#ffffff', 0.4, hue, 1, hue)),
+    }))
+  end
+
+  -- Shafts of light from the sun, soft and laid on by screen.
+  local shafts = world:add(document:group { name = 'shafts', filters = { { kind = 'blur', radius = 14 } }, opacity = 0.5 })
+
+  for index = 1, 7 do
+    local angle = math.pi * (0.62 + index * 0.05 + (hashed(index, 101) - 0.5) * 0.02)
+    local spread = 0.012 + hashed(index, 102) * 0.02
+    local reach = 2600
+
+    shafts:add(document:shape(path.new():polygon {
+      { sunX, sunY },
+      { sunX + math.cos(angle - spread) * reach, sunY + math.sin(angle - spread) * reach },
+      { sunX + math.cos(angle + spread) * reach, sunY + math.sin(angle + spread) * reach },
+    }, {
+      fill = paint.linear(sunX, sunY, sunX + math.cos(angle) * reach, sunY + math.sin(angle) * reach, paint.stops(0, '#fff2d080', 1, '#fff2d000')),
+      blend = 'screen',
+    }))
+  end
+
+  -- Vignette.
+  world:add(document:shape(path.new():rect(0, 0, DesignWidth, DesignHeight), {
+    name = 'vignette',
+    fill = paint.radial(DesignWidth / 2, DesignHeight * 0.45, DesignWidth * 0.62, paint.stops(0, '#ffffff', 0.62, '#ffffff', 1, '#706878')),
+    blend = 'multiply',
+  }))
+
+  return document
+end
+
+return { name = 'valley', build = build, designWidth = DesignWidth, designHeight = DesignHeight }
