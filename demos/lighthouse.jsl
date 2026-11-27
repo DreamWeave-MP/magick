@@ -1,0 +1,308 @@
+--!strict
+-- "Lighthouse at Dusk", a vector poster drawn only through @magick's public 0.2.0 API: layered
+-- gradients in linear light, a hashed starfield, a crescent moon cut from an isolated group, ridges
+-- fading into haze, a shimmering sea, a striped tower and its beams. Deterministic: the same source
+-- gives the same bytes. Rendered, written and checked by tools/demos.jsl, from the package folder:
+--
+--   jess run --package . --capability filesystem.read --capability filesystem.write tools/demos.jsl
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local transform = require '@magick/transform'
+
+local Width, Height = 900, 1200
+local Horizon = 770
+
+--- The low 32 bits of a product of two 32-bit integers, exact: f64 holds a 16 by 32-bit product.
+local function multiply(first: number, second: number): number
+  local high, low = bit32.rshift(first, 16), bit32.band(first, 0xffff)
+
+  return (bit32.lshift((high * second) % 65536, 16) + low * second) % 4294967296
+end
+
+--- A value in 0..1 from an index and a salt, by the murmur3 finalizer over both: the same pair
+--- always gives the same value, and no generator state is shared between features.
+local function hashed(index: number, salt: number): number
+  local value = bit32.bxor(multiply(index % 4294967296, 0x9e3779b1), multiply(salt % 4294967296, 0x85ebca77))
+
+  value = multiply(bit32.bxor(value, bit32.rshift(value, 16)), 0x85ebca6b)
+  value = multiply(bit32.bxor(value, bit32.rshift(value, 13)), 0xc2b2ae35)
+  value = bit32.bxor(value, bit32.rshift(value, 16))
+
+  return value / 4294967296
+end
+
+--- A ridge line across the poster: a sum of sines with hashed phases, so each layer has its own
+--- skyline. Returns the closed silhouette below it, to the bottom of `floor`.
+local function ridge(salt: number, base: number, height: number, roughness: number, floor: number): path.Path
+  local outline = path.new():moveTo(-10, floor)
+
+  for step = 0, 92 do
+    local across = -10 + step * 10
+    local rise = 0
+
+    for octave = 1, 5 do
+      local phase = hashed(octave, salt) * 2 * math.pi
+      local frequency = octave * octave * 0.0021 * (1 + hashed(octave + 10, salt))
+
+      rise += math.sin(across * frequency + phase) / octave ^ roughness
+    end
+
+    outline:lineTo(across, base - height * (0.6 + 0.4 * rise))
+  end
+
+  return outline:lineTo(Width + 10, floor):close()
+end
+
+--- The demo, drawn: the same bytes every time.
+local function render(): magick.Image
+  local canvas = color.tile(Width, Height, { space = 'linear' })
+  local whole = path.new():rect(0, 0, Width, Height)
+
+  -- Sky: night overhead to gold on the horizon.
+  paint.fillPath(canvas, path.new():rect(0, 0, Width, Horizon + 2), paint.linear(0, 0, 0, Horizon, paint.stops(
+    0, '#070b24',
+    0.3, '#1c2257',
+    0.55, '#5b3a78',
+    0.75, '#c0607a',
+    0.9, '#f09a6a',
+    1, '#ffd9a0'
+  )))
+
+  -- The sun, just set: a wide warm glow laid on by screen.
+  paint.fillPath(canvas, path.new():rect(0, 300, Width, Horizon + 2), paint.radial(330, Horizon + 30, 520, paint.stops(
+    0, '#fff2c0e0',
+    0.18, '#ffc07090',
+    0.5, '#e0705030',
+    1, '#e0705000'
+  )), { blend = 'screen' })
+
+  -- Stars, thinning toward the glow.
+  for index = 1, 520 do
+    local across, down = hashed(index, 1) * Width, hashed(index, 2) ^ 1.6 * 560
+    local size = 0.35 + hashed(index, 3) ^ 3 * 1.4
+    local brightness = (0.35 + 0.65 * hashed(index, 4)) * (1 - down / 620)
+
+    paint.fillPath(canvas, path.new():circle(across, down, size), paint.solid('#fff6e8', { opacity = brightness }))
+
+    if size > 1.66 then
+      -- A four-point glint: two thin strokes faded from the star outward.
+      local glint = paint.radial(across, down, size * 9, paint.stops(0, '#fff8f0c0', 1, '#fff8f000'))
+      local cross = path.new():moveTo(across - size * 9, down):lineTo(across + size * 9, down):moveTo(across, down - size * 9):lineTo(across, down + size * 9)
+
+      paint.fillPath(canvas, cross:stroked { width = 0.8, cap = 'round' }, glint, { blend = 'screen' })
+    end
+  end
+
+  -- The moon: a disc with an offset disc taken out of it by dst-out, inside an isolated group, so
+  -- the cut takes away only the moon and never the sky behind it; then its halo.
+  local moon = color.group(canvas)
+
+  paint.fillPath(moon, path.new():circle(690, 190, 46), paint.radial(675, 175, 60, paint.stops(0, '#fffbe8', 1, '#e8d8b0')))
+  paint.fillPath(moon, path.new():circle(712, 176, 42), paint.solid '#000000', { operator = 'dst-out' })
+  paint.fillPath(canvas, path.new():circle(690, 190, 120), paint.radial(690, 190, 120, paint.stops(0, '#fff0d038', 0.4, '#fff0d014', 1, '#fff0d000')), { blend = 'screen' })
+  -- The unlit part of the moon hides the halo behind it: a dark disc, faintly earthlit, under the crescent.
+  paint.fillPath(canvas, path.new():circle(690, 190, 46), paint.solid '#171b3ae8')
+  color.compositeGroup(canvas, moon)
+
+  -- ridges, far to near: each farther one paler and bluer, the haze between them a gradient that
+  -- thickens toward the horizon.
+  local ridges = {
+    { salt = 11, base = 700, height = 120, roughness = 1.1, top = '#7a6a9a', bottom = '#c89090' },
+    { salt = 12, base = 735, height = 95, roughness = 1.3, top = '#4a3f6e', bottom = '#9a6a7a' },
+    { salt = 13, base = 768, height = 70, roughness = 1.6, top = '#241f42', bottom = '#4a3550' },
+  }
+
+  for _, layer in ridges do
+    local shape = ridge(layer.salt, layer.base, layer.height, layer.roughness, Horizon + 1)
+
+    paint.fillPath(canvas, shape, paint.linear(0, layer.base - layer.height, 0, Horizon, paint.stops(0, layer.top, 1, layer.bottom)))
+    paint.fillPath(canvas, path.new():rect(0, layer.base - layer.height * 1.2, Width, Horizon + 1), paint.linear(
+      0, layer.base - layer.height * 1.2, 0, Horizon,
+      paint.stops(0, '#f0a08000', 1, '#f0a08038')
+    ))
+  end
+
+  -- Sea: dark water under a band of reflected sky.
+  paint.fillPath(canvas, path.new():rect(0, Horizon, Width, Height), paint.linear(0, Horizon, 0, Height, paint.stops(
+    0, '#6a4a6e',
+    0.08, '#2a2a50',
+    0.5, '#101834',
+    1, '#04060e'
+  )))
+
+  -- The sun's road on the water: short strokes, shorter and fainter the farther down and out.
+  for index = 1, 420 do
+    local depth = hashed(index, 21) ^ 1.8
+    local down = Horizon + 4 + depth * (Height - Horizon - 40)
+    local spread = 30 + depth * 260
+    local across = 330 + (hashed(index, 22) - 0.5) * 2 * spread * (0.4 + hashed(index, 23))
+    local length = (6 + 34 * hashed(index, 24)) * (1 - depth * 0.6)
+    local fade = (1 - math.abs(across - 330) / (spread * 1.4 + 1)) * (1 - depth * 0.7)
+
+    if fade <= 0 then continue end
+
+    local glint = path.new():moveTo(across - length / 2, down):lineTo(across + length / 2, down):stroked { width = 1 + depth * 2.2, cap = 'round' }
+
+    paint.fillPath(canvas, glint, paint.solid('#ffd8a0', { opacity = math.clamp(fade, 0, 1) * 0.8 }), { blend = 'screen' })
+  end
+
+  -- Swell: long thin curves, closer together toward the horizon.
+  for index = 1, 46 do
+    local depth = (index / 46) ^ 2
+    local down = Horizon + 6 + depth * (Height - Horizon)
+    local swell = path.new():moveTo(-20, down)
+
+    for step = 0, 23 do
+      local across = -20 + step * 40
+
+      swell:quadTo(across + 20, down + (hashed(step + index * 40, 31) - 0.5) * 6 * (0.3 + depth), across + 40, down)
+    end
+
+    local line = swell:stroked { width = 0.6 + depth * 1.4, cap = 'round', join = 'round' }
+
+    paint.fillPath(canvas, line, paint.solid('#8aa0d0', { opacity = 0.08 + 0.1 * (1 - depth) }), { blend = 'screen' })
+  end
+
+  -- The headland, its seaward edge caught by the last light.
+  local cliff = path.new()
+    :moveTo(Width + 10, 640)
+    :cubicTo(820, 640, 760, 655, 700, 700)
+    :cubicTo(650, 740, 630, 800, 560, 860)
+    :cubicTo(520, 900, 470, 930, 430, 1010)
+    :lineTo(420, Height + 10)
+    :lineTo(Width + 10, Height + 10)
+    :close()
+
+  paint.fillPath(canvas, cliff, paint.linear(560, 860, 820, 760, paint.stops(0, '#3a2638', 0.25, '#1c1224', 1, '#0a0810')))
+  paint.fillPath(canvas, cliff:stroked { width = 3, join = 'round' }, paint.linear(560, 860, 760, 650, paint.stops(0, '#e0806060', 1, '#e0806000')), { blend = 'screen' })
+
+  -- Strata: long faint curves across the rock, clipped to it by covering them inside the cliff only.
+  local rock = cliff:coverageIn(0, 0, Width, Height)
+
+  for index = 1, 26 do
+    local down = 700 + index * 19 + hashed(index, 51) * 10
+    local bend = (hashed(index, 52) - 0.5) * 40
+    local layer = path.new():moveTo(380, down + 30):quadTo(650, down + bend, Width + 20, down - 40):stroked { width = 0.8 + hashed(index, 53) * 1.6, cap = 'round' }
+
+    paint.fillPath(canvas, layer, paint.solid('#6a4a60', { opacity = 0.12 + 0.12 * hashed(index, 54) }), {
+      clips = { { mask = rock, left = 0, top = 0 } },
+    })
+  end
+
+  -- The cliff's seaward edge as drawn: its flattened outline from the first point down to where it
+  -- leaves the poster, walked by length, so grass and foam sit exactly on it.
+  local outline = path.flatten(cliff)[1]
+  local edgeX, edgeY, edgeLength = { outline[1] }, { outline[2] }, { 0 }
+
+  for index = 3, #outline - 1, 2 do
+    if outline[index + 1] > Height then break end
+
+    local last = #edgeX
+
+    table.insert(edgeX, outline[index])
+    table.insert(edgeY, outline[index + 1])
+    table.insert(edgeLength, edgeLength[last] + math.sqrt((outline[index] - edgeX[last]) ^ 2 + (outline[index + 1] - edgeY[last]) ^ 2))
+  end
+
+  --- The point on the edge at a fraction of its length.
+  local function onEdge(fraction: number): (number, number)
+    local target = fraction * edgeLength[#edgeLength]
+
+    for index = 2, #edgeLength do
+      if edgeLength[index] >= target then
+        local share = (target - edgeLength[index - 1]) / math.max(1e-9, edgeLength[index] - edgeLength[index - 1])
+
+        return edgeX[index - 1] + (edgeX[index] - edgeX[index - 1]) * share, edgeY[index - 1] + (edgeY[index] - edgeY[index - 1]) * share
+      end
+    end
+
+    return edgeX[#edgeX], edgeY[#edgeY]
+  end
+
+  -- Grass along the crest: short curved blades leaning landward, caught by the light.
+  for index = 1, 260 do
+    local across, crest = onEdge(hashed(index, 61) * 0.55)
+    local height = 5 + hashed(index, 62) * 11
+    local lean = 2 + hashed(index, 63) * 5
+    local blade = path.new():moveTo(across, crest + 2):quadTo(across + lean * 0.3, crest - height * 0.6, across + lean, crest - height)
+
+    paint.fillPath(canvas, blade:stroked { width = 1.1, cap = 'round' }, paint.linear(across, crest, across, crest - height, paint.stops(0, '#1a1220', 1, '#a06058')))
+  end
+
+  -- Foam where the sea meets the foot of the cliff.
+  for index = 1, 90 do
+    local edgeAtX, down = onEdge(0.62 + hashed(index, 71) * 0.38)
+    local across = edgeAtX - hashed(index, 72) * 50
+
+    if down < Horizon + 4 then continue end
+    local length = 8 + hashed(index, 73) * 26
+    local foam = path.new():moveTo(across - length, down):quadTo(across - length / 2, down - 2, across, down):stroked { width = 1 + hashed(index, 74) * 1.5, cap = 'round' }
+
+    paint.fillPath(canvas, foam, paint.solid('#c8d0e8', { opacity = 0.15 + 0.35 * hashed(index, 75) }), { blend = 'screen' })
+  end
+
+  -- The tower: tapered, striped by a repeating hard-edged gradient clipped to its outline.
+  local tower = path.new():polygon { { 742, 655 }, { 798, 655 }, { 788, 470 }, { 752, 470 } }
+  local stripes = paint.stops(0, '#e8e0d8', 0.5, '#e8e0d8', 0.5, '#b03a3a', 1, '#b03a3a')
+
+  paint.fillPath(canvas, tower, paint.linear(0, 470, 0, 530, stripes, { spread = 'repeat' }))
+  paint.fillPath(canvas, tower, paint.linear(742, 0, 798, 0, paint.stops(0, '#00000000', 0.6, '#00000030', 1, '#000000a0')))
+  paint.fillPath(canvas, path.new():rect(738, 652, 802, 662), paint.solid '#2a2028')
+
+  -- Gallery, lantern and roof.
+  paint.fillPath(canvas, path.new():rect(744, 460, 796, 470), paint.solid '#2a2028')
+  paint.fillPath(canvas, path.new():moveTo(742, 455):lineTo(798, 455):stroked { width = 2 }, paint.solid '#2a2028')
+
+  for post = 0, 6 do
+    paint.fillPath(canvas, path.new():moveTo(744 + post * 8.6, 455):lineTo(744 + post * 8.6, 462):stroked { width = 1.2 }, paint.solid '#2a2028')
+  end
+
+  paint.fillPath(canvas, path.new():rect(756, 420, 784, 455), paint.radial(770, 437, 22, paint.stops(0, '#fffbe0', 0.5, '#ffe7a0', 1, '#e0a050')))
+  paint.fillPath(canvas, path.new():moveTo(770, 420):lineTo(770, 455):moveTo(763, 420):lineTo(763, 455):moveTo(777, 420):lineTo(777, 455):stroked { width = 1 }, paint.solid '#3a2a28c0')
+  paint.fillPath(canvas, path.new():moveTo(750, 421):cubicTo(752, 400, 788, 400, 790, 421):close(), paint.solid '#2a2028')
+  paint.fillPath(canvas, path.new():moveTo(770, 404):lineTo(770, 392):stroked { width = 1.5, cap = 'round' }, paint.solid '#2a2028')
+
+  -- Beams: each a stack of nested wedges from the lantern, the narrow ones adding to the core, so
+  -- the light is brightest along its axis and falls off softly to its edges, and each layer fades
+  -- along its length. Laid on by screen, so they only ever brighten the sky.
+  for _, beam in { { -2.86, 0.05 }, { -0.12, 0.035 } } do
+    local angle, spread = beam[1], beam[2]
+    local reach = 1100
+
+    for layer = 1, 6 do
+      local width = spread * layer / 6
+      local wedge = path.new():polygon {
+        { 770, 437 },
+        { 770 + math.cos(angle - width) * reach, 437 + math.sin(angle - width) * reach },
+        { 770 + math.cos(angle + width) * reach, 437 + math.sin(angle + width) * reach },
+      }
+      local fade = paint.linear(770, 437, 770 + math.cos(angle) * reach, 437 + math.sin(angle) * reach, paint.stops(0, '#ffe8a826', 0.35, '#ffd8900e', 0.8, '#ffd89000'))
+
+      paint.fillPath(canvas, wedge, fade, { blend = 'screen' })
+    end
+  end
+
+  paint.fillPath(canvas, path.new():circle(770, 437, 90), paint.radial(770, 437, 90, paint.stops(0, '#fff4c8a0', 0.25, '#ffd89040', 1, '#ffd89000')), { blend = 'screen' })
+
+  -- A lit window halfway up, and a few gulls.
+  paint.fillPath(canvas, path.new():roundRect(765, 560, 775, 576, 3), paint.solid '#ffd890')
+
+  for index = 1, 7 do
+    local across, down = 180 + hashed(index, 41) * 380, 380 + hashed(index, 42) * 180
+    local span = 7 + hashed(index, 43) * 7
+    local gull = path.new():moveTo(across - span, down - span * 0.2):quadTo(across - span * 0.45, down - span * 0.55, across, down):quadTo(across + span * 0.45, down - span * 0.55, across + span, down - span * 0.2)
+
+    paint.fillPath(canvas, gull:stroked { width = 1.3, cap = 'round', join = 'round' }, paint.solid '#1a1428d0')
+  end
+
+  -- Vignette: the corners darkened by multiplying a radial gradient over the whole poster.
+  paint.fillPath(canvas, whole, paint.radial(Width / 2, Height * 0.45, Height * 0.78, paint.stops(0, '#ffffff', 0.6, '#ffffff', 1, '#585068')), {
+    blend = 'multiply',
+  })
+
+  return color.toImage(canvas)
+end
+
+return { name = 'lighthouse', render = render }

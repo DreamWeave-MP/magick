@@ -1,0 +1,45 @@
+--!strict
+-- Renders every demo in demos/, writes each as <name>.png into the output folder, and checks its
+-- pixels against demos/records.jsl. `record` prints the lines for that table instead of checking.
+--
+--   jess run --package . --capability filesystem.read --capability filesystem.write \
+--     tools/demos.jsl [outDir] [record]
+local bytes = require '@dream/bytes'
+local fs = require '@dream/fs'
+local magick = require '@magick'
+local records = require '../demos/records'
+
+type Demo = { name: string, render: () -> magick.Image }
+
+local Demos: { Demo } = {
+  require '../demos/lighthouse',
+  require '../demos/rosette',
+}
+
+local folder: string?, mode: string? = ...
+local out = folder or 'target/demos'
+local recording = mode == 'record'
+
+if mode and not recording then error(`demos: unknown command '{mode}'. usage: tools/demos.jsl [outDir] [record]`, 0) end
+
+local failures = 0
+
+for _, demo in Demos do
+  local started = os.clock()
+  local image = demo.render()
+  local seconds = os.clock() - started
+  local observed = `{image.width}x{image.height}:{string.format('%08x', bytes.crc32(image.data))}`
+
+  fs.writeFile(fs.join(out, `{demo.name}.png`), magick.png(image), { atomic = true, createParents = true })
+
+  if recording then
+    print(`  ['{demo.name}'] = '{observed}',`)
+  elseif records[demo.name] == observed then
+    print(`  ok    {demo.name}  {observed}  {string.format('%.2f', seconds)} s`)
+  else
+    print(`  FAIL  {demo.name}  {observed}, recorded {records[demo.name] or 'nothing'}`)
+    failures += 1
+  end
+end
+
+if failures > 0 then error(`demos: {failures} demo(s) differ from their record`, 0) end

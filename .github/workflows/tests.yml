@@ -70,3 +70,8 @@ jobs:
           fi
           grep -q "is the baseline folder" target/refusal.txt \
             || { cat target/refusal.txt; echo "::error::the gallery failed for another reason"; exit 1; }
+
+      - name: Demos render to their records
+        run: >-
+          jess run --package . --capability filesystem.read --capability filesystem.write
+          tools/demos.jsl target/demos
