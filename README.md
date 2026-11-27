@@ -1,4 +1,4 @@
-# @magick 0.3.0
+# @magick 0.5.0
 
 Pure-Luau raster toolkit for Jess. Backward-compatible with the 0.1.0 Morrowind generator surface while adding PNG/BMP/TGA I/O, atlas operations, image-processing math, gradients, masking, blur/shadow, grayscale/threshold/colorize, and the H3/H3UI dependency cone.
 
@@ -6,7 +6,213 @@ ImageMagick is used only as a development oracle; this package does not spawn it
 
 What 0.1.x promises consumers, and what it keeps as it always did, is in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-The renderer design for 0.2.0 (coordinates, transforms, premultiplied working tiles, compositing and the API boundaries) is proposed for ratification by review in [RFC-0001](docs/RFC-0001-renderer.md), with its checked sketches in `docs/rfc/sketches/`.
+The renderer design for 0.2.0 (coordinates, transforms, premultiplied working tiles, compositing and the API boundaries) is set out in [RFC-0001](docs/RFC-0001-renderer.md), ratified by the owner on 2026-11-26, with its checked sketches in `docs/rfc/sketches/`.
+
+## Gallery
+
+Every picture here is drawn by checked-in JSL source through the public modules, with no generative
+service and no retouching. The only outside media is the Mona Lisa's reference, a public-domain
+photograph pinned by SHA-256 in [`gallery/references/PROVENANCE.md`](gallery/references/PROVENANCE.md);
+every pixel of the painting is Magick's. `tools/demos.jsl` renders each one and holds its pixels to
+the CRC-32 in `demos/records.jsl`, so anyone can reproduce them byte for byte (about five minutes on
+one core):
+
+```sh
+jess run --package . --capability filesystem.read --capability filesystem.write tools/demos.jsl target/demos
+```
+
+### Mona Lisa, after Leonardo (MAG-041)
+
+![Mona Lisa, painted by @magick/painter](gallery/monalisa.png)
+
+![The toned ground and each pass](gallery/monalisa-progress.png)
+
+[`demos/monalisa.jsl`](demos/monalisa.jsl) paints Leonardo's portrait with `painter.paint`. The canvas is toned a
+flat umber, then laid in with loaded oil strokes at radius 8, 4 and 2. The face and hands carry on through radius 3,
+2, 1.5 and 1 in glazes: very soft, translucent strokes that never pile up past their own coverage, refined almost
+everywhere (threshold 0.008), so the flesh turns continuously (sfumato). An earlier opaque brush with a coarser
+threshold banded the face into plateaus, as an independent review pointed out. The bust sits between the two. Each
+region's strokes start inside it. Every pass is planned against the canvas the brush engine actually rendered, and
+its error is measured against the reference itself (mean absolute difference of the colors, 0..1, at the reference's
+size):
+
+| Stage | Strokes | Error against the reference |
+|---|---|---|
+| Toned ground | 0 | 0.1490 |
+| Radius 8, everywhere | 5,922 | 0.0519 |
+| Radius 4 | 5,616 | 0.0410 |
+| Radius 3, flesh and bust | 3,243 | 0.0404 |
+| Radius 2 | 10,077 | 0.0371 |
+| Radius 1.5, face and hands | 3,021 | 0.0370 |
+| Radius 1, face and hands | 9,415 | 0.0369 |
+
+The numbers report what happened; nothing promises they fall. They are not a score to chase either: the reference
+merely blurred by the largest brush measured 0.0343, lower than the finished painting, so the painter is judged by the
+pictures, with the numbers as evidence that every pass moved the canvas toward its subject.
+
+| | |
+|---|---|
+| ![Heron at Dusk](gallery/heron.png) [Heron at Dusk](demos/heron.jsl): ink and watercolor | ![Portrait of a Reader](gallery/portrait.png) [Portrait of a Reader](demos/portrait.jsl): an original vector reference ([reference](gallery/portrait-reference.png)) painted by `painter.paint`, its face and neck in glazes |
+| ![The Valley, in Oil](gallery/oil.png) [The Valley, in Oil](demos/oil.jsl): the valley repainted by `painter.plan` and `apply`, its strokes larger than the ridges and sun they erase; compare [The Valley, Painted](gallery/valley-painted.png) ([source](demos/valleypainted.jsl)), the same reference painted by `painter.paint` against its real renders | ![Valley at First Light](gallery/valley.png) [Valley at First Light](demos/valley.jsl): 5,941 scene nodes, 4K and 8K targets |
+| ![Lighthouse at Dusk](gallery/lighthouse.png) [Lighthouse at Dusk](demos/lighthouse.jsl): a vector poster | ![Rosette](gallery/rosette.png) [Rosette](demos/rosette.jsl): engraved guilloche |
+
+## 0.5.0 changes: Masterpiece
+
+### `@magick/painter`
+
+Painting a reference coarse to fine, after Hertzmann's curved-stroke method (SIGGRAPH 1998; an implementation of the
+idea, not of his code).
+
+**`painter.paint(reference, options?)`** paints an opaque reference against the brush engine's real renders and
+returns `{ image, ground, passes }`.
+- **Ground:** the canvas is toned one flat color (`ground`, the reference's mean by default), and the first pass covers
+  all of it.
+- **Passes:** each pass blurs the reference for its radius and starts a stroke in every cell (as wide as the radius)
+  where the *rendered* canvas misses that blur by more than `threshold`. Strokes run along the edge in the color there
+  and stop where the target leaves it. The starts are laid in a seeded order, and strokes are built only for what
+  `budget` has left.
+- **Rendering and measurement:** each pass's strokes are rendered over the canvas so far, and its `error` is measured
+  against the reference itself. Every `pass.image` is kept.
+- **Regions** (`{ name, shape, radii?, threshold?, curvature?, maximumLength?, preset?, overrides? }`, shapes in
+  reference pixels) paint parts of the picture with their own passes and brush, and their strokes stay inside them.
+- **Brush size:** the planned radius is a stroke's reach across its line even at its tapered ends.
+- **Other options:** `scale` (whole, 1..4), `workers`.
+- **Caps:** `MaxStrokesPerPainting` 131072.
+
+**`painter.plan` and `painter.apply`** are the earlier planner, kept as they were.
+- **`painter.plan(image, options?)`** plans strokes against a fast disc estimate of the canvas, one level at a time in
+  f64 planes (about 100 MB at `MaxReferencePixels`). It builds strokes only for the starts its budget takes, and refuses
+  options that are not finite or whole. `plan.levels[i].error` is that estimate against the level's own blur: a
+  planning diagnostic, not a measure of the painting.
+- **`painter.apply(document, group, plan, options?)`** turns a plan into brush strokes over an underpainting blurred in
+  place. (It once used a blur filter, which faded the underpainting toward the canvas edge and left a ragged unpainted
+  frame. Fixed, and the oil and portrait records retaken.)
+- **`painter.error(image, reference)`** is the mean absolute difference of the premultiplied colors plus that of the
+  alphas, over 255. It is 0..2 in general and 0..1 for opaque images, where it is the plain color difference. Empty
+  images are refused.
+- **Caps:** `MaxStrokesPerPlan` 16384, `MaxPlanLevels` 8, `MaxStrokeLength` 64, `MaxReferencePixels` 1024 by 1024.
+
+### `@magick/svg`
+
+**`svg.export(document)`** writes a bounded SVG subset:
+- retained path commands, with arcs as SVG arcs;
+- solid, linear and radial paints, with every stroke setting;
+- embedded PNG images;
+- groups with transform, opacity, blend, clip, mask, and blur or shadow filters.
+
+Conic, field, pattern, mix and shader paints and brush strokes are refused by name.
+
+**`svg.import(text)`** reads:
+- elements: `svg`, `g`, `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`, `linearGradient` and
+  `radialGradient` (with `href` inheritance and percentages), and `clipPath` on groups and shapes;
+- styling: presentation attributes and `style`, CSS colors (every keyword, `#rgb`, `rgb()` and `rgba()` with
+  percentages and alpha, `currentColor`), absolute units, `display` and `visibility`;
+- geometry: transforms, and a viewBox fitted by `preserveAspectRatio` (`xMidYMid meet` by default).
+
+Input is untrusted:
+- every number list is read in order to its last character;
+- a malformed number, a short argument group, a bad arc flag, or a size past 8192 pixels is refused by name, never
+  dropped or clamped;
+- caps: `MaxSvgBytes` 16 MiB, `MaxElements` 65536, `MaxDepth` 32, `MaxPathCommands` 2^20.
+
+`tests/svg` holds six fixtures to librsvg 2.63.2's renders, made once and committed. The mean absolute difference is
+0.02% to 0.12%, and 0.89% where a translucent radial stop interpolates slightly differently.
+
+### Hardening (MAG-044)
+
+**Package tests:**
+- `tests/fuzz.jsl` drives seeded random geometry through coverage and strokes.
+- `tests/adversarial.jsl` holds mutated PNGs, saved scenes and SVGs (400, 300 and 300) to a read or a named refusal.
+  Verified PNGs read back as exactly the picture written.
+- It also covers a PNG decompression bomb, refused by `readPNG(source, { maxPixels, verify })` before it is inflated.
+- Degenerate geometry, scales from 1e-300 to 1e300, and a 3000-edge zigzag in one row are drawn right or refused at
+  every tile size.
+
+**The stress target** is `jess package run --capability worker.spawn --target stress .`. On an i7-10870H, under a
+9 GB memory cap, with jess 0.4.0:
+- the valley at 7680 by 4320 on 4 workers: 37.9 s;
+- 100,000 shapes at 3840 by 2160: 21.8 s on 4 workers and 45.7 s on one, the same bytes, under a 2 GiB budget;
+- 267,600 brush dabs at 4K: 6.3 s on 4 workers, under a 1 GiB budget (the default 512 MiB refuses it);
+- 118.0 s and **5.14 GB peak resident** for the whole run.
+
+The render budget (`memoryBudgetBytes`) is checked before any tile runs and refuses deterministically. It counts:
+- working tiles, coverage cells and queued tiles;
+- each worker's copy of the plan, by `plan.bytes`, an estimate from how Luau lays out its tables that is meant to err
+  high (the 100,000-node plan: 366 MiB);
+- the output image.
+
+It does not count the document the caller built, the caller's own copy of the plan, or garbage the collector has not
+reached yet. It is a ceiling on the render, not on the process: the serial 100,000-node run peaks at 1.39 GB resident
+with the document in hand. Budget a process with that in mind.
+
+`processBudgetBytes` (opt-in) adds what the process already holds: it refuses, before any tile runs, when the Luau
+heap in use now plus what the render needs would pass it. For the 100,000-node scene that check sees 741 MiB held plus
+32 MiB needed, where the serial render peaks at 1.30 GB resident. The rest is churn during the render, allocator
+overhead and the binary itself. The heap depends on how far the collector has got, so near the bound a call may pass
+once and be refused the next time. A hard ceiling on the process needs the allocator to enforce it: l3i can cap a
+runtime's heap, and jess does not yet let a host set that cap for a package target, which is where such a guarantee
+belongs.
+
+### Downstream integration (MAG-045)
+
+The DreamWeave Mod Template uses Magick as its site generator's image backend: `read`, `Image:resize`, `write`.
+- **Its suite:** it passes 154 of 154 tests with its dependency moved to 0.5, on the local branch `deps/magick-0.5`,
+  which is not yet published.
+- **Its image output:** that same read, resize and write pipeline, run over three gallery images at three sizes each,
+  gives PNGs whose SHA-256 is the same under 0.1.3 and 0.5.0, all nine of them.
+
+The template pins Magick with a caret requirement, so publishing it waits on a Magick 0.5 release.
+[`docs/downstream.md`](docs/downstream.md) has the script and commands to check both claims again.
+
+## Atelier changes (planned as 0.4.0, released in 0.5.0)
+
+### `@magick/noise`
+
+Pure functions of a seed (an integer in 1..2^31 - 2) and a point: `value`, `perlin`, `fbm`, `turbulence`, `ridged`
+(`MaxOctaves` 12) and `worley` (nearest and second distances), over a 1024-entry permutation made once a seed;
+`hash(seed, a, b?, c?)` and `random(...)` by the murmur3 finalizer, for per-dab and per-feature keys. No generator state,
+no `math.random`, so a texture never seams at a tile edge or differs between workers.
+
+**Fields** are descriptions, plain data: `constant`, `coordinate`, `noiseField`, `fbmField`, `turbulenceField`,
+`ridgedField`, `worleyField`, `checker`, `stripes`, `rings`, `combine`, `apply`, `scale`, `clamp`, `smoothstep`,
+`power`, `blend`, `warp` (domain warping) and `transform`, at most `MaxFieldNodes` 256 nested `MaxFieldDepth` 32.
+`noise.compile(field)` makes a closure where the field is used; descriptions save with scenes and cross to workers.
+
+### Procedural paints
+
+`paint.fieldPaint(field, stops, options?)` reads a field through stops as a gradient's parameter; `paint.mix(first,
+second, field)` blends two paints by a field; `paint.masked(inner, field)` cuts a paint's alpha by one;
+`paint.shader(function(x, y) return r, g, b, a end)` is the slow path for anything else, pure by contract, refused for
+workers and saving, and failing with the point and tile it was asked for.
+
+### `@magick/brush`
+
+`brush.stroke(samples, brush, seed?)` turns samples `{ x, y, pressure? }` into dabs: smoothed (`smoothing`), walked by arc
+length, a dab every `spacing` of its own pressure-sized diameter and one on the end, jitter (size, angle, scatter,
+opacity, hue, lightness) from `noise.hash(seed, dab, channel)`. Tips: `round` (hardness, never sharper than a pixel),
+`bristles` (tracks along the stroke) or an `image` mask; a canvas-fixed `grain` field and `dryness` for dry media.
+Accumulation: `buildup` (pigment piles up where dabs overlap, its color pure), `constant` (an even stroke at its flow,
+no seams) and `wet` (edges pooled darker, as watercolor). `blend` sets how the stroke lays on (`multiply` for glazes).
+Presets: `ink`, `oil`, `watercolor`, `graphite`, `airbrush` through `brush.preset(name, size, color, overrides?)`;
+`brush.paper(seed)` is a paper grain. Strokes are scene nodes (`document:stroke(samples, brush, { seed? })`), saved as
+their samples, brush and seed and replayed exactly; dabs are stamped only into the tiles they reach. Caps:
+`MaxSamplesPerStroke` and `MaxDabsPerStroke` 65536. These are stylized media, not simulations.
+
+### `@magick/material`
+
+Seeded recipes made of fields alone: `clouds`, `fog`, `wood`, `bark`, `rock`, `leaf`, `fabric`, `parchment`, `marble`,
+each `material.<name> { seed, scale?, detail?, colors?, transform?, opacity? }` and by name through `material.make`.
+`material.grain(paint)` gives the field for a brush's grain or a mask.
+
+### `@magick/text` and `@magick/art`
+
+`text.monoline(weight?)` is the built-in geometric face (capitals, small-capital lowercase, digits, punctuation), so text
+needs no font file. `text.outline { outline = ..., measure = ... }` adapts any font that draws through a pen, such as
+`@truetype`'s. `text.path(font, text, x, y, size, { tracking?, align?, kerning? })` sets one line as a path and
+`text.measure` its width; shaping is out of scope. Stroking a monoline path outlines each piece, since a union outline
+needs boolean path operations, which are not here. `@magick/art` adds `palette`, `scatter` (jittered, one point a cell),
+`samples` (brush samples along any path) and `symbol` (reusable motifs). `Path:finish()` ends an open contour without
+closing it.
 
 ## 0.3.0 changes
 

@@ -7,10 +7,11 @@ suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and 
 
 Measured against: `jess` 0.4.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
-- `jess package test .`: 916 passed, 0 failed: 458 tests, each run once from the source folder and once from
+- `jess package test .`: 1072 passed, 0 failed: 536 tests, each run once from the source folder and once from
   the packed `.jpk`. The 0.1.x suites (`basic`, `compat`, `gate`, `property`, `png`, `path`, `resample`, `rfc`,
   `rfc_contracts`, `style`) are unchanged; 0.2.0 adds `transform`, `coverage`, `stroke`, `color`, `paint`,
-  `pattern` and `blend`.
+  `pattern` and `blend`; 0.3.0 `scene` and `serialize`; 0.4.0 `noise`, `brush`, `material`, `text` and `art`;
+  0.5.0 `painter`, `svg` and `fuzz`.
 - `jess package check .`: no errors, strict types over every `.jsl`.
 - `jess run --package . bench/bench.jsl`: all 98 workloads ran and held their fingerprints (91 of them before the gate rows).
 

@@ -1,6 +1,6 @@
 # RFC-0001: Renderer coordinates, compositing and API boundaries
 
-- **Status:** Ratified by the owner (Dave Corley) on 2026-11-26.
+- **Status:** Ratified by the owner (Dave Corley) on 2026-11-26, with its amendments A1 to A4.
 - **Issue:** MAG-003, release 0.2.0. Merge order: PR-02 (this RFC only; no implementation).
 - **Scope:** the 0.2.0 issues MAG-004 to MAG-014, including isolated composite groups with opacity
   (MAG-014, PR-09), and the sketches for 0.3.0 and later.
@@ -286,7 +286,7 @@ on self-crossing and overlapping contours (`issue-6.md`); these pinned vectors a
 rule needs the winding per contour, which the 0.2.0 rasterizer does not keep. Adding one is a new rule, and it requires an
 RFC amendment, not a silent change.
 
-**Amendment A1 (MAG-006, provisional until ratified): exact fill rules for new APIs.** F1 and F2 stay the rule of
+**Amendment A1 (MAG-006, ratified by the owner on 2026-11-26): exact fill rules for new APIs.** F1 and F2 stay the rule of
 legacy `Path:mask()`, pinned as above. `Path:coverageIn` and every 0.2.0 API built on it use an **exact** rule instead:
 a pixel's coverage is the area of its square where the winding number of the flattened outline is not 0 (`nonzero`)
 or is odd (`evenodd`), rounded to a byte once. Each pixel row is cut into sub-bands at every vertex and every crossing
@@ -419,7 +419,7 @@ other separable modes (`color-dodge`, `color-burn`, `hard-light`, `difference`, 
 modes (`hue`, `saturation`, `color`, `luminosity`) are not in 0.2.0, so they are refused like any other unknown name.
 Each later addition needs reference vectors.
 
-**Amendment A2 (MAG-014, provisional until ratified): all sixteen W3C blend modes.** W9's seven modes are extended to
+**Amendment A2 (MAG-014, ratified by the owner on 2026-11-26): all sixteen W3C blend modes.** W9's seven modes are extended to
 the full W3C Compositing Level 1 set: the separable `color-dodge`, `color-burn`, `hard-light`, `difference` and
 `exclusion`, and the nonseparable `hue`, `saturation`, `color` and `luminosity` (Lum, ClipColor, SetLum and SetSat as W3C
 defines them; a channel tied with the greatest takes the whole saturation, as its Cmid does). Each has reference
@@ -593,7 +593,7 @@ the same rectangle. **Owned by MAG-008**: it is the tile test of that issue, on 
 The total is `workers * perWorker + outputBytes + encodeBytes`. `Render.plan` returns it, and refuses with
 `magick: render needs <n> bytes, budget is <m>` when it exceeds `memoryBudgetBytes`. The default budget is 512 MiB.
 
-**Amendment A4 (stabilization, provisional until ratified): opaque plans and bounded workers.** A plan is an opaque
+**Amendment A4 (stabilization, ratified by the owner on 2026-11-26): opaque plans and bounded workers.** A plan is an opaque
 frozen handle (`width`, `height`, `space`, `nodes`, `operations`, `bytes`); its operations live inside
 `@magick/render`, so its immutability is enforced rather than promised. Pixels a plan reads (image nodes, pattern
 sources) are copied at compile time, once per source buffer. Tiles are worked out from a grid, never listed. A
@@ -618,7 +618,7 @@ Each row is a `Render.plan` assertion. The exact-boundary geometry is the only `
 with total exactly 512 MiB at height 8192 (search over tile 1..256, halo 0..64, workers 1..8, width at most 8192).
 The earlier round's shortfall (520 MiB passing) is now a refusal, because the output and the cells are counted.
 
-**Amendment A3 (MAG-021 to MAG-025, provisional until ratified): the budget as implemented.** `render.image` checks
+**Amendment A3 (MAG-021 to MAG-025, ratified by the owner on 2026-11-26): the budget as implemented.** `render.image` checks
 B3 before it allocates the output or renders a tile, with these differences from the text above.
 
 - **Workers and cells are counted.** The check runs after the worker count is chosen, and the total is

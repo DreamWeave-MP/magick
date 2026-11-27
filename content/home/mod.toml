@@ -33,3 +33,8 @@ summary = "Vector and paint foundation: retained paths and affine transforms, ex
 version = "0.3.0"
 date = 2026-11-27
 summary = "Retained canvas: typed scenes compiled to immutable plans, tiled rendering with the same bytes at every tile size and on Jess workers, group clips, masks, blur and shadow filters, and saved scenes."
+
+[[releases]]
+version = "0.5.0"
+date = 2026-11-27
+summary = "Atelier and Masterpiece: seeded noise and fields, procedural paints, a stamped brush engine with five media presets, material recipes and monoline text; reference-guided painting against real renders, with the Mona Lisa from a pinned public-domain photograph; an SVG subset in and out, held to librsvg; and adversarial, 8K and 100,000-node hardening. 0.4.0 was planned but never tagged: its changes ship here."
