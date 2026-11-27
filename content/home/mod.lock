@@ -126,6 +126,47 @@
       "groups": [],
       "extensions": {},
       "critical_extensions": []
+    },
+    {
+      "version": "0.5.0",
+      "locked_from": "5b5b8b4c04bec5122ad40cb0bff9727f203c9fd7",
+      "artifacts": [
+        {
+          "id": "jpk",
+          "format": "jpk",
+          "filename": "org.dreamweave.magick-0.5.0.jpk",
+          "media_type": "application/vnd.jess.jpk",
+          "size": 555284,
+          "digests": {
+            "sha256": "a2e67acc0e3cca1e557bf628a0969b9575d898635cc76112abd48287832c5f7c"
+          },
+          "jess": {
+            "package": "org.dreamweave.magick",
+            "jess_api": "1",
+            "content_digest": "3693ab3e11661137ddf318d675a9f17648780f42ad093178cd83e4d32180fa35",
+            "dependencies": {}
+          }
+        }
+      ],
+      "runtimes": {},
+      "platforms": [],
+      "provides": [],
+      "relationships": [],
+      "components": [
+        {
+          "id": "main",
+          "name": "Magick",
+          "path": ".",
+          "required": true,
+          "default": true,
+          "requires": [],
+          "conflicts": [],
+          "suggested_with": []
+        }
+      ],
+      "groups": [],
+      "extensions": {},
+      "critical_extensions": []
     }
   ]
 }
