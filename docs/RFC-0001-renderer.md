@@ -618,6 +618,22 @@ Each row is a `Render.plan` assertion. The exact-boundary geometry is the only `
 with total exactly 512 MiB at height 8192 (search over tile 1..256, halo 0..64, workers 1..8, width at most 8192).
 The earlier round's shortfall (520 MiB passing) is now a refusal, because the output and the cells are counted.
 
+**Amendment A3 (MAG-021 to MAG-025, provisional until ratified): the budget as implemented.** `render.image` checks
+B3 before it allocates the output or renders a tile, with these differences from the text above.
+
+- **Workers and cells are counted.** The check runs after the worker count is chosen, and the total is
+  `workers * perWorker + outputBytes`. `perWorker` counts the base tile, one tile per group level (the deepest
+  nesting, a mask counting as a level below its group), two tiles of filter and shadow scratch, and the coverage
+  cells `(E + 1) * E * 8`, at the tile edge widened by the largest halo on both sides at each level. Computable: `tests/scene.jsl`,
+  "counts the tile of a mask and the halos of its groups in the budget".
+- **No encode term.** `render.image` returns an `Image` and never encodes, so it takes no `encode` option. The
+  `encodeBytes` bound applies to a caller that encodes the result, until MAG-025's streaming encode replaces it.
+- **Depth.** The scene caps nesting at `MaxDepth` 32 (`magick: MaxDepth 32 exceeded`), counting every node and not
+  groups alone, so it bounds the group levels B3 counts.
+- **`workers = 'auto'`** takes 4 workers (at most the tile count), only for renders of at least `512 * 512` pixels
+  and only where workers may be spawned. Jess has no host CPU count, so the RFC's "host count capped at 8" cannot be
+  read; an explicit count up to 8 is unchanged.
+
 **Option validation (computable).** `Render.plan` refuses a tile edge or a worker count that is not a whole number at
 least one, and refuses each option past its cap with the E5 message: tile 257 (`MaxTileEdge 256 exceeded`), 9 workers
 (`MaxWorkers 8 exceeded`), halo 65 (`MaxHaloPx 64 exceeded`), and an output edge 8193 (`MaxImageEdge 8192 exceeded`).
@@ -646,7 +662,7 @@ relations are tested, and their code is owned by the issue named in the row.
 | `MaxHaloPx` | `64` | `Render.plan`; boundary tested | Filter halo, per side, per pass (0.3.0, MAG-023). |
 | `MaxDecodedPixels` | `MaxImagePixels` | constant; relation tested; owned by MAG-012 (decoders) | Any new decoder. Legacy codecs keep their 0.1.x behaviour, which has no cap, because the contract is frozen (section 16). |
 | `MaxReferenceDepth` | `0` | constant; owned by MAG-016 | No references in 0.3.0, since scene structure is a tree (section 12). |
-| `MaxNodes` | `65536` | constant; owned by MAG-016 | Scene nodes (0.3.0). |
+| `MaxNodes` | `131072` | constant; owned by MAG-016, raised by MAG-044 | Scene nodes. 65,536 in 0.3.0; MAG-044 asks for 100,000-node scenes, measured at 4K: compile 1.5 s, one worker 45 s, 1.39 GB peak RSS (`tests/stress.jsl`). |
 | `MaxDabsPerStroke` | `65536` | constant; owned by MAG-030 | Brush dabs in one stroke (0.4.0). |
 | `MaxDabsPerScene` | `2^20` | constant; owned by MAG-030 | Brush dabs in one scene (0.4.0). |
 | `MaxStrokesPerPlan` | `16384` | constant; owned by MAG-038 | Strokes in one painter plan (0.5.0). |

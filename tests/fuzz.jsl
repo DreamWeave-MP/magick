@@ -1,0 +1,129 @@
+--!strict
+-- Hardening (MAG-044): seeded random geometry through the rasterizer and the stroker, at scales
+-- from tiny to huge, with near-duplicate, collinear and self-crossing points, holding the
+-- invariants that must survive anything: the same bytes from any tiling, evenodd never covering
+-- more than nonzero, a window cut from a larger one equal to it, and refusals instead of runaway
+-- work for what is past the caps.
+local noise = require '@magick/noise'
+local path = require '@magick/path'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+--- A random outline: one to three contours of 3 to 30 points, at a scale from 1/64 to 4096 about a
+--- center in the window, some points repeated or set on a line.
+local function randomPath(seed: number): path.Path
+  local shape = path.new()
+  local contours = 1 + noise.hash(seed, 1) % 3
+  local scale = 2 ^ (noise.random(seed, 2) * 18 - 6)
+
+  for contour = 1, contours do
+    local count = 3 + noise.hash(seed, 3, contour) % 28
+    local centerX, centerY = 20 + noise.random(seed, 4, contour) * 40, 20 + noise.random(seed, 5, contour) * 40
+    local lastX, lastY = 0, 0
+
+    for index = 1, count do
+      local pointX = centerX + (noise.random(seed, 6, contour * 100 + index) - 0.5) * scale
+      local pointY = centerY + (noise.random(seed, 7, contour * 100 + index) - 0.5) * scale
+      local kind = noise.hash(seed, 8, contour * 100 + index) % 10
+
+      -- Some points repeat the last, some lie on the line through the last two.
+      if kind == 0 and index > 1 then pointX, pointY = lastX, lastY end
+      if kind == 1 and index > 1 then pointX, pointY = lastX + (lastX - centerX) * 0.5, lastY + (lastY - centerY) * 0.5 end
+
+      if index == 1 then shape:moveTo(pointX, pointY) else shape:lineTo(pointX, pointY) end
+
+      lastX, lastY = pointX, pointY
+    end
+
+    shape:close()
+  end
+
+  return shape
+end
+
+suite.it('gives every random outline the same bytes from any tiling, by both rules', function()
+  for seed = 1, 60 do
+    local shape = randomPath(seed)
+    local turn = transform.rotate(noise.random(seed, 9) * 6.28)
+    local around = transform.compose(transform.translate(40, 40), turn, transform.translate(-40, -40))
+
+    for _, rule in { 'nonzero', 'evenodd' } :: { path.FillRule } do
+      local whole = shape:coverageIn(0, 0, 80, 80, { fillRule = rule, transform = around })
+
+      for _, tile in { { 0, 0, 40, 40 }, { 40, 0, 40, 40 }, { 13, 57, 29, 23 }, { 79, 79, 1, 1 } } do
+        local part = shape:coverageIn(tile[1], tile[2], tile[3], tile[4], { fillRule = rule, transform = around })
+
+        for row = 0, tile[4] - 1 do
+          local expected = buffer.readstring(whole.data, (tile[2] + row) * 80 + tile[1], tile[3])
+
+          expect(buffer.readstring(part.data, row * tile[3], tile[3]) == expected).toBe(true)
+        end
+      end
+    end
+  end
+end)
+
+suite.it('never covers more under evenodd than under nonzero, pixel by pixel', function()
+  for seed = 100, 160 do
+    local shape = randomPath(seed)
+    local nonzero = shape:coverageIn(0, 0, 80, 80)
+    local evenodd = shape:coverageIn(0, 0, 80, 80, { fillRule = 'evenodd' })
+
+    for index = 0, 80 * 80 - 1 do
+      expect(buffer.readu8(evenodd.data, index) <= buffer.readu8(nonzero.data, index) + 1).toBe(true)
+    end
+  end
+end)
+
+suite.it('strokes random lines with random widths, joins, caps and dashes to finite outlines', function()
+  local joins: { path.Join }, caps: { path.Cap } = { 'miter', 'round', 'bevel' }, { 'butt', 'round', 'square' }
+
+  for seed = 200, 260 do
+    local line = path.new()
+
+    for index = 1, 2 + noise.hash(seed, 1) % 12 do
+      local pointX, pointY = 40 + (noise.random(seed, 2, index) - 0.5) * 70, 40 + (noise.random(seed, 3, index) - 0.5) * 70
+
+      if index == 1 then line:moveTo(pointX, pointY) else line:lineTo(pointX, pointY) end
+    end
+
+    local outline = line:stroked {
+      width = 2 ^ (noise.random(seed, 4) * 8 - 3),
+      join = joins[noise.hash(seed, 5) % 3 + 1],
+      cap = caps[noise.hash(seed, 6) % 3 + 1],
+      miterLimit = 1 + noise.random(seed, 7) * 10,
+      dashes = if noise.hash(seed, 8) % 2 == 0 then { noise.random(seed, 9) * 6, noise.random(seed, 10) * 6 } else nil,
+    }
+
+    for _, points in path.flatten(outline) do
+      for _, value in points do
+        expect(value == value and math.abs(value) < 1e6).toBe(true)
+      end
+    end
+
+    expect(buffer.len(outline:coverageIn(0, 0, 80, 80).data)).toBe(6400)
+  end
+end)
+
+suite.it('refuses geometry past its caps rather than running away', function()
+  expect(function()
+    path.new():moveTo(0, 0):lineTo(5e6, 0):lineTo(0, 1):close():coverageIn(0, 0, 4, 4)
+  end).toThrow 'magick: MaxCoordinate 4194304 exceeded'
+
+  expect(function()
+    path.new():moveTo(0, 0):cubicTo(0, 1e9, 1, -1e9, 1, 0)
+  end).toThrow 'magick: MaxPiecesPerCurve 16384 exceeded'
+
+  expect(function()
+    path.new():moveTo(0, 0):lineTo(4000, 0):stroked { width = 1, dashes = { 0.001, 0.001 } }
+  end).toThrow 'magick: MaxDashesPerStroke 1048576 exceeded'
+
+  expect(function()
+    path.new():rect(0, 0, 1, 1):coverageIn(0, 0, 9000, 1)
+  end).toThrow 'magick: MaxImageEdge 8192 exceeded'
+end)
+
+return suite

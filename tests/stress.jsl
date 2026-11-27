@@ -1,0 +1,124 @@
+--!strict
+-- The stress run (MAG-044): Valley at First Light compiled once and rendered at 7680 by 4320
+-- (8K UHD) on four workers; 100,000 shapes at 4K on four workers and on one, which must agree;
+-- 100,000 brush dabs at 4K; and a canvas past MaxImageEdge refused before anything is made. Each
+-- section reports its time and bytes. An application target, run by hand or in a long CI job:
+--
+--   jess package run --capability worker.spawn --target stress .
+local application = require '@jess/application'
+local brush = require '@magick/brush'
+local bytes = require '@dream/bytes'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local valley = require '../demos/valley'
+
+local began = os.clock()
+local plan = render.compile(valley.build(7680, 4320))
+local compiled = os.clock() - began
+local started = os.clock()
+local image, stats = render.image(plan, { tileSize = 128, workers = 4, memoryBudgetBytes = 1024 * 1024 * 1024 })
+local seconds = os.clock() - started
+
+print(`stress: {image.width}x{image.height}, {plan.nodes} nodes, compiled {string.format('%.2f', compiled)} s, rendered {string.format('%.2f', seconds)} s on 4 workers, {stats.tiles} tiles`)
+print(`stress: {string.format('%08x', bytes.crc32(image.data))}`)
+
+-- pcall only around a document that must be refused: a canvas past MaxImageEdge.
+local refused = not pcall(scene.new, 8193, 4320, nil)
+
+print(`stress: 8193 wide refused: {refused}`)
+local failures = if refused then 0 else 1
+
+--- One section of the run: its name, how long it took, and what it drew.
+local function report(name: string, started: number, image: magick.Image, stats: render.Stats)
+  print(`stress: {name}: {image.width}x{image.height}, {string.format('%.2f', os.clock() - started)} s, {stats.tiles} tiles, {stats.rendered} drawn, {string.format('%08x', bytes.crc32(image.data))}`)
+end
+
+-- 100,000 shapes at 4K: small circles and squares in 100 groups, gradient and solid, on 4 workers,
+-- then the same plan on one, which must give the same bytes.
+do
+  local started = os.clock()
+  local document = scene.new(3840, 2160, { background = '#101820' })
+  local state = 7
+
+  local function random(): number
+    state = state * 48271 % 2147483647
+
+    return state / 2147483647
+  end
+
+  for group = 1, 100 do
+    local layer = document:add(document:group { opacity = 0.7 + random() * 0.3 })
+
+    for _ = 1, 1000 do
+      local left, top, size = random() * 3840, random() * 2160, 2 + random() * 10
+      local outline = if random() < 0.5 then path.new():circle(left, top, size) else path.new():rect(left, top, left + size, top + size)
+      local fill = if group % 3 == 0 then paint.linear(left, top, left + size, top, paint.stops(0, '#ffcc33', 1, '#3366ff')) else paint.solid(string.format('#%02x%02x%02x', math.floor(random() * 255), math.floor(random() * 255), math.floor(random() * 255)))
+
+      layer:add(document:shape(outline, { fill = fill }))
+    end
+  end
+
+  local plan = render.compile(document)
+
+  print(`stress: 100k nodes: {plan.nodes} nodes, {plan.operations} operations, plan {plan.bytes // (1024 * 1024)} MiB, compiled in {string.format('%.2f', os.clock() - started)} s`)
+
+  local began = os.clock()
+  -- Four copies of a 366 MiB plan (its estimate), besides the working sets and the output: 2 GiB.
+  local image, stats = render.image(plan, { workers = 4, memoryBudgetBytes = 2 * 1024 * 1024 * 1024 })
+
+  report('100k nodes, 4 workers', began, image, stats)
+
+  local serialStarted = os.clock()
+  local serial, serialStats = render.image(plan, { memoryBudgetBytes = 1024 * 1024 * 1024 })
+
+  report('100k nodes, serial', serialStarted, serial, serialStats)
+
+  if buffer.tostring(serial.data) ~= buffer.tostring(image.data) then
+    print('stress: 100k nodes: DIFFERENT BYTES on 4 workers and on one')
+    failures += 1
+  end
+end
+
+-- 100,000 brush dabs at 4K: 200 oil strokes of 500 dabs each, spirals across the canvas.
+do
+  local started = os.clock()
+  local document = scene.new(3840, 2160, { background = '#f4ecd8' })
+  local dabs = 0
+
+  for index = 1, 200 do
+    local samples: { brush.Sample } = {}
+    local centerX, centerY = (index % 20) * 192 + 96, (index // 20) * 216 + 108
+
+    for step = 0, 120 do
+      local angle = step / 120 * 6 * math.pi
+      local reach = 10 + step * 0.6
+
+      table.insert(samples, { centerX + math.cos(angle) * reach, centerY + math.sin(angle) * reach, 0.5 + 0.5 * math.sin(step / 120 * math.pi) })
+    end
+
+    local settings = brush.preset('oil', 14, string.format('#%02x4060', (index * 37) % 256), { spacing = 0.05 })
+
+    dabs += #brush.stroke(samples, settings, index).dabs
+    document:add(document:stroke(samples, settings, { seed = index }))
+  end
+
+  local plan = render.compile(document)
+
+  print(`stress: 100k dabs: {dabs} dabs in {plan.operations} strokes, plan {plan.bytes // (1024 * 1024)} MiB, compiled in {string.format('%.2f', os.clock() - started)} s`)
+
+  local began = os.clock()
+  -- Four copies of a 163 MiB plan, besides the working sets and the output: past the default 512 MiB.
+  local image, stats = render.image(plan, { workers = 4, memoryBudgetBytes = 1024 * 1024 * 1024 })
+
+  report('100k dabs, 4 workers', began, image, stats)
+
+  if dabs < 100000 then
+    print('stress: 100k dabs: FEWER THAN 100,000 dabs')
+    failures += 1
+  end
+end
+
+application.exit(if failures == 0 then 0 else 1)

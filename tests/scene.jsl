@@ -396,6 +396,38 @@ suite.describe('redraw and budgets', function()
     expect(node.id > 0).toBe(true)
   end)
 
+  suite.it('counts the tile of a mask and the halos of its groups in the budget', function()
+    local function masked(radius: number): scene.Document
+      local document = scene.new(64, 64)
+      local inner = document:group { filters = { { kind = 'blur', radius = radius } } }
+
+      inner:add(document:shape(path.new():rect(0, 0, 64, 64), { fill = paint.solid '#ffffff' }))
+
+      local holder = document:group()
+
+      holder:add(inner)
+
+      local group = document:add(document:group { mask = { node = holder } })
+
+      group:add(document:shape(path.new():rect(0, 0, 64, 64), { fill = paint.solid '#ff0000' }))
+
+      return document
+    end
+
+    local plain, blurred = render.compile(masked(0)), render.compile(masked(21))
+
+    -- The base, the group, its mask tile and the mask's two groups: four levels below the base.
+    local perWorker = (1 + 4 + 2) * 64 * 64 * 16 + 65 * 64 * 8
+
+    expect(render.workingBytes(plain, 64)).toBe(perWorker + 64 * 64 * 4)
+    -- Each worker holds a working set of its own, its copy of the plan, and the tiles that may wait
+    -- in its queues.
+    local queued = (render.InFlightBatches + 1) * render.BatchTiles * 64 * 64 * 4
+
+    expect(render.workingBytes(plain, 64, 4)).toBe(4 * (perWorker + plain.bytes + queued) + 64 * 64 * 4)
+    expect(render.workingBytes(blurred, 64) > render.workingBytes(plain, 64)).toBe(true)
+  end)
+
   suite.it('refuses a render past its memory budget before any tile runs', function()
     expect(function()
       render.image(busy(400, 300), { memoryBudgetBytes = 100000 })

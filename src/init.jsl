@@ -1605,8 +1605,18 @@ end
 
 --- The image a PNG file holds, the file given as its bytes or as a path to read them from. The
 --- samples must be eight bits and not interlaced; any color type but a palette is read.
+---
+--- `maxPixels` refuses an image whose header claims more pixels, before any of it is inflated, so
+--- an untrusted file cannot make a small stream expand into gigabytes. Left out, the size is
+--- unbounded, as it has always been. `verify` checks every chunk against its CRC-32, so a damaged file
+--- is refused rather than decoded to the wrong picture; left out, CRCs are not read, as before.
 @native
-function Magick.readPNG(source: buffer | string): Image
+function Magick.readPNG(source: buffer | string, options: { maxPixels: number?, verify: boolean? }?): Image
+  local cap = if options then options.maxPixels else nil
+  local verify = options and options.verify
+
+  if cap ~= nil and (cap ~= cap or cap < 1 or cap == math.huge) then error('magick: maxPixels must be a positive finite number', 2) end
+
   local file = opened(source)
   local length = buffer.len(file)
 
@@ -1622,6 +1632,11 @@ function Magick.readPNG(source: buffer | string): Image
     local payload = position + 8
 
     if payload + size + 4 > length then error('magick: truncated PNG chunk', 2) end
+
+    if verify and bytes.crc32(buffer.fromstring(buffer.readstring(file, position + 4, size + 4))) ~= bytes.readu32be(file, payload + size) then
+      error(`magick: PNG chunk {kind} does not match its CRC-32`, 2)
+    end
+
     if kind == 'IEND' then break end
 
     if kind == 'IHDR' then
@@ -1646,6 +1661,8 @@ function Magick.readPNG(source: buffer | string): Image
   end
 
   local {width, height, colorType} = header
+
+  if cap and width * height > cap then error(`magick: PNG of {width} by {height} pixels is past maxPixels {cap}`, 2) end
 
   local channels = PngChannels[colorType]
 

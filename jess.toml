@@ -5,7 +5,7 @@ id = "org.dreamweave.magick"
 version = "0.3.0"
 jess_api = "1"
 include = ["src", "LICENSES", "README.md", "COMPATIBILITY.md", "tests", "demos"]
-tests = ["tests/basic.jsl", "tests/compat.jsl", "tests/gate.jsl", "tests/property.jsl", "tests/png.jsl", "tests/path.jsl", "tests/resample.jsl", "tests/rfc.jsl", "tests/rfc_contracts.jsl", "tests/transform.jsl", "tests/coverage.jsl", "tests/stroke.jsl", "tests/color.jsl", "tests/paint.jsl", "tests/pattern.jsl", "tests/blend.jsl", "tests/scene.jsl", "tests/serialize.jsl", "tests/noise.jsl", "tests/brush.jsl", "tests/material.jsl", "tests/text.jsl", "tests/art.jsl", "tests/painter.jsl", "tests/svg.jsl", "tests/style.jsl"]
+tests = ["tests/basic.jsl", "tests/compat.jsl", "tests/gate.jsl", "tests/property.jsl", "tests/png.jsl", "tests/path.jsl", "tests/resample.jsl", "tests/rfc.jsl", "tests/rfc_contracts.jsl", "tests/transform.jsl", "tests/coverage.jsl", "tests/stroke.jsl", "tests/color.jsl", "tests/paint.jsl", "tests/pattern.jsl", "tests/blend.jsl", "tests/scene.jsl", "tests/serialize.jsl", "tests/noise.jsl", "tests/brush.jsl", "tests/material.jsl", "tests/text.jsl", "tests/art.jsl", "tests/painter.jsl", "tests/svg.jsl", "tests/fuzz.jsl", "tests/adversarial.jsl", "tests/style.jsl"]
 
 [modules]
 "@magick" = "src/init.jsl"
@@ -36,4 +36,9 @@ capabilities = ["worker.spawn"]
 [targets.showcase]
 kind = "application"
 entry = "tests/showcase.jsl"
+capabilities = ["worker.spawn"]
+
+[targets.stress]
+kind = "application"
+entry = "tests/stress.jsl"
 capabilities = ["worker.spawn"]

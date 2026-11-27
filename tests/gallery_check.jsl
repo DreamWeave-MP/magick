@@ -108,7 +108,7 @@ local function compare(
   if baselineFile then
     -- pcall only around the decode of a baseline file, which may be damaged: a file that will
     -- not decode is recorded as missing, not raised.
-    local ok, decoded = pcall(magick.readPNG, baselineFile)
+    local ok, decoded = pcall(magick.readPNG, baselineFile, nil)
 
     if ok then
       local decodedImage = decoded :: Image
