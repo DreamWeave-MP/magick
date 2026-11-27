@@ -3,7 +3,7 @@
 -- is deterministic, so a change here is a change to what the engine draws: review the render
 -- before taking a new record, and never take one to make a check pass.
 local Records: { [string]: string } = {
-  ['lighthouse'] = '900x1200:66b3db16',
+  ['lighthouse'] = '900x1200:a3d7845e',
   ['rosette'] = '1000x1000:4d1413ef',
 }
 

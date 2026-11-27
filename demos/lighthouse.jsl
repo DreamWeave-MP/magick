@@ -102,6 +102,8 @@ local function render(): magick.Image
   paint.fillPath(moon, path.new():circle(690, 190, 46), paint.radial(675, 175, 60, paint.stops(0, '#fffbe8', 1, '#e8d8b0')))
   paint.fillPath(moon, path.new():circle(712, 176, 42), paint.solid '#000000', { operator = 'dst-out' })
   paint.fillPath(canvas, path.new():circle(690, 190, 120), paint.radial(690, 190, 120, paint.stops(0, '#fff0d038', 0.4, '#fff0d014', 1, '#fff0d000')), { blend = 'screen' })
+  -- The unlit part of the moon hides the halo behind it: a dark disc, faintly earthlit, under the crescent.
+  paint.fillPath(canvas, path.new():circle(690, 190, 46), paint.solid '#171b3ae8')
   color.compositeGroup(canvas, moon)
 
   -- ridges, far to near: each farther one paler and bluer, the haze between them a gradient that
@@ -262,18 +264,24 @@ local function render(): magick.Image
   paint.fillPath(canvas, path.new():moveTo(750, 421):cubicTo(752, 400, 788, 400, 790, 421):close(), paint.solid '#2a2028')
   paint.fillPath(canvas, path.new():moveTo(770, 404):lineTo(770, 392):stroked { width = 1.5, cap = 'round' }, paint.solid '#2a2028')
 
-  -- Beams: two long wedges from the lantern, fading along their length, laid on by screen.
+  -- Beams: each a stack of nested wedges from the lantern, the narrow ones adding to the core, so
+  -- the light is brightest along its axis and falls off softly to its edges, and each layer fades
+  -- along its length. Laid on by screen, so they only ever brighten the sky.
   for _, beam in { { -2.86, 0.05 }, { -0.12, 0.035 } } do
     local angle, spread = beam[1], beam[2]
     local reach = 1100
-    local wedge = path.new():polygon {
-      { 770, 437 },
-      { 770 + math.cos(angle - spread) * reach, 437 + math.sin(angle - spread) * reach },
-      { 770 + math.cos(angle + spread) * reach, 437 + math.sin(angle + spread) * reach },
-    }
-    local fade = paint.linear(770, 437, 770 + math.cos(angle) * reach, 437 + math.sin(angle) * reach, paint.stops(0, '#fff0c070', 0.4, '#ffe0a028', 1, '#ffe0a000'))
 
-    paint.fillPath(canvas, wedge, fade, { blend = 'screen' })
+    for layer = 1, 6 do
+      local width = spread * layer / 6
+      local wedge = path.new():polygon {
+        { 770, 437 },
+        { 770 + math.cos(angle - width) * reach, 437 + math.sin(angle - width) * reach },
+        { 770 + math.cos(angle + width) * reach, 437 + math.sin(angle + width) * reach },
+      }
+      local fade = paint.linear(770, 437, 770 + math.cos(angle) * reach, 437 + math.sin(angle) * reach, paint.stops(0, '#ffe8a826', 0.35, '#ffd8900e', 0.8, '#ffd89000'))
+
+      paint.fillPath(canvas, wedge, fade, { blend = 'screen' })
+    end
   end
 
   paint.fillPath(canvas, path.new():circle(770, 437, 90), paint.radial(770, 437, 90, paint.stops(0, '#fff4c8a0', 0.25, '#ffd89040', 1, '#ffd89000')), { blend = 'screen' })
