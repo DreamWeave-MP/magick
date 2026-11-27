@@ -1,14 +1,31 @@
 --!strict
 -- "Portrait of a Reader", the reference-guided portrait (MAG-041). The reference is not a found
 -- image: it is an original vector portrait drawn here, so its provenance is this file and its
--- license the package's. The painter reads it coarse to fine and lays the oil preset over it, the
--- finest brushes going only where the face holds detail.
+-- license the package's. `painter.paint` reads it coarse to fine against its own renders, each part
+-- (face, hair, coat, backdrop) with its own brush, the finest glazes only in the face.
+local magick = require '@magick'
 local paint = require '@magick/paint'
 local painter = require '@magick/painter'
 local path = require '@magick/path'
 local render = require '@magick/render'
 local scene = require '@magick/scene'
-local transform = require '@magick/transform'
+
+--- The outlines the reference is drawn from, which the painting reuses as its regions.
+local function coatOutline(): path.Path
+  return path.new():moveTo(20, 450):cubicTo(40, 380, 110, 345, 180, 340):cubicTo(250, 345, 320, 380, 345, 450):close()
+end
+
+local function hairOutline(): path.Path
+  return path.new():moveTo(92, 200):cubicTo(80, 90, 160, 50, 220, 64):cubicTo(290, 80, 300, 170, 282, 260):cubicTo(270, 300, 250, 320, 236, 320):lineTo(120, 320):cubicTo(96, 290, 90, 240, 92, 200):close()
+end
+
+local function neckOutline(): path.Path
+  return path.new():moveTo(150, 290):lineTo(148, 360):cubicTo(170, 372, 200, 372, 214, 358):lineTo(210, 288):close()
+end
+
+local function faceOutline(): path.Path
+  return path.new():moveTo(120, 170):cubicTo(118, 110, 160, 88, 196, 92):cubicTo(240, 96, 262, 140, 256, 196):cubicTo(252, 250, 230, 296, 186, 306):cubicTo(150, 302, 124, 260, 120, 170):close()
+end
 
 --- The reference: a three-quarter head and shoulders, 360 by 450, lit from the upper left.
 local function reference(): scene.Document
@@ -25,19 +42,19 @@ local function reference(): scene.Document
   shape(path.new():rect(0, 0, 360, 450), paint.radial(120, 140, 360, paint.stops(0, '#8a6a48', 0.6, '#4a3428', 1, '#24180f')))
 
   -- Shoulders and a dark blue coat with a pale collar.
-  local coat = path.new():moveTo(20, 450):cubicTo(40, 380, 110, 345, 180, 340):cubicTo(250, 345, 320, 380, 345, 450):close()
+  local coat = coatOutline()
 
   shape(coat, paint.linear(60, 360, 300, 450, paint.stops(0, '#3a4a78', 0.5, '#24304e', 1, '#121a2c')))
   shape(path.new():moveTo(140, 352):lineTo(180, 400):lineTo(222, 352):cubicTo(210, 345, 152, 345, 140, 352):close(), paint.linear(140, 350, 220, 400, paint.stops(0, '#e8e0d0', 1, '#a8a090')))
 
   -- The neck, shadowed under the jaw.
-  shape(path.new():moveTo(150, 290):lineTo(148, 360):cubicTo(170, 372, 200, 372, 214, 358):lineTo(210, 288):close(), paint.linear(0, 290, 0, 360, paint.stops(0, '#8a5a40', 0.4, '#c08a68', 1, '#d8a888')))
+  shape(neckOutline(), paint.linear(0, 290, 0, 360, paint.stops(0, '#8a5a40', 0.4, '#c08a68', 1, '#d8a888')))
 
   -- Hair behind the head.
-  shape(path.new():moveTo(92, 200):cubicTo(80, 90, 160, 50, 220, 64):cubicTo(290, 80, 300, 170, 282, 260):cubicTo(270, 300, 250, 320, 236, 320):lineTo(120, 320):cubicTo(96, 290, 90, 240, 92, 200):close(), paint.linear(100, 60, 280, 320, paint.stops(0, '#6a3a22', 0.5, '#3e2014', 1, '#1e0e08')))
+  shape(hairOutline(), paint.linear(100, 60, 280, 320, paint.stops(0, '#6a3a22', 0.5, '#3e2014', 1, '#1e0e08')))
 
   -- The face: an oval lit from the left, warmer at the cheeks, shaded down its right side.
-  local face = path.new():moveTo(120, 170):cubicTo(118, 110, 160, 88, 196, 92):cubicTo(240, 96, 262, 140, 256, 196):cubicTo(252, 250, 230, 296, 186, 306):cubicTo(150, 302, 124, 260, 120, 170):close()
+  local face = faceOutline()
 
   shape(face, paint.radial(160, 170, 170, paint.stops(0, '#f2c8a8', 0.55, '#e0a888', 1, '#a86a50'), { focusX = 150, focusY = 150 }))
   shape(face, paint.linear(150, 0, 262, 0, paint.stops(0, '#00000000', 0.6, '#00000000', 1, '#5a2a1a90')))
@@ -70,23 +87,45 @@ local function reference(): scene.Document
   return document
 end
 
---- The painting at 1.5 times the reference, 540 by 675, with the reference image it was made from.
-local function build(): scene.Document
+--- Flesh glazes, as the Mona Lisa's: soft translucent dabs that never cover past their own tip.
+local Glaze: { [string]: unknown } = {
+  spacing = 0.15,
+  tip = { kind = 'round', hardness = 0.1 },
+  aspect = 0.9,
+  flow = 0.45,
+  minimumSize = 0.75,
+  accumulation = 'constant',
+  grainStrength = 0.04,
+  jitter = { lightness = 0.03, size = 0.05 },
+}
+
+--- The painting at twice the reference, 720 by 900, by `painter.paint` against its real renders.
+--- Each part keeps its own strokes: the face in glazes refined almost everywhere, the hair and the
+--- coat in oil along their forms, and the backdrop in short straight strokes, which a long stroke
+--- following the radial backdrop's gradient would curl into a vortex about the head.
+local function paintIt(): painter.Painting
   local image = render.image(reference())
-  local plan = painter.plan(image, { radii = { 10, 5, 2.5, 1.25 }, threshold = 0.045, curvature = 0.5, seed = 41 })
-  local document = scene.new(540, 675, { background = '#3a2a22', space = 'linear' })
 
-  painter.apply(document, document.root, plan, {
-    matrix = transform.scale(1.5),
-    seed = 9,
-    underpaint = image,
-    overrides = function(radius: number): { [string]: unknown }
-      -- The finest strokes are smoother and less bristled, as a small sable is.
-      return if radius < 2 then { spacing = 0.2, tip = { kind = 'round', hardness = 0.6 }, aspect = 0.8 } else { spacing = 0.15 }
-    end,
+  return painter.paint(image, {
+    radii = { 10, 5 },
+    threshold = 0.05,
+    curvature = 0.9,
+    maximumLength = 4,
+    seed = 41,
+    scale = 2,
+    ground = '#3a2a22',
+    overrides = { spacing = 0.12, aspect = 0.7, flow = 0.8, jitter = { hue = 0.03, lightness = 0.06, angle = 0.05, size = 0.08 } },
+    regions = {
+      { name = 'face', shape = faceOutline(), radii = { 10, 5, 3, 2, 1.5, 1 }, threshold = 0.01, curvature = 0.6, maximumLength = 8, overrides = Glaze },
+      { name = 'neck', shape = neckOutline(), radii = { 10, 5, 3, 2 }, threshold = 0.012, curvature = 0.6, maximumLength = 8, overrides = Glaze },
+      { name = 'hair', shape = hairOutline(), radii = { 10, 5, 2.5 }, threshold = 0.035, curvature = 0.4, maximumLength = 12 },
+      { name = 'coat', shape = coatOutline(), radii = { 10, 5, 2.5 }, threshold = 0.035, curvature = 0.5, maximumLength = 10 },
+    },
   })
+end
 
-  return document
+local function build(): magick.Image
+  return paintIt().image
 end
 
 return { name = 'portrait', build = build, reference = reference }

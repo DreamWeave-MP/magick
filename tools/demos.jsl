@@ -50,7 +50,7 @@ local Demos: { Demo } = {
   {
     name = 'portrait',
     render = function(): magick.Image
-      return (render.image(portrait.build()))
+      return portrait.build()
     end,
   },
   {

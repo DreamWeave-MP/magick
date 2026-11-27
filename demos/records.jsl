@@ -6,9 +6,9 @@ local Records: { [string]: string } = {
   ['lighthouse'] = '900x1200:a3d7845e',
   ['rosette'] = '1000x1000:4d1413ef',
   ['valley'] = '960x540:5f71731b',
-  ['heron'] = '800x1000:7b868098',
+  ['heron'] = '800x1000:315f86c5',
   ['oil'] = '960x540:bdf08d8b',
-  ['portrait'] = '540x675:a0c7bfe1',
+  ['portrait'] = '720x900:7c818e92',
   ['valley-painted'] = '960x540:83b83d01',
   ['monalisa'] = '1000x1490:b93b6b93',
 }
