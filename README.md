@@ -164,7 +164,7 @@ The DreamWeave Mod Template uses Magick as its site generator's image backend: `
 The template pins Magick with a caret requirement, so publishing it waits on a Magick 0.5 release.
 [`docs/downstream.md`](docs/downstream.md) has the script and commands to check both claims again.
 
-## 0.4.0 changes: Atelier
+## Atelier changes (planned as 0.4.0, released in 0.5.0)
 
 ### `@magick/noise`
 
