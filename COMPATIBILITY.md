@@ -5,11 +5,14 @@ alter inside 0.1.x. It was written from the package as imported (commit `6206925
 suites in `tests/` as the proof: `tests/compat.jsl` runs the examples here, and the goldens in
 `tests/goldens.jsl` hold every operation to the bytes it gave at import.
 
-Measured against: `jess` 0.3.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
+Measured against: `jess` 0.4.0 (`jess_api = "1"` in `jess.toml`). Gates run on this checkout:
 
-- `jess package test .`: 500 passed, 0 failed (each test counted once per provider; 274 before `tests/rfc.jsl` and `tests/rfc_contracts.jsl`, which add 226 counted items, 113 tests).
+- `jess package test .`: 664 passed, 0 failed. That is 332 tests counted twice: each suite runs once from
+  the source folder and once from the packed `.jpk`, so every count is doubled. Per provider, 49 are
+  `tests/basic.jsl`, 46 `tests/compat.jsl`, 78 `tests/gate.jsl`, 4 `tests/property.jsl`, 15
+  `tests/png.jsl`, 16 `tests/path.jsl`, 10 `tests/resample.jsl`, 56 `tests/rfc.jsl`, 57 `tests/rfc_contracts.jsl` and 1 `tests/style.jsl`.
 - `jess package check .`: no errors, strict types over every `.jsl`.
-- `jess run --package . bench/bench.jsl`: all 91 workloads ran and held their fingerprints.
+- `jess run --package . bench/bench.jsl`: all 98 workloads ran and held their fingerprints (91 of them before the gate rows).
 
 ## Policy
 
@@ -236,8 +239,21 @@ announced in the release notes of the release that ships it, and is not a silent
   "**Quirks are contract too.** ... A fix goes in as a clearly versioned opt-in, never as a silent change", which this
   entry records as an owner-approved exception rather than an opt-in. Golden and benchmark files do not call
   `transformed` on a curve, so no golden moves. Release notes for 0.2.0 must carry this entry.
+## Known legacy behaviour
+
+Two defects, pinned as they are and not endorsed:
+
+- `magick.tile` over a source with no width throws `buffer access out of bounds` (src/init.jsl),
+  for any target with a height. `tests/property.jsl` pins it; a source with width is tiled normally.
+These are what 0.1.3 does, kept as they are and pinned by the suites, not endorsed as correct:
+
+- `Image:rotate` of a 0 by 0 image returns a 2 by 1 image of 8 bytes, where `rotate90` of the same
+  image returns 0 by 0. Nothing about an empty image is promised here. The gate suite pins the
+  2 by 1 result as a defect (`tests/gate.jsl`, "pins the rotate of nothing as the legacy defect it
+  is"), so a fix changes that test and this entry together.
 
 ## Where the proof lives
+
 
 - `tests/basic.jsl`: every operation on seeded fixtures, held to the goldens in
   `tests/goldens.jsl` (the geometry and CRC-32 of each result, as imported).
@@ -245,5 +261,10 @@ announced in the release notes of the release that ships it, and is not a silent
 - `tests/compat.jsl`: the examples in this document, and the consumer call shapes.
 - `tests/style.jsl`: `@jess/style` over the payload.
 - `tests/rfc.jsl`, `tests/rfc_contracts.jsl`: the renderer RFC's pinned legacy facts and its computable contracts (`docs/RFC-0001-renderer.md`).
+- `tests/gate.jsl`: tiny exact fixtures, the reference scenes of `tests/scenes.jsl` and empty and
+  one-pixel images. `tools/gallery.jsl` renders the scenes to PNG and checks them against
+  `tests/gallery/`.
+  `tests/gallery_check.jsl` is the gallery's comparison and report, held to a round trip and to
+  a report cut short.
 - `bench/bench.jsl`: every workload, held to its fingerprint; methodology and the reference table
   are in `BENCHMARKS.md`.
