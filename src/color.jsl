@@ -50,7 +50,31 @@ export type Operator =
 export type TileOptions = { space: Space?, left: number?, top: number? }
 
 --- What `composite` takes: an operator (`src-over` by default) and an opacity in 0..1 (1).
-export type CompositeOptions = { operator: Operator?, opacity: number? }
+--- The W3C blend modes.
+export type BlendMode =
+  'normal'
+  | 'multiply'
+  | 'screen'
+  | 'overlay'
+  | 'darken'
+  | 'lighten'
+  | 'color-dodge'
+  | 'color-burn'
+  | 'hard-light'
+  | 'soft-light'
+  | 'difference'
+  | 'exclusion'
+  | 'hue'
+  | 'saturation'
+  | 'color'
+  | 'luminosity'
+
+--- A clip: coverage bytes placed with their top left pixel at (`left`, `top`) in device space.
+export type Clip = { mask: magick.Mask, left: number, top: number }
+
+--- What `composite` takes: an operator (`src-over` by default), a blend mode (`normal`), an opacity
+--- in 0..1 (1), and a clip the source is first multiplied by.
+export type CompositeOptions = { operator: Operator?, blend: BlendMode?, opacity: number?, clip: Clip? }
 
 --- The widest or tallest tile, and the most pixels one tile holds: 4096 by 4096.
 Module.MaxImageEdge = 8192
@@ -415,6 +439,249 @@ local function blend(
   end
 end
 
+--- The blend modes of W3C Compositing Level 1: twelve separable, four nonseparable.
+local BlendModes: { [string]: boolean } = {
+  normal = true,
+  multiply = true,
+  screen = true,
+  overlay = true,
+  darken = true,
+  lighten = true,
+  ['color-dodge'] = true,
+  ['color-burn'] = true,
+  ['hard-light'] = true,
+  ['soft-light'] = true,
+  difference = true,
+  exclusion = true,
+  hue = true,
+  saturation = true,
+  color = true,
+  luminosity = true,
+}
+
+--- Refuses a blend mode outside the W3C sixteen.
+function Module.checkBlend(mode: string): BlendMode
+  if not BlendModes[mode] then error(`magick: unknown blend mode {mode}`, 3) end
+
+  return mode :: BlendMode
+end
+
+--- A separable blend of one straight channel: `B(backdrop, source)` of W3C Compositing Level 1.
+function Module.separable(mode: BlendMode, backdrop: number, source: number): number
+  if mode == 'multiply' then return backdrop * source end
+  if mode == 'screen' then return backdrop + source - backdrop * source end
+  if mode == 'overlay' then return Module.separable('hard-light', source, backdrop) end
+  if mode == 'darken' then return math.min(backdrop, source) end
+  if mode == 'lighten' then return math.max(backdrop, source) end
+
+  if mode == 'color-dodge' then
+    if backdrop == 0 then return 0 end
+    if source >= 1 then return 1 end
+
+    return math.min(1, backdrop / (1 - source))
+  end
+
+  if mode == 'color-burn' then
+    if backdrop >= 1 then return 1 end
+    if source <= 0 then return 0 end
+
+    return 1 - math.min(1, (1 - backdrop) / source)
+  end
+
+  if mode == 'hard-light' then
+    if source <= 0.5 then return backdrop * 2 * source end
+
+    local doubled = 2 * source - 1
+
+    return backdrop + doubled - backdrop * doubled
+  end
+
+  if mode == 'soft-light' then
+    if source <= 0.5 then return backdrop - (1 - 2 * source) * backdrop * (1 - backdrop) end
+
+    local curve = if backdrop <= 0.25 then ((16 * backdrop - 12) * backdrop + 4) * backdrop else math.sqrt(backdrop)
+
+    return backdrop + (2 * source - 1) * (curve - backdrop)
+  end
+
+  if mode == 'difference' then return math.abs(backdrop - source) end
+  if mode == 'exclusion' then return backdrop + source - 2 * backdrop * source end
+
+  return source
+end
+
+local function luminance(red: number, green: number, blue: number): number
+  return 0.3 * red + 0.59 * green + 0.11 * blue
+end
+
+--- W3C ClipColor after SetLum: pulls a color back inside 0..1 about its luminance.
+local function clipColor(red: number, green: number, blue: number): (number, number, number)
+  local light = luminance(red, green, blue)
+  local low, high = math.min(red, green, blue), math.max(red, green, blue)
+
+  if low < 0 then
+    local scale = light / (light - low)
+
+    red, green, blue = light + (red - light) * scale, light + (green - light) * scale, light + (blue - light) * scale
+  end
+
+  if high > 1 then
+    local scale = (1 - light) / (high - light)
+
+    red, green, blue = light + (red - light) * scale, light + (green - light) * scale, light + (blue - light) * scale
+  end
+
+  return red, green, blue
+end
+
+local function setLuminance(red: number, green: number, blue: number, light: number): (number, number, number)
+  local shift = light - luminance(red, green, blue)
+
+  return clipColor(red + shift, green + shift, blue + shift)
+end
+
+--- W3C SetSat: the color's spread between its least and greatest channel set to `amount`.
+local function setSaturation(red: number, green: number, blue: number, amount: number): (number, number, number)
+  local low, high = math.min(red, green, blue), math.max(red, green, blue)
+
+  if high <= low then return 0, 0, 0 end
+
+  -- Cmax becomes the amount, Cmin 0 and Cmid its share between them; a channel tied with Cmax is a
+  -- Cmid of the same value, so it becomes the amount too, and one tied with Cmin becomes 0.
+  local scale = amount / (high - low)
+
+  return (red - low) * scale, (green - low) * scale, (blue - low) * scale
+end
+
+--- A blend of straight colors, `B(backdrop, source)` channel by channel or, for `hue`,
+--- `saturation`, `color` and `luminosity`, as a whole.
+function Module.blendColor(
+  mode: BlendMode,
+  backdropRed: number,
+  backdropGreen: number,
+  backdropBlue: number,
+  sourceRed: number,
+  sourceGreen: number,
+  sourceBlue: number
+): (number, number, number)
+  if mode == 'luminosity' then
+    return setLuminance(backdropRed, backdropGreen, backdropBlue, luminance(sourceRed, sourceGreen, sourceBlue))
+  end
+
+  if mode == 'color' then
+    return setLuminance(sourceRed, sourceGreen, sourceBlue, luminance(backdropRed, backdropGreen, backdropBlue))
+  end
+
+  if mode == 'hue' or mode == 'saturation' then
+    local backdropSaturation = math.max(backdropRed, backdropGreen, backdropBlue) - math.min(backdropRed, backdropGreen, backdropBlue)
+    local sourceSaturation = math.max(sourceRed, sourceGreen, sourceBlue) - math.min(sourceRed, sourceGreen, sourceBlue)
+    local red, green, blue
+
+    if mode == 'hue' then
+      red, green, blue = setSaturation(sourceRed, sourceGreen, sourceBlue, backdropSaturation)
+    else
+      red, green, blue = setSaturation(backdropRed, backdropGreen, backdropBlue, sourceSaturation)
+    end
+
+    return setLuminance(red, green, blue, luminance(backdropRed, backdropGreen, backdropBlue))
+  end
+
+  return Module.separable(mode, backdropRed, sourceRed),
+    Module.separable(mode, backdropGreen, sourceGreen),
+    Module.separable(mode, backdropBlue, sourceBlue)
+end
+
+--- One premultiplied source pixel over one premultiplied backdrop pixel by a blend mode, src-over:
+--- `cr = cs (1 - ab) + cb (1 - as) + as ab B(Cb, Cs)`, `ar = as + ab - as ab`.
+function Module.mixPixel(
+  mode: BlendMode,
+  sourceRed: number,
+  sourceGreen: number,
+  sourceBlue: number,
+  sourceAlpha: number,
+  backdropRed: number,
+  backdropGreen: number,
+  backdropBlue: number,
+  backdropAlpha: number
+): (number, number, number, number)
+  local alpha = sourceAlpha + backdropAlpha - sourceAlpha * backdropAlpha
+
+  if sourceAlpha <= 0 or backdropAlpha <= 0 or mode == 'normal' then
+    return sourceRed + backdropRed * (1 - sourceAlpha),
+      sourceGreen + backdropGreen * (1 - sourceAlpha),
+      sourceBlue + backdropBlue * (1 - sourceAlpha),
+      alpha
+  end
+
+  local blendRed, blendGreen, blendBlue = Module.blendColor(
+    mode,
+    math.clamp(backdropRed / backdropAlpha, 0, 1),
+    math.clamp(backdropGreen / backdropAlpha, 0, 1),
+    math.clamp(backdropBlue / backdropAlpha, 0, 1),
+    math.clamp(sourceRed / sourceAlpha, 0, 1),
+    math.clamp(sourceGreen / sourceAlpha, 0, 1),
+    math.clamp(sourceBlue / sourceAlpha, 0, 1)
+  )
+  local both = sourceAlpha * backdropAlpha
+
+  return sourceRed * (1 - backdropAlpha) + backdropRed * (1 - sourceAlpha) + both * blendRed,
+    sourceGreen * (1 - backdropAlpha) + backdropGreen * (1 - sourceAlpha) + both * blendGreen,
+    sourceBlue * (1 - backdropAlpha) + backdropBlue * (1 - sourceAlpha) + both * blendBlue,
+    alpha
+end
+
+--- Composites with a blend mode or through a clip, one pixel at a time: the source scaled by the
+--- clip's coverage and the opacity, then mixed by the blend (src-over) or the operator.
+local function blendThrough(
+  destination: Tile,
+  source: Tile,
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+  mode: BlendMode,
+  factor: { number },
+  opacity: number,
+  clip: Clip?
+)
+  for row = top, bottom - 1 do
+    for column = left, right - 1 do
+      local weight = opacity
+
+      if clip then
+        local maskColumn, maskRow = column - clip.left, row - clip.top
+        local mask = clip.mask
+        local inside = maskColumn >= 0 and maskRow >= 0 and maskColumn < mask.width and maskRow < mask.height
+
+        weight *= if inside then buffer.readu8(mask.data, maskRow * mask.width + maskColumn) / 255 else 0
+      end
+
+      local from = ((row - source.top) * source.width + column - source.left) * 16
+      local to = ((row - destination.top) * destination.width + column - destination.left) * 16
+      local sourceRed, sourceGreen = buffer.readf32(source.data, from) * weight, buffer.readf32(source.data, from + 4) * weight
+      local sourceBlue, sourceAlpha = buffer.readf32(source.data, from + 8) * weight, buffer.readf32(source.data, from + 12) * weight
+      local backdropRed, backdropGreen = buffer.readf32(destination.data, to), buffer.readf32(destination.data, to + 4)
+      local backdropBlue, backdropAlpha = buffer.readf32(destination.data, to + 8), buffer.readf32(destination.data, to + 12)
+      local red, green, blue, alpha
+
+      if mode ~= 'normal' then
+        red, green, blue, alpha = Module.mixPixel(mode, sourceRed, sourceGreen, sourceBlue, sourceAlpha, backdropRed, backdropGreen, backdropBlue, backdropAlpha)
+      else
+        local fa, fb = factor[1] + factor[2] * backdropAlpha, factor[3] + factor[4] * sourceAlpha
+
+        red, green, blue = sourceRed * fa + backdropRed * fb, sourceGreen * fa + backdropGreen * fb, sourceBlue * fa + backdropBlue * fb
+        alpha = sourceAlpha * fa + backdropAlpha * fb
+      end
+
+      alpha = math.clamp(alpha, 0, 1)
+      buffer.writef32(destination.data, to, math.clamp(red, 0, alpha))
+      buffer.writef32(destination.data, to + 4, math.clamp(green, 0, alpha))
+      buffer.writef32(destination.data, to + 8, math.clamp(blue, 0, alpha))
+      buffer.writef32(destination.data, to + 12, alpha)
+    end
+  end
+end
+
 --- Scales every pixel of a tile outside a rectangle by `factor`: what an operator does to the
 --- backdrop where the source is transparent.
 local function outside(tile: Tile, left: number, top: number, right: number, bottom: number, factor: number)
@@ -433,10 +700,12 @@ local function outside(tile: Tile, left: number, top: number, right: number, bot
   end
 end
 
-local CompositeKeys = { operator = true, opacity = true }
+local CompositeKeys = { operator = true, blend = true, opacity = true, clip = true }
 
---- Composites `source` onto `destination` where they overlap in device space, by an operator, its
---- alpha first scaled by `opacity`. Where the source does not reach it is transparent, so an
+--- Composites `source` onto `destination` where they overlap in device space. The source is first
+--- multiplied by `clip` (coverage bytes placed in device space; nothing outside them) and by
+--- `opacity`, once, then laid on by a blend mode, which composites src-over, or by a Porter-Duff
+--- operator with the normal blend. Where the source does not reach it is transparent, so an
 --- operator that clears under a transparent source (`src`, `src-in`, `dst-in`, `src-out`,
 --- `dst-atop`, `clear`) clears the rest of the destination. Both tiles must be of one space.
 --- Returns the destination.
@@ -453,35 +722,54 @@ function Module.composite(destination: Tile, source: Tile, options: CompositeOpt
 
   if not factor then error(`magick: unknown operator {operator}`, 2) end
 
+  local mode = Module.checkBlend(if options and options.blend then options.blend else 'normal')
+
+  if mode ~= 'normal' and operator ~= 'src-over' then error('magick: blend modes composite with src-over only', 2) end
+
   local opacity = if options then options.opacity or 1 else 1
 
   if not finite(opacity) or opacity < 0 or opacity > 1 then error('magick: opacity must be in 0..1', 2) end
 
+  local clip = if options then options.clip else nil
   local left = math.max(destination.left, source.left)
   local top = math.max(destination.top, source.top)
   local right = math.min(destination.left + destination.width, source.left + source.width)
   local bottom = math.min(destination.top + destination.height, source.top + source.height)
 
   if right > left and bottom > top then
-    blend(
-      destination.data,
-      destination.width,
-      source.data,
-      source.width,
-      right - left,
-      bottom - top,
-      left - destination.left,
-      top - destination.top,
-      left - source.left,
-      top - source.top,
-      factor,
-      opacity
-    )
+    if mode == 'normal' and not clip then
+      blend(
+        destination.data,
+        destination.width,
+        source.data,
+        source.width,
+        right - left,
+        bottom - top,
+        left - destination.left,
+        top - destination.top,
+        left - source.left,
+        top - source.top,
+        factor,
+        opacity
+      )
+    else
+      blendThrough(destination, source, left, top, right, bottom, mode, factor, opacity, clip)
+    end
   end
 
   outside(destination, left - destination.left, top - destination.top, right - destination.left, bottom - destination.top, factor[3])
 
   return destination
+end
+
+--- Composites a finished isolated group onto its backdrop (RFC-0001 G1 to G7): its children were
+--- drawn into `group`, a tile that started transparent; it is clipped, its opacity applied once, and
+--- it is laid on by its blend and operator, in that order. The same call as `composite`.
+Module.compositeGroup = Module.composite
+
+--- A transparent tile with another's place, size and space: the canvas of an isolated group.
+function Module.group(like: Tile): Tile
+  return Module.tile(like.width, like.height, { space = like.space, left = like.left, top = like.top })
 end
 
 return Module

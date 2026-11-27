@@ -419,6 +419,14 @@ other separable modes (`color-dodge`, `color-burn`, `hard-light`, `difference`, 
 modes (`hue`, `saturation`, `color`, `luminosity`) are not in 0.2.0, so they are refused like any other unknown name.
 Each later addition needs reference vectors.
 
+**Amendment A2 (MAG-014, provisional until ratified): all sixteen W3C blend modes.** W9's seven modes are extended to
+the full W3C Compositing Level 1 set: the separable `color-dodge`, `color-burn`, `hard-light`, `difference` and
+`exclusion`, and the nonseparable `hue`, `saturation`, `color` and `luminosity` (Lum, ClipColor, SetLum and SetSat as W3C
+defines them; a channel tied with the greatest takes the whole saturation, as its Cmid does). Each has reference
+values in `tests/blend.jsl`, which is the "reference vectors" condition of W9. A name outside the sixteen is still
+refused. Blending applies to the tile's own values, so in a `linear` tile it blends linear light. Patterns gain the edge
+`transparent` (nothing past the source) beside M10's `clamp`, `repeat` and `mirror`.
+
 **Computable values.** At `cb = 0.5`, `cs = 0.25`, opaque: normal 0.25, multiply 0.125, screen 0.625, overlay 0.25,
 darken 0.25, lighten 0.5, soft-light 0.375. Off-center: `overlay(0.75, 0.25) = 0.625`,
 `soft-light(0.5, 0.75) = 0.5 + 0.5 * (sqrt(0.5) - 0.5)`, and `soft-light(0.2, 0.75) = 0.324`, which takes the

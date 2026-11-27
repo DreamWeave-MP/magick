@@ -1,0 +1,231 @@
+--!strict
+-- Blend modes and isolated groups (MAG-014): every W3C blend mode against values worked out by
+-- hand, the composite formula with partial alpha and opacity, unknown names refused, and the group
+-- order of RFC-0001 G2 (children, clip, opacity once, blend and operator) with its worked numbers.
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local test = require '@jess/test'
+
+local expect = test.expect
+local suite = test.new()
+
+local function near(actual: number, expected: number): boolean
+  return math.abs(actual - expected) < 1e-4
+end
+
+local function pixelTile(red: number, green: number, blue: number, alpha: number): color.Tile
+  local tile = color.tile(1, 1)
+
+  buffer.writef32(tile.data, 0, red)
+  buffer.writef32(tile.data, 4, green)
+  buffer.writef32(tile.data, 8, blue)
+  buffer.writef32(tile.data, 12, alpha)
+
+  return tile
+end
+
+local function matches(tile: color.Tile, expected: { number }): boolean
+  local red, green, blue, alpha = color.pixel(tile, 0, 0)
+
+  return near(red, expected[1]) and near(green, expected[2]) and near(blue, expected[3]) and near(alpha, expected[4])
+end
+
+suite.describe('separable modes', function()
+  -- B(0.5, 0.25), backdrop 0.5 and source 0.25, by the W3C definitions.
+  local atQuarter: { [string]: number } = {
+    normal = 0.25,
+    multiply = 0.125,
+    screen = 0.625,
+    overlay = 0.25,
+    darken = 0.25,
+    lighten = 0.5,
+    -- min(1, 0.5 / 0.75)
+    ['color-dodge'] = 2 / 3,
+    -- 1 - min(1, 0.5 / 0.25)
+    ['color-burn'] = 0,
+    -- multiply(0.5, 2 * 0.25)
+    ['hard-light'] = 0.25,
+    -- 0.5 - (1 - 0.5) * 0.5 * 0.5
+    ['soft-light'] = 0.375,
+    difference = 0.25,
+    -- 0.5 + 0.25 - 2 * 0.125
+    exclusion = 0.5,
+  }
+
+  suite.it('gives every separable mode its W3C value at backdrop 0.5, source 0.25', function()
+    for mode, expected in atQuarter do
+      expect(near(color.separable(mode :: color.BlendMode, 0.5, 0.25), expected)).toBe(true)
+    end
+  end)
+
+  suite.it('takes each branch of overlay, soft-light, dodge and burn', function()
+    -- overlay(0.75, 0.25) = screen(0.25, 2 * 0.75 - 1) = 0.25 + 0.5 - 0.125.
+    expect(near(color.separable('overlay', 0.75, 0.25), 0.625)).toBe(true)
+    expect(near(color.separable('soft-light', 0.5, 0.75), 0.5 + 0.5 * (math.sqrt(0.5) - 0.5))).toBe(true)
+    -- D(0.2) = ((16 * 0.2 - 12) * 0.2 + 4) * 0.2 = 0.448; 0.2 + 0.5 * (0.448 - 0.2) = 0.324.
+    expect(near(color.separable('soft-light', 0.2, 0.75), 0.324)).toBe(true)
+    expect({ color.separable('color-dodge', 0, 1), color.separable('color-dodge', 0.3, 1) }).toEqual { 0, 1 }
+    expect({ color.separable('color-burn', 1, 0), color.separable('color-burn', 0.3, 0) }).toEqual { 1, 0 }
+    -- hard-light(0.5, 0.75) = screen(0.5, 0.5) = 0.75.
+    expect(near(color.separable('hard-light', 0.5, 0.75), 0.75)).toBe(true)
+  end)
+
+  suite.it('keeps every mode inside 0..1 over a grid of inputs', function()
+    for mode in atQuarter do
+      for backdrop = 0, 20 do
+        for source = 0, 20 do
+          local value = color.separable(mode :: color.BlendMode, backdrop / 20, source / 20)
+
+          expect(value >= 0 and value <= 1).toBe(true)
+        end
+      end
+    end
+  end)
+end)
+
+suite.describe('nonseparable modes', function()
+  suite.it('sets luminosity, color, hue and saturation by the W3C helpers', function()
+    -- luminosity: SetLum((1, 0, 0), Lum(0, 0, 1) = 0.11) = (0.81, -0.19, -0.19), clipped about
+    -- 0.11 by 0.11 / 0.30: (0.36667, 0, 0).
+    local red, green, blue = color.blendColor('luminosity', 1, 0, 0, 0, 0, 1)
+
+    expect(near(red, 0.11 + 0.7 * 0.11 / 0.3) and near(green, 0) and near(blue, 0)).toBe(true)
+
+    -- color: SetLum((0, 0, 1), 0.3) = (0.19, 0.19, 1.19), clipped about 0.3 by 0.7 / 0.89.
+    red, green, blue = color.blendColor('color', 1, 0, 0, 0, 0, 1)
+    expect(near(red, 0.3 - 0.11 * 0.7 / 0.89) and near(green, red) and near(blue, 1)).toBe(true)
+
+    -- saturation: the backdrop (0.8, 0.4, 0.2) given a gray source's saturation 0 is its gray,
+    -- Lum = 0.24 + 0.236 + 0.022 = 0.498.
+    red, green, blue = color.blendColor('saturation', 0.8, 0.4, 0.2, 0.5, 0.5, 0.5)
+    expect(near(red, 0.498) and near(green, 0.498) and near(blue, 0.498)).toBe(true)
+
+    -- hue: blue given the backdrop's saturation 0.6 is (0, 0, 0.6); at the backdrop's luminance
+    -- 0.498 that is (0.432, 0.432, 1.032), clipped about 0.498 by 0.502 / 0.534.
+    red, green, blue = color.blendColor('hue', 0.8, 0.4, 0.2, 0, 0, 1)
+
+    local pulled = 0.498 - 0.066 * 0.502 / 0.534
+
+    expect(near(red, pulled) and near(green, pulled) and near(blue, 1)).toBe(true)
+  end)
+
+  suite.it('gives a tied greatest channel the whole saturation, as W3C SetSat does', function()
+    -- Hue of (1, 1, 0) onto a backdrop of saturation 0.5 and luminance 0.5.
+    local red, green, blue = color.blendColor('hue', 0.75, 0.5, 0.25, 1, 1, 0)
+
+    expect(near(red, green) and blue < red).toBe(true)
+  end)
+end)
+
+suite.describe('compositing with a blend', function()
+  suite.it('composites multiply at opacity 0.5 over opaque and half-transparent backdrops', function()
+    local opaque = pixelTile(0.5, 0.5, 0.5, 1)
+
+    color.composite(opaque, pixelTile(0.25, 0.25, 0.25, 1), { blend = 'multiply', opacity = 0.5 })
+    -- as = 0.5: 0.125 (1 - 1) + 0.5 (1 - 0.5) + 0.5 * 1 * 0.125 = 0.3125.
+    expect(matches(opaque, { 0.3125, 0.3125, 0.3125, 1 })).toBe(true)
+
+    local half = pixelTile(0.25, 0.25, 0.25, 0.5)
+
+    color.composite(half, pixelTile(0.25, 0.25, 0.25, 1), { blend = 'multiply', opacity = 0.5 })
+    -- cs 0.125, as 0.5, cb 0.25, ab 0.5, B(0.5, 0.25) = 0.125:
+    -- 0.125 * 0.5 + 0.25 * 0.5 + 0.25 * 0.125 = 0.21875; alpha 0.75.
+    expect(matches(half, { 0.21875, 0.21875, 0.21875, 0.75 })).toBe(true)
+  end)
+
+  suite.it('reduces to src-over where either side is transparent', function()
+    local empty = pixelTile(0, 0, 0, 0)
+
+    color.composite(empty, pixelTile(0.2, 0.4, 0.1, 0.5), { blend = 'difference' })
+    expect(matches(empty, { 0.2, 0.4, 0.1, 0.5 })).toBe(true)
+  end)
+
+  suite.it('refuses unknown modes, and a blend with an operator other than src-over', function()
+    expect(function()
+      color.composite(color.tile(1, 1), color.tile(1, 1), { blend = 'linear-burn' :: any })
+    end).toThrow 'magick: unknown blend mode linear-burn'
+
+    expect(function()
+      color.composite(color.tile(1, 1), color.tile(1, 1), { blend = 'multiply', operator = 'src-in' })
+    end).toThrow 'magick: blend modes composite with src-over only'
+  end)
+end)
+
+suite.describe('groups', function()
+  suite.it('composes a group as G5 works it out: 191, 128, 191, 255', function()
+    local backdrop = color.fromImage(magick.new(1, 1, '#ffffff'))
+    local group = color.group(backdrop)
+
+    color.composite(group, pixelTile(1, 0, 0, 1))
+    color.composite(group, pixelTile(0, 0, 0.5, 0.5))
+    expect(matches(group, { 0.5, 0, 0.5, 1 })).toBe(true)
+
+    color.compositeGroup(backdrop, group, { opacity = 0.5 })
+    expect(matches(backdrop, { 0.75, 0.5, 0.75, 1 })).toBe(true)
+    expect({ color.toImage(backdrop):get(0, 0) }).toEqual { 191, 128, 191, 255 }
+  end)
+
+  suite.it('applies opacity once to the group, not to each child', function()
+    -- Two overlapping opaque children at group opacity 0.5 give 0.5 coverage, where each child at
+    -- 0.5 would give 0.75.
+    local backdrop = color.tile(1, 1)
+    local group = color.group(backdrop)
+
+    color.composite(group, pixelTile(1, 0, 0, 1))
+    color.composite(group, pixelTile(0, 0, 1, 1))
+    color.compositeGroup(backdrop, group, { opacity = 0.5 })
+    expect(matches(backdrop, { 0, 0, 0.5, 0.5 })).toBe(true)
+
+    local separately = color.tile(1, 1)
+
+    color.composite(separately, pixelTile(1, 0, 0, 1), { opacity = 0.5 })
+    color.composite(separately, pixelTile(0, 0, 1, 1), { opacity = 0.5 })
+    expect(near(select(4, color.pixel(separately, 0, 0)), 0.75)).toBe(true)
+  end)
+
+  suite.it('clips the group before its opacity and blend: red clipped by half over white', function()
+    local backdrop = color.fromImage(magick.new(1, 1, '#ffffff'))
+    local group = color.group(backdrop)
+    local half = magick.mask(1, 1, buffer.fromstring '\128')
+
+    color.composite(group, pixelTile(1, 0, 0, 1))
+    color.compositeGroup(backdrop, group, { clip = { mask = half, left = 0, top = 0 } })
+
+    local red, green = color.pixel(backdrop, 0, 0)
+
+    expect(near(red, 1) and near(green, 1 - 128 / 255)).toBe(true)
+  end)
+
+  suite.it('isolates: a child drawn src-in into the empty group leaves the backdrop', function()
+    local backdrop = color.fromImage(magick.new(1, 1, '#ffffff'))
+    local group = color.group(backdrop)
+
+    color.composite(group, pixelTile(1, 0, 0, 1), { operator = 'src-in' })
+    color.compositeGroup(backdrop, group)
+    expect(matches(backdrop, { 1, 1, 1, 1 })).toBe(true)
+  end)
+
+  suite.it('blends a whole group: multiply of red over white is red', function()
+    local backdrop = color.fromImage(magick.new(1, 1, '#ffffff'))
+    local group = color.group(backdrop)
+
+    color.composite(group, pixelTile(1, 0, 0, 1))
+    color.compositeGroup(backdrop, group, { blend = 'multiply' })
+    expect(matches(backdrop, { 1, 0, 0, 1 })).toBe(true)
+  end)
+
+  suite.it('fills paths through a blend mode', function()
+    local tile = color.fromImage(magick.new(4, 1, '#808080'))
+
+    paint.fillPath(tile, path.new():rect(0, 0, 2, 1), paint.solid '#808080', { blend = 'multiply' })
+
+    local image = color.toImage(tile)
+
+    -- 0.50196 * 0.50196 = 0.25197, 64.25 of 255.
+    expect({ (image:get(0, 0)), (image:get(3, 0)) }).toEqual { 64, 128 }
+  end)
+end)
+
+return suite
