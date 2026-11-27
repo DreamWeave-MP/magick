@@ -1,0 +1,210 @@
+--!strict
+-- Conic gradients (MAG-011) and image patterns (MAG-012): the seam and its direction, spreads that
+-- agree across gradient kinds, constant-time evaluation at extreme coordinates, and pattern sampling
+-- at half-pixel offsets, negative coordinates, repeats, mirrors, rotations and transparent edges,
+-- aligned with legacy tiled sources, and refused when it would read its own destination.
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+local Ramp = paint.stops(0, '#000000', 1, '#ffffff')
+
+--- A paint over a tile placed in device space, as straight bytes of one channel, rows of lists.
+local function sample(value: paint.Paint, left: number, top: number, width: number, height: number, channel: number?): { { number } }
+  local tile = color.tile(width, height, { left = left, top = top })
+
+  paint.fillMask(tile, value)
+
+  local image = color.toImage(tile)
+  local out: { { number } } = {}
+
+  for row = 0, height - 1 do
+    local values: { number } = {}
+
+    for column = 0, width - 1 do
+      table.insert(values, (select(channel or 1, image:get(column, row))))
+    end
+
+    table.insert(out, values)
+  end
+
+  return out
+end
+
+--- A 2 by 2 image: red, green / blue, white, all opaque unless `clear` makes green transparent.
+local function quad(clear: boolean?): magick.Image
+  local image = magick.new(2, 2)
+
+  image:set(0, 0, 255, 0, 0, 255)
+  image:set(1, 0, 0, 255, 0, if clear then 0 else 255)
+  image:set(0, 1, 0, 0, 255, 255)
+  image:set(1, 1, 255, 255, 255, 255)
+
+  return image
+end
+
+suite.describe('conic', function()
+  suite.it('rises clockwise on screen from its seam on +x', function()
+    local value = paint.conic(0, 0, Ramp)
+
+    -- Pixel centers a little off each axis: right of the center just below +x is t near 0; below
+    -- is a quarter turn; left a half; above three quarters.
+    local function at(column: number, row: number): number
+      return sample(value, column, row, 1, 1)[1][1]
+    end
+
+    -- Center (100.5, 0.5): atan2(0.5, 100.5) / 2 pi = 0.00079, byte 0.
+    expect(at(100, 0)).toBe(0)
+    -- Center (0.5, 100.5): atan2(100.5, 0.5) = 1.5658, t = 0.24921, byte 63.5 -> 64.
+    expect(at(0, 100)).toBe(64)
+    expect(at(-101, 0)).toBe(127)
+    expect(at(0, -101)).toBe(191)
+  end)
+
+  suite.it('makes its seam a hard edge, and moves it with startAngle', function()
+    local value = paint.conic(0, 0, Ramp)
+
+    -- Just above +x is the end of the turn, white; just below is its start, black.
+    expect(sample(value, 50, -1, 1, 2)).toEqual { { 255 }, { 0 } }
+
+    local turned = paint.conic(0, 0, Ramp, { startAngle = math.pi / 2 })
+
+    -- The seam is now straight down, and clockwise from down heads left: just left of it is the
+    -- start of the turn, just right of it the end.
+    expect(sample(turned, -1, 50, 2, 1)).toEqual { { 0, 255 } }
+  end)
+
+  suite.it('gives the same paint under every spread, since its parameter never leaves 0..1', function()
+    local stops = paint.stops(0.2, '#ff0000', 0.8, '#0000ff')
+    local padded = sample(paint.conic(8, 8, stops), 0, 0, 16, 16)
+
+    expect(sample(paint.conic(8, 8, stops, { spread = 'repeat' }), 0, 0, 16, 16)).toEqual(padded)
+    expect(sample(paint.conic(8, 8, stops, { spread = 'reflect' }), 0, 0, 16, 16)).toEqual(padded)
+  end)
+
+  suite.it('uses one spread rule for linear and radial: a reflected ramp folds the same way in both', function()
+    local linear = sample(paint.linear(0, 0, 4, 0, Ramp, { spread = 'reflect' }), 0, 0, 16, 1)[1]
+    local radial = sample(paint.radial(0, 0.5, 4, Ramp, { spread = 'reflect' }), 0, 0, 16, 1)[1]
+
+    -- Along y = 0.5 through the radial's center its distance is the linear's x, so they agree.
+    expect(radial).toEqual(linear)
+  end)
+
+  suite.it('evaluates at extreme coordinates in constant time', function()
+    local started = os.clock()
+    local far = sample(paint.conic(0, 0, Ramp), 4000000, -4000000, 4, 4)
+
+    expect(far[1][1]).toBe(223)
+    expect(os.clock() - started < 1).toBe(true)
+
+    local repeated = sample(paint.linear(0, 0, 1e-6, 0, Ramp, { spread = 'repeat' }), 4000000, 0, 2, 1)
+
+    expect(#repeated[1]).toBe(2)
+  end)
+end)
+
+suite.describe('patterns', function()
+  suite.it('lays source pixels on device pixels under the identity', function()
+    expect(sample(paint.pattern(quad()), 0, 0, 2, 2)).toEqual { { 255, 0 }, { 0, 255 } }
+    expect(sample(paint.pattern(quad()), 0, 0, 2, 2, 2)).toEqual { { 0, 255 }, { 0, 255 } }
+  end)
+
+  suite.it('repeats from the origin, as a legacy tiled source does, at negative coordinates too', function()
+    local source = quad()
+    local legacy = magick.new(6, 6, '#000000'):rect(0, 0, 5, 5, source)
+    local tile = color.tile(6, 6)
+
+    paint.fillMask(tile, paint.pattern(source, { edge = 'repeat' }))
+    expect(buffer.tostring(color.toImage(tile).data) == buffer.tostring(legacy.data)).toBe(true)
+
+    -- Device (-3, -3) is source (1, 1) repeated: white.
+    expect(sample(paint.pattern(source, { edge = 'repeat' }), -3, -3, 1, 1, 2)).toEqual { { 255 } }
+  end)
+
+  suite.it('clamps, mirrors, or leaves transparent past the edges', function()
+    local source = quad()
+    local function row(edge: paint.Edge): { number }
+      return sample(paint.pattern(source, { edge = edge }), -2, 0, 6, 1)[1]
+    end
+
+    -- Red channel along row 0 of the source (255, 0) from x = -2 to 3.
+    expect(row 'clamp').toEqual { 255, 255, 255, 0, 0, 0 }
+    expect(row 'repeat').toEqual { 255, 0, 255, 0, 255, 0 }
+    expect(row 'mirror').toEqual { 0, 255, 255, 0, 0, 255 }
+    expect(sample(paint.pattern(source, { edge = 'transparent' }), -2, 0, 6, 1, 4)[1]).toEqual { 0, 0, 255, 255, 0, 0 }
+  end)
+
+  suite.it('takes the nearest pixel at a half-pixel offset, and blends four for bilinear', function()
+    local source = magick.new(2, 1)
+
+    source:set(0, 0, 0, 0, 0, 255)
+    source:set(1, 0, 200, 0, 0, 255)
+
+    -- Moved half a pixel right, device pixel 1's center (1.5) is source x 1.0: nearest is pixel 1,
+    -- and bilinear sits halfway between the centers of pixels 0 and 1.
+    local moved = transform.translate(0.5, 0)
+
+    expect(sample(paint.pattern(source, { transform = moved }), 1, 0, 1, 1)).toEqual { { 200 } }
+    expect(sample(paint.pattern(source, { transform = moved, sampling = 'bilinear' }), 1, 0, 1, 1)).toEqual { { 100 } }
+  end)
+
+  suite.it('blends premultiplied, so a transparent neighbour lends no color', function()
+    -- Red beside a transparent green: halfway is half-transparent red, not a dark or greenish one.
+    local source = quad(true)
+    local value = paint.pattern(source, { sampling = 'bilinear', edge = 'clamp' })
+    local tile = color.tile(1, 1)
+
+    paint.fillMask(tile, paint.pattern(source, { sampling = 'bilinear', transform = transform.translate(-0.5, 0.5) }))
+    expect({ color.toImage(tile):get(0, 0) }).toEqual { 255, 0, 0, 128 }
+    expect(value.edge).toBe 'clamp'
+  end)
+
+  suite.it('turns with its transform: a quarter turn puts the top row down the right', function()
+    local turned = transform.compose(transform.translate(2, 0), transform.rotate(math.pi / 2))
+
+    expect(sample(paint.pattern(quad(), { transform = turned }), 0, 0, 2, 2)).toEqual { { 0, 255 }, { 255, 0 } }
+    expect(sample(paint.pattern(quad(), { transform = turned }), 0, 0, 2, 2, 3)).toEqual { { 255, 0 }, { 255, 0 } }
+  end)
+
+  suite.it('reads a working tile of the same space, and refuses one of another', function()
+    local source = color.fromImage(quad(), { space = 'linear' })
+    local target = color.tile(2, 2, { space = 'linear' })
+
+    paint.fillMask(target, paint.pattern(source))
+    expect(buffer.tostring(color.toImage(target).data) == buffer.tostring(quad().data)).toBe(true)
+
+    expect(function()
+      paint.fillMask(color.tile(2, 2), paint.pattern(source))
+    end).toThrow 'magick: a pattern tile must be in the space of the tile it fills'
+  end)
+
+  suite.it('refuses to fill the tile it reads, rather than read what it is writing', function()
+    local tile = color.fromImage(quad())
+
+    expect(function()
+      paint.fillPath(tile, path.new():rect(0, 0, 2, 2), paint.pattern(tile))
+    end).toThrow 'magick: pattern reads its own destination'
+  end)
+
+  suite.it('refuses unknown sampling and edges, and empty sources', function()
+    expect(function()
+      paint.pattern(quad(), { sampling = 'cubic' :: any })
+    end).toThrow 'magick: unknown sampling cubic'
+
+    expect(function()
+      paint.pattern(quad(), { edge = 'wrap' :: any })
+    end).toThrow 'magick: unknown edge wrap'
+
+    expect(function()
+      paint.pattern(magick.new(0, 4))
+    end).toThrow 'magick: a pattern needs a source with pixels'
+  end)
+end)
+
+return suite

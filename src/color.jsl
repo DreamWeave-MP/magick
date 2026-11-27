@@ -121,6 +121,9 @@ for byte = 0, 255 do
   Decoded[byte + 1] = Module.decode(byte / 255)
 end
 
+--- Each sRGB byte as linear light, `linearBytes[byte + 1]`, for code that converts many pixels.
+Module.linearBytes = table.freeze(table.clone(Decoded))
+
 --- Where each linear value starts rounding to the next byte: `Thresholds[byte + 1]` is the linear
 --- value whose encoding is `(byte + 0.5) / 255`. The encoding is monotonic, so the byte a linear
 --- value encodes to is how many thresholds lie at or below it, with no power taken per pixel.

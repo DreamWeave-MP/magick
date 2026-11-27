@@ -136,6 +136,20 @@ Nothing the size of the canvas is made for a paint: a fill allocates the coverag
 `Path:fill(image, color)` stays the legacy straight-alpha routine; a solid fill through `fillPath` gives the same bytes
 on whole pixels of opaque colors and is within one step elsewhere (premultiplied f32 rounds differently).
 
+### Conic gradients and image patterns
+
+- `paint.conic(cx, cy, stops, { startAngle?, ... })`: offset 0 on the seam at `startAngle` radians from +x (0 by
+  default), rising **clockwise on screen** (y grows down) to 1 a whole turn on. The seam is a hard edge unless the
+  first and last stops match. Its parameter never leaves 0..1, so every spread gives the same paint; turn it the other
+  way with a reflecting `transform`. Evaluation is constant time at any coordinate.
+- `paint.pattern(source, { transform?, sampling?, edge?, opacity? })`: a legacy `Image` (straight sRGB RGBA8) or a
+  working tile (premultiplied, in the space of the tile it fills) laid out in paint space with source pixel (i, j)
+  covering the unit square at (i, j). With the identity and `edge = 'repeat'` it aligns as a legacy tiled `Image`
+  source does. `sampling`: `nearest` (default) or `bilinear`, which blends the four nearest pixels premultiplied, so a
+  transparent neighbour lends no color. `edge`: `clamp` (default), `repeat`, `mirror`, or `transparent` (nothing past
+  the source; an addition to RFC-0001 M10's three). The source is read where it is at each fill, nothing is copied,
+  and a fill into the tile a pattern reads is refused (`magick: pattern reads its own destination`).
+
 ## Gates
 
 `tests/gate.jsl` holds the package to tiny exact fixtures (transparency, clipping, alpha, curves,

@@ -10,7 +10,9 @@
 -- `clipped circle` by area alone, and the rest at the points listed there. Every other pixel of a
 -- scene is held by its fingerprint alone, so the fingerprint says the tree drew this, not that it
 -- drew the right thing. A change that moves one is a visual change and needs a reviewed rebaseline.
+local color = require '@magick/color'
 local magick = require '@magick'
+local paint = require '@magick/paint'
 local path = require '@magick/path'
 local transform = require '@magick/transform'
 local support = require './support'
@@ -216,6 +218,48 @@ scene('stroke dashes mirrored', function()
   return image:overMask(dashed:coverageIn(0, 0, 108, 40, { transform = mirror }), '#80d0ff', 0, 0)
 end)
 
+-- MAG-011: a conic gradient whose seam is turned to straight up, through a ring, and a linear
+-- gradient of hard-edged stripes repeated under a rotation and a shear.
+scene('conic seam', function()
+  local tile = color.tile(48, 48)
+  local hues = paint.stops(0, '#ff0000', 0.33, '#00ff00', 0.67, '#0000ff', 1, '#ff0000')
+
+  paint.fillPath(tile, path.new():ring(24, 24, 22, 8), paint.conic(24, 24, hues, { startAngle = -math.pi / 2 }))
+  paint.fillPath(tile, path.new():circle(24, 24, 6), paint.conic(24, 24, paint.stops(0, '#000000', 1, '#ffffff')))
+
+  return color.toImage(tile)
+end)
+
+scene('repeated stripes', function()
+  local tile = color.tile(48, 32)
+  local stripes = paint.stops(0, '#f0e0b0', 0.5, '#f0e0b0', 0.5, '#304060', 1, '#304060')
+  local slant = transform.compose(transform.rotate(0.4), transform.skew(0.3))
+
+  paint.fillPath(tile, path.new():roundRect(2, 2, 46, 30, 6), paint.linear(0, 0, 6, 0, stripes, { spread = 'repeat', transform = slant }))
+
+  return color.toImage(tile)
+end)
+
+-- MAG-012: a 4 by 4 checker of opaque and transparent cells, mirrored, turned and scaled, sampled
+-- bilinear through a circle over a gradient.
+scene('transformed pattern', function()
+  local checker = magick.new(4, 4)
+
+  for row = 0, 3 do
+    for column = 0, 3 do
+      if (column // 2 + row // 2) % 2 == 0 then checker:set(column, row, 255, 230, 160, 255) end
+    end
+  end
+
+  local tile = color.tile(48, 48)
+  local place = transform.compose(transform.translate(24, 24), transform.rotate(0.6), transform.scale(3))
+
+  paint.fillMask(tile, paint.linear(0, 0, 0, 48, paint.stops(0, '#203050', 1, '#502030')))
+  paint.fillPath(tile, path.new():circle(24, 24, 21), paint.pattern(checker, { transform = place, edge = 'mirror', sampling = 'bilinear' }))
+
+  return color.toImage(tile)
+end)
+
 --- The scenes, in the order the gallery renders and the gate suite checks them.
 local Scenes: { Scene } = scenes
 
@@ -257,6 +301,12 @@ local Recorded: { [string]: string } = {
   ['stroke joins and caps png'] = '4841:82f16e74',
   ['stroke dashes mirrored pixels'] = '108x40:ed898f9d',
   ['stroke dashes mirrored png'] = '1398:eefb5a78',
+  ['conic seam pixels'] = '48x48:dee03043',
+  ['conic seam png'] = '4104:b1821894',
+  ['repeated stripes pixels'] = '48x32:31ed4e9b',
+  ['repeated stripes png'] = '317:5e6e1573',
+  ['transformed pattern pixels'] = '48x48:10f1049d',
+  ['transformed pattern png'] = '3101:9f715988',
 }
 
 return table.freeze {
