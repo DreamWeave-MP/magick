@@ -1,6 +1,6 @@
 # RFC-0001: Renderer coordinates, compositing and API boundaries
 
-- **Status:** Proposed for ratification by review. Nobody has ratified it yet.
+- **Status:** Ratified by the owner (Dave Corley) on 2026-11-26.
 - **Issue:** MAG-003, release 0.2.0. Merge order: PR-02 (this RFC only; no implementation).
 - **Scope:** the 0.2.0 issues MAG-004 to MAG-014, including isolated composite groups with opacity
   (MAG-014, PR-09), and the sketches for 0.3.0 and later.
