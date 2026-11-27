@@ -1,0 +1,402 @@
+--!strict
+-- `@magick/transform` (MAG-005) and the retained path (MAG-004): the composition order, inverses,
+-- singular and nonfinite refusals, exact curve boxes, and paths that keep their curves under a
+-- matrix while every 0.1.x call keeps its bytes.
+local magick = require '@magick'
+local path = require '@magick/path'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+--- A Park-Miller generator, so every sample here is the same on every run.
+local function generator(seed: number): () -> number
+  local state = seed
+
+  return function(): number
+    state = state * 48271 % 2147483647
+
+    return state / 2147483647
+  end
+end
+
+local function near(actual: number, expected: number, within: number): boolean
+  return math.abs(actual - expected) <= within
+end
+
+--- The bytes of a mask as a string, to compare two masks whole.
+local function bytes(mask: magick.Mask): string
+  return buffer.tostring(mask.data)
+end
+
+--- The area of a flat x, y contour, by the shoelace formula.
+local function shoelace(points: { number }): number
+  local total = 0
+  local count = #points
+  local lastX, lastY = points[count - 1], points[count]
+
+  for index = 1, count - 1, 2 do
+    total += lastX * points[index + 1] - points[index] * lastY
+    lastX, lastY = points[index], points[index + 1]
+  end
+
+  return total / 2
+end
+
+suite.describe('matrices', function()
+  suite.it('composes right to left: rotate, then scale, then translate', function()
+    local matrix = transform.compose(transform.translate(10, 20), transform.scale(2), transform.rotate(math.pi / 2))
+    local pointX, pointY = transform.apply(matrix, 1, 0)
+
+    expect(near(pointX, 10, 1e-12) and near(pointY, 22, 1e-12)).toBe(true)
+  end)
+
+  suite.it('takes SVG matrix fields in order', function()
+    local matrix = transform.matrix(1, 2, 3, 4, 5, 6)
+
+    expect({ transform.apply(matrix, 1, 1) }).toEqual { 9, 12 }
+    expect(transform.determinant(matrix)).toBe(-2)
+  end)
+
+  suite.it('inverts a thousand random matrices to the identity within 1e-9', function()
+    local random = generator(7)
+    local worst = 0
+
+    for _ = 1, 1000 do
+      local matrix = transform.matrix(
+        random() * 8 - 4,
+        random() * 8 - 4,
+        random() * 8 - 4,
+        random() * 8 - 4,
+        random() * 2000 - 1000,
+        random() * 2000 - 1000
+      )
+
+      if transform.isSingular(matrix) then continue end
+
+      local product = transform.multiply(transform.inverse(matrix), matrix)
+
+      worst = math.max(
+        worst,
+        math.abs(product.scaleX - 1),
+        math.abs(product.skewY),
+        math.abs(product.skewX),
+        math.abs(product.scaleY - 1),
+        math.abs(product.offsetX),
+        math.abs(product.offsetY)
+      )
+    end
+
+    expect(worst <= 1e-9).toBe(true)
+  end)
+
+  suite.it('round-trips points through translation, rotation, shear, reflection and a near-singular scale', function()
+    local cases = {
+      transform.translate(-3.5, 1e6),
+      transform.rotate(1.234),
+      transform.skew(0.75, -0.25),
+      transform.scale(-1, 1),
+      transform.scale(1, 1e-6),
+      transform.compose(transform.rotate(-0.4), transform.skew(2), transform.scale(-3, 0.5)),
+    }
+    local random = generator(11)
+
+    for _, matrix in cases do
+      local inverse = transform.inverse(matrix)
+
+      for _ = 1, 50 do
+        local pointX, pointY = random() * 2000 - 1000, random() * 2000 - 1000
+        local backX, backY = transform.apply(inverse, transform.apply(matrix, pointX, pointY))
+
+        expect(near(backX, pointX, 1e-6) and near(backY, pointY, 1e-6)).toBe(true)
+      end
+    end
+  end)
+
+  suite.it('flips the determinant under a reflection', function()
+    local matrix = transform.compose(transform.rotate(0.3), transform.scale(2, 3))
+
+    expect(transform.determinant(transform.multiply(matrix, transform.scale(-1, 1))) < 0).toBe(true)
+    expect(transform.determinant(matrix) > 0).toBe(true)
+  end)
+
+  suite.it('refuses a singular inverse, and inverts one just past the threshold', function()
+    expect(function()
+      transform.inverse(transform.scale(1, 1e-13))
+    end).toThrow 'magick: transform is singular'
+
+    expect(function()
+      transform.inverse(transform.scale(0, 1))
+    end).toThrow 'magick: transform is singular'
+    expect(transform.inverse(transform.scale(1, 1e-11)).scaleY).toBe(1e11)
+  end)
+
+  suite.it('refuses NaN and infinite fields', function()
+    for _, value in { 0 / 0, math.huge, -math.huge } do
+      expect(function()
+        transform.translate(value, 0)
+      end).toThrow 'magick: transform must be finite'
+
+      expect(function()
+        transform.matrix(1, 0, 0, value, 0, 0)
+      end).toThrow 'magick: transform must be finite'
+    end
+  end)
+
+  suite.it('measures the largest stretch', function()
+    expect(transform.sigmaMax(transform.identity())).toBe(1)
+    expect(near(transform.sigmaMax(transform.scale(3, 1)), 3, 1e-12)).toBe(true)
+    expect(near(transform.sigmaMax(transform.rotate(0.7)), 1, 1e-12)).toBe(true)
+    expect(near(transform.sigmaMax(transform.scale(2, -1)), 2, 1e-12)).toBe(true)
+  end)
+
+  suite.it('boxes a cubic exactly, against dense sampling, under a reflected rotation', function()
+    local matrix = transform.compose(transform.rotate(0.6), transform.scale(-1.5, 1))
+    local curves = {
+      { 0, 0, 0, 100, 100, 100, 100, 0 },
+      { 0, 0, 100, 0, 0, 100, 100, 100 },
+      { 10, 10, 10, 10, 90, 40, 50, 50 },
+      { 0, 0, 30, 30, 60, 60, 90, 90 },
+    }
+
+    for _, curve in curves do
+      local left, top, right, bottom = transform.cubicBox(matrix, table.unpack(curve))
+      local sampledLeft, sampledTop, sampledRight, sampledBottom = math.huge, math.huge, -math.huge, -math.huge
+
+      for step = 0, 20000 do
+        local along = step / 20000
+        local rest = 1 - along
+        local early, late = 3 * rest * rest * along, 3 * rest * along * along
+        local userX = rest ^ 3 * curve[1] + early * curve[3] + late * curve[5] + along ^ 3 * curve[7]
+        local userY = rest ^ 3 * curve[2] + early * curve[4] + late * curve[6] + along ^ 3 * curve[8]
+        local pointX, pointY = transform.apply(matrix, userX, userY)
+
+        sampledLeft, sampledRight = math.min(sampledLeft, pointX), (math.max(sampledRight, pointX))
+        sampledTop, sampledBottom = math.min(sampledTop, pointY), (math.max(sampledBottom, pointY))
+      end
+
+      expect(near(left, sampledLeft, 1e-6) and near(right, sampledRight, 1e-6)).toBe(true)
+      expect(near(top, sampledTop, 1e-6) and near(bottom, sampledBottom, 1e-6)).toBe(true)
+    end
+  end)
+end)
+
+suite.describe('retained paths', function()
+  --- Curved shapes, built every way the module builds curves.
+  local function curved(): path.Path
+    return path
+      .new()
+      :moveTo(2, 2)
+      :quadTo(12, 20, 22, 3)
+      :cubicTo(30, 0, 30, 18, 20, 21)
+      :close()
+      :circle(40, 12, 7.3)
+      :ring(60, 12, 8, 4.5)
+      :roundRect(72, 3, 95, 20, 6)
+      :polyline({ { 5, 30 }, { 25, 40 }, { 45, 28 } }, 3, 'round')
+  end
+
+  suite.it('gives the 0.1.3 mask under transformed(1, 0, 0)', function()
+    local shape = curved()
+    local before = shape:mask()
+    local after = shape:transformed(1, 0, 0):mask()
+
+    expect(bytes(after)).toBe(bytes(before))
+  end)
+
+  suite.it('gives the 0.1.3 mask under whole-pixel translations', function()
+    local shape = curved()
+    local before, left, top = shape:mask()
+
+    for _, offset in { { 3, 0 }, { 0, -7 }, { 16, 9 } } do
+      local after, movedLeft, movedTop = shape:transformed(1, offset[1], offset[2]):mask()
+
+      expect(bytes(after)).toBe(bytes(before))
+      expect({ movedLeft - left, movedTop - top }).toEqual(offset)
+    end
+  end)
+
+  suite.it('keeps a line-only path to the 0.1.3 points under any transformed', function()
+    local shape = path.new():rect(0.5, 1, 7.25, 3):polygon { { 9, 0 }, { 14, 3 }, { 10, 6 } }
+    local moved = shape:transformed(2.5, -1.25, 3)
+
+    for index, points in shape.contours do
+      local expected: { number } = {}
+
+      for at = 1, #points - 1, 2 do
+        table.insert(expected, points[at] * 2.5 + -1.25)
+        table.insert(expected, points[at + 1] * 2.5 + 3)
+      end
+
+      expect(moved.contours[index]).toEqual(expected)
+    end
+  end)
+
+  suite.it('flattens a scaled quadratic again: 20 pieces at scale 4, not 10 baked', function()
+    local shape = path.new():moveTo(0, 0):quadTo(50, 100, 100, 0):close()
+    local moved = shape:transformed(4, 0, 0)
+
+    -- The source flattens to 10 pieces; at scale 4 the device curve needs 20 at a quarter pixel.
+    expect(#shape.contours[1]).toBe(22)
+    expect(#moved.contours[1]).toBe(42)
+    expect(near(math.abs(shoelace(moved.contours[1])), 53200, 1e-6)).toBe(true)
+    -- What 0.1.3 gave, the 10 pieces scaled up, is 533 square pixels short of the curve's 53333.
+    expect(near(math.abs(shoelace(shape.contours[1])) * 16, 52800, 1e-6)).toBe(true)
+  end)
+
+  suite.it('tessellates more finely as the scale grows', function()
+    local shape = path.new():circle(0, 0, 10)
+    local last = 0
+
+    for _, scale in { 1, 2, 8, 64 } do
+      local pieces = #path.flatten(shape, 0.25, transform.scale(scale))[1]
+
+      expect(pieces > last).toBe(true)
+      last = pieces
+    end
+  end)
+
+  suite.it('keeps a circle round under a non-uniform scale and a rotation', function()
+    local matrix = transform.compose(transform.rotate(0.5), transform.scale(40, 4))
+    local points = path.flatten(path.new():circle(0, 0, 1), 0.25, matrix)[1]
+    local inverse = transform.inverse(matrix)
+
+    -- Every flattened point lies on the unit circle in user space within the device tolerance.
+    for index = 1, #points - 1, 2 do
+      local userX, userY = transform.apply(inverse, points[index], points[index + 1])
+
+      expect(near(math.sqrt(userX * userX + userY * userY), 1, 0.25 / 4 + 1e-3)).toBe(true)
+    end
+
+    expect(near(math.abs(shoelace(points)), math.pi * 160, 0.5)).toBe(true)
+  end)
+
+  suite.it('composes moves: transformBy twice is transformBy of the product', function()
+    local shape = curved()
+    local first, second = transform.rotate(0.3), transform.translate(5, 7)
+    local twice = shape:transformBy(first):transformBy(second)
+    local once = shape:transformBy(transform.multiply(second, first))
+
+    for index, points in once.contours do
+      for at, value in points do
+        expect(near(twice.contours[index][at], value, 1e-9)).toBe(true)
+      end
+    end
+  end)
+
+  suite.it('keeps holes as holes under a reflection, mirroring the mask', function()
+    local shape = path.new():ring(10, 10, 8, 4)
+    local mirrored = shape:transformBy(transform.compose(transform.translate(20, 0), transform.scale(-1, 1)))
+    local before, after = shape:mask(), mirrored:mask()
+
+    expect({ after.width, after.height }).toEqual { before.width, before.height }
+
+    for row = 0, before.height - 1 do
+      for column = 0, before.width - 2 do
+        local original = buffer.readu8(before.data, row * before.width + column)
+        local reflected = buffer.readu8(after.data, row * after.width + (before.width - 2 - column))
+
+        expect(math.abs(original - reflected) <= 1).toBe(true)
+      end
+    end
+
+    -- The center is the hole in both.
+    expect(buffer.readu8(after.data, 8 * after.width + 8)).toBe(0)
+  end)
+
+  suite.it('bounds curves exactly in device space, arcs included', function()
+    local arch = path.new():moveTo(0, 0):cubicTo(0, 100, 100, 100, 100, 0):close()
+    local left, top, right, bottom = arch:deviceBounds()
+
+    expect({ left, top, right }).toEqual { 0, 0, 100 }
+    expect(near(bottom, 75, 1e-9)).toBe(true)
+
+    local scaledLeft, scaledTop, scaledRight, scaledBottom = arch:deviceBounds(transform.scale(3, 1), 0.5)
+
+    expect({ scaledLeft, scaledTop, scaledRight }).toEqual { -1.5, -1.5, 301.5 }
+    expect(near(scaledBottom, 76.5, 1e-9)).toBe(true)
+
+    local circleLeft, circleTop, circleRight, circleBottom = path.new():circle(0, 0, 10):deviceBounds(transform.rotate(0.4))
+
+    expect(circleLeft <= -10 and circleTop <= -10 and circleRight >= 10 and circleBottom >= 10).toBe(true)
+    -- The flattened circle's points sit a little outside it, so its area is the circle's: at
+    -- radius 10 and a quarter pixel, 15 pieces pushed out by sqrt(turn / sin(turn)), 10.147.
+    expect(circleLeft > -10.15 and circleRight < 10.15).toBe(true)
+  end)
+
+  suite.it('refuses nonfinite coordinates and coordinates past MaxCoordinate when flattening', function()
+    expect(function()
+      path.flatten(path.new():rect(0, 0, 0 / 0, 4))
+    end).toThrow 'magick: path coordinates must be finite'
+
+    expect(function()
+      path.flatten(path.new():rect(0, 0, 4194305, 4))
+    end).toThrow 'magick: MaxCoordinate 4194304 exceeded'
+    expect(#path.flatten(path.new():rect(0, 0, 4194304, 4))).toBe(1)
+  end)
+
+  suite.it('stops a curve that would need more than MaxPiecesPerCurve pieces, rather than hang', function()
+    expect(function()
+      path.new():moveTo(0, 0):quadTo(math.huge, 0, 0, 1)
+    end).toThrow 'magick: MaxPiecesPerCurve 16384 exceeded'
+
+    expect(function()
+      path.new():moveTo(0, 0):cubicTo(0, 1e12, 1, 1e12, 1, 0)
+    end).toThrow 'magick: MaxPiecesPerCurve 16384 exceeded'
+
+    expect(function()
+      path.flatten(path.new():moveTo(0, 0):quadTo(1000, 1000, 0, 1):close(), 1e-9)
+    end).toThrow 'magick: MaxPiecesPerCurve 16384 exceeded'
+  end)
+
+  suite.it('refuses a tolerance that is not a positive finite number', function()
+    for _, tolerance in { 0, -1, 0 / 0, math.huge } do
+      expect(function()
+        path.flatten(path.new():rect(0, 0, 1, 1), tolerance)
+      end).toThrow 'magick: tolerance must be a positive finite number'
+    end
+  end)
+
+  suite.it('returns frozen matrices, and keeps a frozen copy of a plain table it is given', function()
+    local made = {
+      transform.identity(),
+      transform.translate(1, 2),
+      transform.scale(2, 3),
+      transform.rotate(0.5),
+      transform.skew(0.25),
+      transform.multiply(transform.scale(2), transform.translate(1, 1)),
+      transform.compose(transform.rotate(1), transform.scale(3)),
+      transform.inverse(transform.scale(4)),
+      transform.matrix(1, 2, 3, 4, 5, 6),
+    }
+
+    for _, matrix in made do
+      expect(table.isfrozen(matrix)).toBe(true)
+      expect(function()
+        local writable = (matrix :: unknown) :: { [string]: number }
+
+        writable.offsetX = 99
+      end).toThrow()
+    end
+
+    local plain = { scaleX = 2, skewY = 0, skewX = 0, scaleY = 2, offsetX = 3, offsetY = 4 }
+    local kept = transform.check(plain)
+
+    plain.offsetX = 1000
+    expect(table.isfrozen(kept)).toBe(true)
+    expect(kept.offsetX).toBe(3)
+    expect(rawequal(transform.check(kept), kept)).toBe(true)
+  end)
+
+  suite.it('appends retained contours, so an appended path transforms with its curves', function()
+    local circle = path.new():circle(0, 0, 3)
+    local joined = path.new():rect(10, 10, 12, 12):append(circle)
+    local fine = path.flatten(joined, 0.25, transform.scale(50))
+
+    expect(#fine).toBe(2)
+    expect(#fine[2] > #circle.contours[1]).toBe(true)
+  end)
+end)
+
+return suite
