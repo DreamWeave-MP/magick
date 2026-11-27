@@ -141,6 +141,48 @@ scene('one row', function()
   return path.new():rect(4.5, 0, 8.5, 1):fill(image, '#ffffff')
 end)
 
+--- A self-crossing star, two same-way overlapping circles and a ring, for the fill-rule scenes.
+local function crossings(): path.Path
+  local star = path.new()
+
+  for point = 0, 5 do
+    local angle = -math.pi / 2 + point * 4 * math.pi / 5
+    local pointX, pointY = 12 + 11 * math.cos(angle), 12 + 11 * math.sin(angle)
+
+    if point == 0 then
+      star:moveTo(pointX, pointY)
+    else
+      star:lineTo(pointX, pointY)
+    end
+  end
+
+  return star:close():circle(30, 10, 7):circle(36, 14, 7):ring(52, 12, 10, 5)
+end
+
+-- MAG-006: the same outline under each rule. Nonzero fills the star's center and the circles'
+-- overlap; evenodd leaves both empty. The ring's hole is empty under both.
+scene('fill rule nonzero', function()
+  local coverage = crossings():coverageIn(0, 0, 64, 24)
+
+  return magick.new(64, 24, '#101828'):overMask(coverage, '#f0c040', 0, 0)
+end)
+
+scene('fill rule evenodd', function()
+  local coverage = crossings():coverageIn(0, 0, 64, 24, { fillRule = 'evenodd' })
+
+  return magick.new(64, 24, '#101828'):overMask(coverage, '#40c0f0', 0, 0)
+end)
+
+-- Compound clipping: the outline clipped by a band and then by a ring, by multiplying coverage.
+scene('compound clip', function()
+  local band = path.new():rect(0, 4, 64, 20):coverageIn(0, 0, 64, 24)
+  local ring = path.new():ring(32, 12, 30, 6):coverageIn(0, 0, 64, 24)
+  local clips = { { mask = band, left = 0, top = 0 }, { mask = ring, left = 0, top = 0 } }
+  local coverage = crossings():coverageIn(0, 0, 64, 24, { clips = clips })
+
+  return magick.new(64, 24, '#101828'):overMask(coverage, '#f05080', 0, 0)
+end)
+
 --- The scenes, in the order the gallery renders and the gate suite checks them.
 local Scenes: { Scene } = scenes
 
@@ -172,6 +214,12 @@ local Recorded: { [string]: string } = {
   ['one column png'] = '93:25640511',
   ['one row pixels'] = '17x1:65e06997',
   ['one row png'] = '88:3fbca953',
+  ['fill rule nonzero pixels'] = '64x24:734fabc2',
+  ['fill rule nonzero png'] = '799:0134a883',
+  ['fill rule evenodd pixels'] = '64x24:11039a7d',
+  ['fill rule evenodd png'] = '972:7a04541a',
+  ['compound clip pixels'] = '64x24:ff91d9c4',
+  ['compound clip png'] = '797:ab4254c4',
 }
 
 return table.freeze {

@@ -286,6 +286,20 @@ on self-crossing and overlapping contours (`issue-6.md`); these pinned vectors a
 rule needs the winding per contour, which the 0.2.0 rasterizer does not keep. Adding one is a new rule, and it requires an
 RFC amendment, not a silent change.
 
+**Amendment A1 (MAG-006, provisional until ratified): exact fill rules for new APIs.** F1 and F2 stay the rule of
+legacy `Path:mask()`, pinned as above. `Path:coverageIn` and every 0.2.0 API built on it use an **exact** rule instead:
+a pixel's coverage is the area of its square where the winding number of the flattened outline is not 0 (`nonzero`)
+or is odd (`evenodd`), rounded to a byte once. Each pixel row is cut into sub-bands at every vertex and every crossing
+of two edges inside it; within a sub-band the edges keep one left-to-right order, the winding is constant between
+neighbours, and the boundaries of the runs that pass the rule are accumulated as signed areas. Cell contributions
+are whole multiples of 2^-30 and band heights are whole multiples of 2^-30 of a row, so a window is the same bytes as
+that part of any larger window (B2 holds by construction and is tested at four tilings). "Exact" means exact for
+the flattened outline up to that quantization and the floating-point position of crossings: the error is below
+1e-6 of a pixel's area, far under the half step a byte rounds by. The pinned vectors under the new rule:
+the bowtie gives 128 at pixel (1, 1), two identical `rect(0.5, 0, 2, 1)` give `128, 255, 0` under nonzero and
+`0, 0, 0` under evenodd, and a rectangle traced twice in one contour gives 0 under evenodd. `tests/coverage.jsl` holds
+these and the union and symmetric-difference areas of two rotated rectangles.
+
 **F3 (defaults).** New APIs take `fillRule` as an option; omitted, it is `nonzero`. Legacy `Path:mask()` is
 `nonzero`. Legacy `Image:polygon` is even-odd, and `Image:circle` is center-sampled. Each module documents its
 rule.
@@ -599,6 +613,8 @@ relations are tested, and their code is owned by the issue named in the row.
 | `MaxCommandsPerPath` | `2^20` | constant; E5 rule tested; owned by MAG-004 | About a million commands is an outline far larger than any glyph or sprite set. |
 | `MaxPiecesPerCurve` | `16384` | constant; relation tested: the coordinate-limit cubic needs 8437 pieces; owned by MAG-004 | At 0.25 px, a cubic may have a control bend up to `16384^2 * 0.25 / 0.75`, about `8.9e7` px; the largest bend `MaxCoordinate` allows is about `2.4e7`. |
 | `MaxSegmentsPerCoverage` | `2^20` | constant; E5 rule tested; owned by MAG-008 | Flattened segments one coverage call may produce. |
+| `MaxStripCrossings` | `65536` | `raster.cover`; refusal and tiling-independence tested in `tests/coverage.jsl` | Crossings of one cluster of overlapping edges inside one pixel row. Exact coverage needs every one; past this the outline is refused, not approximated (A1). |
+| `MaxStripWork` | `2^22` | `raster.cover`, checked before the bands are cut | Pair tests plus band steps (bands x cluster edges) for one cluster in one row: about 0.7 s of work at most per row. |
 | `MaxDashEntries` | `64` | `checkDashes`; E5 boundary tested | A dash pattern is a short list (SK6). |
 | `MaxDashesPerStroke` | `2^20` | constant; E5 rule tested; owned by MAG-007 | Generated dashes per stroke (SK6). |
 | `MaxStops` | `256` | constant; E5 rule tested; owned by MAG-010 | A gradient stop list is not a lookup table (M6). |
@@ -825,7 +841,7 @@ Also not in 0.2.0, with a reason:
 - Linear-light compositing as a default. Linear is opt-in (W3).
 - Text, glyphs, fonts, GPU and network. None is a dependency.
 - Any change to legacy outputs, goldens, or legacy error messages, except the owner-approved P4 change.
-- Exact parity for self-crossing and overlapping contours. It is **not** deferred: the 0.2.0 rule for both fill rules is the summed approximation of F1 and F2, pinned by vectors (section 6), which MAG-006 documents as its result. An exact rule is a new rule and needs an RFC amendment.
+- Exact parity for self-crossing and overlapping contours in legacy `Path:mask()`. New APIs have it (amendment A1, section 6); the legacy call keeps the summed rule of F1 and F2.
 
 **Acceptance tests owned by later issues.** These cannot be run against the 0.2.0 sketches, so the RFC names each test and
 its owner. Each is text here until its issue runs it.

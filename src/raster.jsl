@@ -1,0 +1,542 @@
+--!strict
+--[[
+Exact fill-rule coverage over a window, for @magick/path (private to the package).
+
+A pixel's coverage is the area of its square where the outline's winding passes the fill rule:
+nonzero where the winding is not 0, evenodd where it is odd. It is exact for the flattened outline,
+self-crossing and overlapping contours included, rather than the summed signed area `Path:mask`
+gives (RFC-0001 C2), and it is rounded to a byte once.
+
+How. Each pixel row is a strip one pixel high. The strip is cut into sub-bands at every vertex and
+every crossing of two edges inside it, so that within a sub-band no two edges cross and the edges
+keep one order from left to right. Walking that order, the winding is constant between neighbours,
+and the runs where it passes the rule are trapezoids. Each trapezoid's two sides are accumulated as
+signed areas into the row's cells (the font-rs technique `Path:mask` uses), and a running sum along
+the row is the coverage.
+
+Windows. Everything is worked out in absolute device coordinates, and every edge that crosses a
+row takes part in it wherever it lies across, so the cuts and their arithmetic do not depend on the
+window. Cell contributions are rounded to integer multiples of 2^-30 before they are added, and the
+part of a row left of the window is carried in as one integer sum. Integer sums do not depend on
+their order, so a window's bytes are the bytes a single larger window gives at the same pixels.
+
+Scratch is one row of cells as wide as the window, plus the edges themselves.
+
+Cost. A cluster of k edges in one strip with c crossings costs about k^2 / 2 pair tests and
+(c + 2k) bands of k edges each. Exactness needs every crossing, so densely crossing geometry is
+refused rather than approximated: a cluster with more than MaxStripCrossings crossings, or whose
+pair tests and band work would pass MaxStripWork, raises before that work is done. A cluster is a
+function of the outline and the strip alone, never of the window, so whether an outline is refused
+does not depend on how the canvas is tiled: every tiling of a canvas processes every cluster that
+reaches it.
+]]
+
+local dataPlane = require '@dream/data'
+
+local Module = {}
+
+export type FillRule = 'nonzero' | 'evenodd'
+
+--- A flattened outline's edges in device space, sorted by their top, ready to be covered over any
+--- number of windows.
+export type Prepared = {
+  count: number,
+  x0: { number },
+  y0: { number },
+  x1: { number },
+  y1: { number },
+  slope: { number },
+  --- +1 where the edge was drawn downward (y growing), -1 where upward, 0 for a level edge.
+  direction: { number },
+  left: number,
+  top: number,
+  right: number,
+  bottom: number,
+}
+
+--- The most edges one prepared outline may hold.
+Module.MaxSegmentsPerCoverage = 1048576
+--- The most crossings of edges one cluster may have inside one pixel row.
+Module.MaxStripCrossings = 65536
+--- The most work units (pair tests, then band edges) one cluster may take in one pixel row.
+Module.MaxStripWork = 4194304
+
+local Scale = 1073741824
+
+--- The edges of closed contours given as flat x, y lists in device space.
+function Module.prepare(contours: { { number } }): Prepared
+  local rawX0: { number }, rawY0: { number }, rawX1: { number }, rawY1: { number } = {}, {}, {}, {}
+  local rawDirection: { number } = {}
+  local count = 0
+  local left, top, right, bottom = math.huge, math.huge, -math.huge, -math.huge
+
+  for _, points in contours do
+    local length = #points
+
+    if length < 6 then continue end
+
+    local lastX, lastY = points[length - 1], points[length]
+
+    for index = 1, length - 1, 2 do
+      local pointX, pointY = points[index], points[index + 1]
+
+      left, right = math.min(left, pointX), math.max(right, pointX)
+      top, bottom = math.min(top, pointY), math.max(bottom, pointY)
+
+      -- A level edge covers nothing, but it joins the edges at its ends into one cluster of the row
+      -- it lies inside (see `cover`); one on a row boundary joins nothing that needs joining.
+      local level = pointY == lastY
+
+      if not level or (pointX ~= lastX and pointY ~= math.floor(pointY)) then
+        count += 1
+        if count > Module.MaxSegmentsPerCoverage then
+          error(`magick: MaxSegmentsPerCoverage {Module.MaxSegmentsPerCoverage} exceeded`, 3)
+        end
+
+        if level then
+          rawX0[count], rawY0[count], rawX1[count], rawY1[count], rawDirection[count] = lastX, lastY, pointX, pointY, 0
+        elseif lastY < pointY then
+          rawX0[count], rawY0[count], rawX1[count], rawY1[count], rawDirection[count] = lastX, lastY, pointX, pointY, 1
+        else
+          rawX0[count], rawY0[count], rawX1[count], rawY1[count], rawDirection[count] = pointX, pointY, lastX, lastY, -1
+        end
+      end
+
+      lastX, lastY = pointX, pointY
+    end
+  end
+
+  -- The data plane's sort is stable, so ties keep their drawing order and the order is a function
+  -- of the outline alone.
+  local keys, order = buffer.create(count * 8), buffer.create(count * 4)
+
+  for index = 1, count do
+    buffer.writef64(keys, (index - 1) * 8, rawY0[index])
+  end
+
+  dataPlane.argsort(keys, 'f64', 0, count, order)
+
+  local prepared: Prepared = {
+    count = count,
+    x0 = table.create(count) :: { number },
+    y0 = table.create(count) :: { number },
+    x1 = table.create(count) :: { number },
+    y1 = table.create(count) :: { number },
+    slope = table.create(count) :: { number },
+    direction = table.create(count) :: { number },
+    left = if left <= right then left else 0,
+    top = if left <= right then top else 0,
+    right = if left <= right then right else 0,
+    bottom = if left <= right then bottom else 0,
+  }
+
+  for position = 1, count do
+    local index = buffer.readu32(order, (position - 1) * 4) + 1
+
+    prepared.x0[position], prepared.y0[position] = rawX0[index], rawY0[index]
+    prepared.x1[position], prepared.y1[position] = rawX1[index], rawY1[index]
+    prepared.slope[position] = if rawDirection[index] == 0 then 0 else (rawX1[index] - rawX0[index]) / (rawY1[index] - rawY0[index])
+    prepared.direction[position] = rawDirection[index]
+  end
+
+  return prepared
+end
+
+--- An edge's x at a height inside its span, exact at its ends.
+local function edgeX(prepared: Prepared, edge: number, height: number): number
+  if height == prepared.y0[edge] then return prepared.x0[edge] end
+  if height == prepared.y1[edge] then return prepared.x1[edge] end
+
+  return prepared.x0[edge] + (height - prepared.y0[edge]) * prepared.slope[edge]
+end
+
+--- Sorts `items[1..count]` by `keys[item]`, ascending, ties by item. Insertion sort: the rows of an
+--- outline change their order little from one to the next.
+@native
+local function sortBy(items: { number }, keys: { number }, count: number)
+  for index = 2, count do
+    local item = items[index]
+    local key = keys[item]
+    local at = index - 1
+
+    while at >= 1 and (keys[items[at]] > key or (keys[items[at]] == key and items[at] > item)) do
+      items[at + 1] = items[at]
+      at -= 1
+    end
+
+    items[at + 1] = item
+  end
+end
+
+--- What one row's sweep needs, reused from row to row.
+type Row = {
+  cells: buffer,
+  --- The integer sum of every contribution left of the window.
+  carry: number,
+  --- The window's first column and its width, in absolute columns.
+  first: number,
+  width: number,
+}
+
+--- Adds an integer contribution to an absolute cell.
+local function deposit(row: Row, cell: number, amount: number)
+  local offset = cell - row.first
+
+  if offset < 0 then
+    row.carry += amount
+  elseif offset < row.width then
+    local at = offset * 8
+
+    buffer.writef64(row.cells, at, buffer.readf64(row.cells, at) + amount)
+  end
+end
+
+local function round(value: number): number
+  return math.floor(value + 0.5)
+end
+
+--- Accumulates a line crossing a sub-band, from x `topX` at its top to `bottomX` at its bottom,
+--- with `share` its height in units of 2^-30 times its sign, a whole number: each cell takes the
+--- part of it right of the line, rounded to a whole number of units, and
+--- the cell after the last takes what is left, so a running sum is the area right of the line.
+--- The last contribution is the rounded share less the rest, so the whole row sums to it exactly.
+@native
+local function accumulate(row: Row, topX: number, bottomX: number, share: number)
+  local left, right = math.min(topX, bottomX), math.max(topX, bottomX)
+  local leftCell, rightCell = math.floor(left), math.ceil(right)
+  local whole = share
+
+  if rightCell <= leftCell + 1 then
+    local middle = 0.5 * (topX + bottomX) - leftCell
+    local first = round(share * (1 - middle))
+
+    deposit(row, leftCell, first)
+    deposit(row, leftCell + 1, whole - first)
+
+    return
+  end
+
+  local inverse = 1 / (right - left)
+  local leftPart = left - leftCell
+  local firstArea = 0.5 * inverse * (1 - leftPart) * (1 - leftPart)
+  local rightPart = right - rightCell + 1
+  local lastArea = 0.5 * inverse * rightPart * rightPart
+  local first = round(share * firstArea)
+  local spent = first
+
+  deposit(row, leftCell, first)
+
+  if rightCell == leftCell + 2 then
+    local second = round(share * (1 - firstArea - lastArea))
+
+    deposit(row, leftCell + 1, second)
+    spent += second
+  else
+    local secondArea = inverse * (1.5 - leftPart)
+    local second = round(share * (secondArea - firstArea))
+    local even = round(share * inverse)
+
+    deposit(row, leftCell + 1, second)
+    spent += second
+
+    for cell = leftCell + 2, rightCell - 2 do
+      deposit(row, cell, even)
+      spent += even
+    end
+
+    local beforeLast = secondArea + (rightCell - leftCell - 3) * inverse
+    local penultimate = round(share * (1 - beforeLast - lastArea))
+
+    deposit(row, rightCell - 1, penultimate)
+    spent += penultimate
+  end
+
+  deposit(row, rightCell, whole - spent)
+end
+
+--- Sums one row of cells, from the carry, into coverage bytes at `base`, and clears the cells for
+--- the next row.
+@native
+local function settle(cells: buffer, carry: number, width: number, out: buffer, base: number)
+  local total = carry
+
+  for column = 0, width - 1 do
+    total += buffer.readf64(cells, column * 8)
+    buffer.writef64(cells, column * 8, 0)
+
+    local coverage = math.clamp(total / Scale, 0, 1)
+
+    buffer.writeu8(out, base + column, math.floor(coverage * 255 + 0.5))
+  end
+end
+
+local function passes(rule: FillRule, winding: number): boolean
+  if rule == 'evenodd' then return winding % 2 == 1 end
+
+  return winding ~= 0
+end
+
+--- Coverage bytes of a prepared outline over the window `width` by `height` pixels whose top left
+--- pixel is (`left`, `top`), rows from the top.
+@native
+local function cover(prepared: Prepared, rule: FillRule, left: number, top: number, width: number, height: number): buffer
+  local out = buffer.create(width * height)
+
+  if width == 0 or height == 0 or prepared.count == 0 then return out end
+  if prepared.bottom <= top or prepared.top >= top + height then return out end
+
+  local y0, y1 = prepared.y0, prepared.y1
+  local direction = prepared.direction
+  local row: Row = { cells = buffer.create(width * 8), carry = 0, first = left, width = width }
+  local right = left + width
+  local active: { number } = {}
+  local activeCount = 0
+  local nextEdge = 1
+  -- Per edge, its span and ends inside the current strip; keyed by edge.
+  local spanTop: { number }, spanBottom: { number }, startX: { number }, endX: { number } = {}, {}, {}, {}
+  local lowX: { number }, highX: { number }, key: { number } = {}, {}, {}
+  local band: { number }, byLow: { number } = {}, {}
+  -- Which band an edge was last put in, by a mark that grows band by band.
+  local member: { number } = {}
+  local mark = 0
+  local events: { number } = {}
+
+  for rowIndex = 0, height - 1 do
+    local stripTop = top + rowIndex
+    local stripBottom = stripTop + 1
+
+    -- Drop the edges that ended, then take in those that start in this strip.
+    local kept = 0
+
+    for position = 1, activeCount do
+      local edge = active[position]
+
+      if y1[edge] > stripTop then
+        kept += 1
+        active[kept] = edge
+      end
+    end
+
+    activeCount = kept
+
+    while nextEdge <= prepared.count and y0[nextEdge] < stripBottom do
+      if y1[nextEdge] > stripTop then
+        activeCount += 1
+        active[activeCount] = nextEdge
+      end
+
+      nextEdge += 1
+    end
+
+    local base = rowIndex * width
+
+    if activeCount == 0 then continue end
+
+    row.carry = 0
+
+    -- Each edge's part of the strip, its reach across, and the edges in order of their left end.
+    for position = 1, activeCount do
+      local edge = active[position]
+      local fromY, toY = math.max(y0[edge], stripTop), math.min(y1[edge], stripBottom)
+      local fromX, toX = edgeX(prepared, edge, fromY), edgeX(prepared, edge, toY)
+
+      spanTop[edge], spanBottom[edge] = fromY, toY
+      if direction[edge] == 0 then fromX, toX = prepared.x0[edge], prepared.x1[edge] end
+
+      lowX[edge], highX[edge] = math.min(fromX, toX), math.max(fromX, toX)
+      byLow[position] = edge
+    end
+
+    sortBy(byLow, lowX, activeCount)
+
+    -- Clusters: runs of edges whose reaches across overlap. No edge crosses from one cluster into
+    -- another, and a closed outline's edges in one cluster add the same winding at every height of
+    -- the strip, so each cluster is cut into sub-bands on its own, starting from the winding of
+    -- those before it. A cluster wholly left of the window adds only its net boundary to the carry,
+    -- the strip's full height when it turns the rule on and minus it when it turns it off, and a
+    -- cluster wholly right of it adds nothing the window shows.
+    local winding = 0
+    local first = 1
+
+    while first <= activeCount do
+      local reach = highX[byLow[first]]
+      local last = first
+
+      while last < activeCount and lowX[byLow[last + 1]] <= reach do
+        last += 1
+        reach = math.max(reach, highX[byLow[last]])
+      end
+
+      if lowX[byLow[first]] >= right then break end
+
+      local net = 0
+
+      for position = first, last do
+        local edge = byLow[position]
+
+        net += direction[edge] * (spanBottom[edge] - spanTop[edge])
+      end
+
+      net = round(net)
+
+      if reach < left - 1 then
+        if passes(rule, winding + net) ~= passes(rule, winding) then
+          row.carry += if passes(rule, winding + net) then Scale else -Scale
+        end
+
+        winding += net
+        first = last + 1
+        continue
+      end
+
+      -- The heights where this cluster's strip must be cut: its edges' ends, and their crossings.
+      -- Pair tests and crossings are counted as they are made and refused at their caps, so a
+      -- densely crossing cluster costs at most the caps before it raises.
+      local eventCount = 2
+      local crossings, work = 0, 0
+      local size = last - first + 1
+
+      events[1], events[2] = stripTop, stripBottom
+
+      for position = first, last do
+        local edge = byLow[position]
+
+        if spanTop[edge] > stripTop then
+          eventCount += 1
+          events[eventCount] = spanTop[edge]
+        end
+
+        if spanBottom[edge] < stripBottom then
+          eventCount += 1
+          events[eventCount] = spanBottom[edge]
+        end
+
+        local edgeReach = highX[edge]
+
+        for other = position + 1, last do
+          local second = byLow[other]
+
+          if lowX[second] > edgeReach then break end
+
+          work += 1
+          if work > Module.MaxStripWork then error(`magick: MaxStripWork {Module.MaxStripWork} exceeded`, 0) end
+
+          local from, to = math.max(spanTop[edge], spanTop[second]), math.min(spanBottom[edge], spanBottom[second])
+
+          if to <= from then continue end
+
+          local before = edgeX(prepared, edge, from) - edgeX(prepared, second, from)
+          local after = edgeX(prepared, edge, to) - edgeX(prepared, second, to)
+
+          if (before < 0 and after > 0) or (before > 0 and after < 0) then
+            local crossing = from + (to - from) * (before / (before - after))
+
+            if crossing > from and crossing < to then
+              crossings += 1
+              if crossings > Module.MaxStripCrossings then error(`magick: MaxStripCrossings {Module.MaxStripCrossings} exceeded`, 0) end
+
+              eventCount += 1
+              events[eventCount] = crossing
+            end
+          end
+        end
+      end
+
+      -- Each band visits every edge of the cluster, so the bands' work is known before any is cut.
+      if work + (eventCount - 1) * size > Module.MaxStripWork then error(`magick: MaxStripWork {Module.MaxStripWork} exceeded`, 0) end
+
+      -- The events past this cluster's are a longer cluster's leftovers: drop them so the sort
+      -- sees only these. Numbers sort to one order whatever the algorithm.
+      for index = eventCount + 1, #events do
+        events[index] = nil
+      end
+
+      table.sort(events)
+
+      -- Band heights are whole units of 2^-30 of the strip, so the bands of a strip add up to it
+      -- exactly, however it is cut.
+      local bandTop, bandUnits = events[1], 0
+      -- The band before keeps its left-to-right order for the next, less the edges that ended and
+      -- with the ones that began, so sorting it again moves only the edges that crossed in between.
+      -- The order (by key, ties by edge) is total, so it is the same however the list came in.
+      local bandCount = 0
+
+      for eventIndex = 2, eventCount do
+        local bandBottom = events[eventIndex]
+        local bottomUnits = round((bandBottom - stripTop) * Scale)
+        local shareUnits = bottomUnits - bandUnits
+
+        -- A cut thinner than a unit covers nothing, but the next band still starts below it.
+        if shareUnits <= 0 then
+          bandTop = bandBottom
+          continue
+        end
+
+        local kept = 0
+
+        mark += 1
+
+        for position = 1, bandCount do
+          local edge = band[position]
+
+          if spanBottom[edge] < bandBottom then continue end
+
+          kept += 1
+          band[kept] = edge
+          member[edge] = mark
+        end
+
+        for position = first, last do
+          local edge = byLow[position]
+
+          if member[edge] == mark or spanTop[edge] > bandTop or spanBottom[edge] < bandBottom then continue end
+
+          kept += 1
+          band[kept] = edge
+          member[edge] = mark
+        end
+
+        bandCount = kept
+
+        for position = 1, bandCount do
+          local edge = band[position]
+
+          startX[edge], endX[edge] = edgeX(prepared, edge, bandTop), edgeX(prepared, edge, bandBottom)
+          key[edge] = startX[edge] + endX[edge]
+        end
+
+        sortBy(band, key, bandCount)
+
+        local inside = winding
+
+        for position = 1, bandCount do
+          local edge = band[position]
+          local was = passes(rule, inside)
+
+          inside += direction[edge]
+
+          local now = passes(rule, inside)
+
+          if now and not was then
+            accumulate(row, startX[edge], endX[edge], shareUnits)
+          elseif was and not now then
+            accumulate(row, startX[edge], endX[edge], -shareUnits)
+          end
+        end
+
+        bandTop, bandUnits = bandBottom, bottomUnits
+      end
+
+      winding += net
+      first = last + 1
+    end
+
+    settle(row.cells, row.carry, width, out, base)
+  end
+
+  return out
+end
+
+Module.coverage = cover
+
+return Module
