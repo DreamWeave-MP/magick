@@ -1,0 +1,325 @@
+--!strict
+-- `@magick/svg` (MAG-043): export that is deterministic and reads back to the same picture, an
+-- import of the subset hand-written SVG uses, and refusals of what is out of the subset or past its
+-- caps. (The export was also checked against ImageMagick's SVG renderer by hand: MAE 0.11%.)
+local brush = require '@magick/brush'
+local bytes = require '@dream/bytes'
+local fixtures = require './svg/fixtures'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local render = require '@magick/render'
+local scene = require '@magick/scene'
+local svg = require '@magick/svg'
+local test = require '@jess/test'
+local transform = require '@magick/transform'
+
+local expect = test.expect
+local suite = test.new()
+
+local function meanDifference(first: { data: buffer }, second: { data: buffer }): number
+  local total = 0
+
+  for index = 0, buffer.len(first.data) - 1 do
+    total += math.abs(buffer.readu8(first.data, index) - buffer.readu8(second.data, index))
+  end
+
+  return total / buffer.len(first.data)
+end
+
+local function sample(): scene.Document
+  local document = scene.new(200, 120, { background = '#f0f0f0' })
+  local group = document:add(document:group { transform = transform.rotate(0.1), opacity = 0.9, clip = { path = path.new():circle(100, 60, 58) } })
+
+  group:add(document:shape(path.new():ring(60, 60, 40, 18), { fill = paint.linear(20, 0, 100, 0, paint.stops(0, '#ff6040', 1, '#4060ff')) }))
+  group:add(document:shape(path.new():moveTo(110, 20):quadTo(190, 40, 150, 100):cubicTo(130, 110, 120, 90, 110, 20):close(), {
+    fill = paint.radial(140, 60, 40, paint.stops(0, '#ffff80', 1, '#40a040')),
+    stroke = paint.solid '#202020',
+    strokeStyle = { width = 3, join = 'round', dashes = { 6, 3 } },
+  }))
+  document:add(document:group { filters = { { kind = 'blur', radius = 2 } }, blend = 'multiply' }):add(document:shape(path.new():rect(10, 10, 40, 30), { fill = paint.solid '#80808080' }))
+
+  return document
+end
+
+suite.describe('export', function()
+  suite.it('writes the same text for the same document, and reads back to the same picture', function()
+    local text = svg.export(sample())
+
+    expect(svg.export(sample())).toBe(text)
+    expect(string.find(text, 'A40 40 0 0 1 20 60 ', 1, true) ~= nil).toBe(true)
+    expect(string.find(text, '<feGaussianBlur stdDeviation="2"/>', 1, true) ~= nil).toBe(true)
+    expect(string.find(text, 'mix-blend-mode:multiply', 1, true) ~= nil).toBe(true)
+
+    -- The read-back has no filter (blur is not in the import subset), so compare without it.
+    local plain = sample()
+
+    plain.root.children[2]:remove()
+
+    local back = svg.import(svg.export(plain))
+
+    expect(meanDifference(render.image(back.document), render.image(plain)) < 0.5).toBe(true)
+  end)
+
+  suite.it('refuses what SVG cannot say as this package draws it', function()
+    local conic = scene.new(10, 10)
+
+    conic:add(conic:shape(path.new():rect(0, 0, 10, 10), { fill = paint.conic(5, 5, paint.stops(0, '#000', 1, '#fff')) }))
+
+    expect(function()
+      svg.export(conic)
+    end).toThrow 'magick: svg export takes solid, linear and radial paints, not a conic paint (node #2)'
+
+    local painted = scene.new(10, 10)
+
+    painted:add(painted:stroke({ { 1, 1 }, { 9, 9 } }, brush.preset('ink', 2, '#000')))
+
+    expect(function()
+      svg.export(painted)
+    end).toThrow 'magick: svg export does not take brush strokes (node #2)'
+  end)
+end)
+
+suite.describe('import', function()
+  local drawing = [[<?xml version="1.0"?>
+<!-- hand written -->
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80" viewBox="0 0 60 40">
+  <defs>
+    <linearGradient id="sky"><stop offset="0%" stop-color="#204080"/><stop offset="100%" style="stop-color: #f0c080"/></linearGradient>
+  </defs>
+  <rect width="60" height="40" fill="url(#sky)"/>
+  <g fill="#203018" transform="translate(0 2)">
+    <path d="M0 30 q15 -12 30 -2 t30 0 V40 H0 z"/>
+    <circle cx="44" cy="10" r="5" style="fill: white; fill-opacity: 0.8"/>
+    <path d="M5 5 a6 4 0 1 0 12 0 a6 4 0 1 0 -12 0" fill="red" stroke="black" stroke-width="0.5"/>
+  </g>
+  <polygon points="20,5 24,12 16,12" fill="rgb(255, 160, 0)"/>
+  <text x="2" y="38">ignored</text>
+</svg>]]
+
+  suite.it('draws the subset: viewBox, gradients, inheritance, styles, relative and smooth commands, arcs', function()
+    local result = svg.import(drawing)
+    local image = render.image(result.document)
+
+    expect({ image.width, image.height }).toEqual { 120, 80 }
+    expect(#result.warnings).toBe(1)
+    expect(result.warnings[1]).toBe 'skipped <text>: not in the subset this reads'
+
+    -- The sky runs from blue at the left to warm at the right, through the bounding box.
+    expect((image:get(2, 2)) < (image:get(117, 2))).toBe(true)
+    -- The hill is dark green, the sun near white, the triangle orange, the ellipse red.
+    expect({ image:get(10, 76) }).toEqual { 32, 48, 24, 255 }
+    expect((image:get(88, 24)) > 230).toBe(true)
+    expect({ image:get(40, 18) }).toEqual { 255, 160, 0, 255 }
+    expect({ image:get(22, 16) }).toEqual { 255, 0, 0, 255 }
+  end)
+
+  suite.it('refuses untrusted input past its caps or out of range', function()
+    expect(function()
+      svg.import(string.rep(' ', svg.MaxSvgBytes + 1))
+    end).toThrow 'magick: MaxSvgBytes 16777216 exceeded'
+
+    expect(function()
+      svg.import('<svg>' .. string.rep('<g/>', svg.MaxElements + 1) .. '</svg>')
+    end).toThrow 'magick: MaxElements 65536 exceeded'
+
+    expect(function()
+      svg.import('<svg>' .. string.rep('<g>', 40) .. string.rep('</g>', 40) .. '</svg>')
+    end).toThrow 'magick: MaxDepth 32 exceeded'
+
+    expect(function()
+      svg.import('<svg><path d="M0 0 L1e400 0"/></svg>')
+    end).toThrow 'magick: svg path command L has 1e400, which is not a finite number'
+
+    expect(function()
+      svg.import('<svg><g transform="perspective(3)"/></svg>')
+    end).toThrow 'magick: unknown svg transform perspective'
+
+    expect(function()
+      svg.import('<html></html>')
+    end).toThrow 'magick: no svg element'
+  end)
+end)
+
+--- The image an SVG text imports and renders to.
+local function drawn(text: string): magick.Image
+  return (render.image(svg.import(text).document))
+end
+
+--- The straight bytes of a pixel.
+local function pixelOf(image: magick.Image, column: number, row: number): { number }
+  local at = (row * image.width + column) * 4
+
+  return { buffer.readu8(image.data, at), buffer.readu8(image.data, at + 1), buffer.readu8(image.data, at + 2), buffer.readu8(image.data, at + 3) }
+end
+
+suite.describe('an independent renderer', function()
+  -- tests/svg holds each fixture and librsvg 2.63.2's render of it, made once by
+  -- tools/svg_fixtures.jsl. Antialiasing differs between renderers, so pixels are compared by mean
+  -- difference and by how many differ by more than a quarter of their range.
+  suite.it('draws every fixture as librsvg does', function()
+    for _, fixture in fixtures do
+      local result = svg.import(fixture.svg)
+      local image = render.image(result.document)
+      local reference = magick.readPNG(bytes.fromBase64(fixture.reference))
+      local total, far = 0, 0
+
+      expect({ fixture.name, image.width, image.height }).toEqual { fixture.name, reference.width, reference.height }
+
+      for at = 0, buffer.len(image.data) - 1 do
+        local difference = math.abs(buffer.readu8(image.data, at) - buffer.readu8(reference.data, at))
+
+        total += difference
+        if difference > 64 then far += 1 end
+      end
+
+      local mean = total / buffer.len(image.data) / 255
+
+      -- Measured on 2026-11-26: 0.02% to 0.12%, and 0.89% for the paints fixture, whose radial
+      -- gradient interpolates a translucent stop a little differently.
+      expect({ fixture.name, mean < 0.012 }).toEqual { fixture.name, true }
+      expect({ fixture.name, far / buffer.len(image.data) < 0.002 }).toEqual { fixture.name, true }
+      expect({ fixture.name, #result.warnings }).toEqual { fixture.name, 0 }
+    end
+  end)
+end)
+
+suite.describe('numbers', function()
+  suite.it('reads mixed exponent, decimal and signed forms in order, in every list', function()
+    local wide = drawn '<svg width="10" height="10" viewBox="0 0 1e1 10"><rect width="10" height="10" fill="#fff"/></svg>'
+    local polygon = drawn '<svg width="10" height="10"><polygon points="0,0 1e1,0 10 .1e2-0 10" fill="#fff"/></svg>'
+    local path = drawn '<svg width="10" height="10"><path d="M0-0L1e1.0 10,1e1H0z" fill="#fff"/></svg>'
+    local moved = drawn '<svg width="10" height="10"><rect width="5" height="5" fill="#fff" transform="translate(5-0)"/></svg>'
+
+    for _, image in { wide, polygon, path } do
+      expect(pixelOf(image, 9, 9)).toEqual { 255, 255, 255, 255 }
+      expect(pixelOf(image, 0, 0)).toEqual { 255, 255, 255, 255 }
+    end
+
+    expect(pixelOf(moved, 7, 2)).toEqual { 255, 255, 255, 255 }
+    expect(pixelOf(moved, 2, 2)).toEqual { 0, 0, 0, 0 }
+  end)
+
+  suite.it('reads compact arc flags, and draws nothing for an arc that ends where it starts', function()
+    local compact = drawn '<svg width="40" height="40"><path d="M10 20a10 10 0 1020 0a10 10 0 10-20 0z" fill="#fff"/></svg>'
+    local spaced = drawn '<svg width="40" height="40"><path d="M10 20 a10 10 0 1 0 20 0 a10 10 0 1 0 -20 0 z" fill="#fff"/></svg>'
+    local still = svg.import '<svg width="10" height="10"><path d="M5 5 A3 3 0 0 1 5 5 L8 8 Z" fill="#fff"/></svg>'
+
+    expect(buffer.tostring(compact.data)).toBe(buffer.tostring(spaced.data))
+    expect(pixelOf(compact, 20, 20)).toEqual { 255, 255, 255, 255 }
+    render.image(still.document)
+  end)
+
+  suite.it('refuses malformed numbers and leftover arguments rather than dropping them', function()
+    local cases: { { text: string, message: string } } = {
+      { text = '<svg width="9" height="9"><path d="M0 0 L1e 2"/></svg>', message = 'malformed exponent' },
+      { text = '<svg width="9" height="9"><path d="M0 0 L1,,2"/></svg>', message = 'where a number belongs' },
+      { text = '<svg width="9" height="9"><path d="M0 0 L1 2 3"/></svg>', message = 'needs 2 numbers a step, and 1 are left' },
+      { text = '<svg width="9" height="9"><path d="M0 0 Z 4"/></svg>', message = 'takes no numbers' },
+      { text = '<svg width="9" height="9"><path d="5 5 M0 0 L1 1"/></svg>', message = 'before any command' },
+      { text = '<svg width="9" height="9"><path d="M0 0 A1 1 0 2 0 4 4"/></svg>', message = 'arc flag 2' },
+      { text = '<svg width="9" height="9"><polygon points="0 0 4 4 5"/></svg>', message = 'odd count' },
+      { text = '<svg width="9" height="9" viewBox="0 0 9"/>', message = 'viewBox has 3 numbers' },
+      { text = '<svg width="9" height="9"><g transform="scale(1 2 3)"/></svg>', message = 'transform scale takes 1 or 2 numbers, not 3' },
+      { text = '<svg width="9" height="9"><g transform="translate(1) bogus"/></svg>', message = 'is not a list of transform functions' },
+    }
+
+    for _, case in cases do
+      expect(function()
+        svg.import(case.text)
+      end).toThrow(case.message)
+    end
+  end)
+end)
+
+suite.describe('the canvas', function()
+  suite.it('fits a viewBox by preserveAspectRatio: meet by default, slice, and none', function()
+    local base = '<rect width="100" height="100" fill="#fff"/></svg>'
+    local meet = drawn('<svg width="200" height="100" viewBox="0 0 100 100">' .. base)
+    local slice = drawn('<svg width="200" height="100" viewBox="0 0 100 100" preserveAspectRatio="xMinYMin slice">' .. base)
+    local none = drawn('<svg width="200" height="100" viewBox="0 0 100 100" preserveAspectRatio="none">' .. base)
+
+    -- Meet centers a 100 square in the 200 by 100 canvas.
+    expect(pixelOf(meet, 10, 50)[4]).toBe(0)
+    expect(pixelOf(meet, 100, 50)[4]).toBe(255)
+    expect(pixelOf(meet, 190, 50)[4]).toBe(0)
+    -- Slice and none both fill it.
+    expect(pixelOf(slice, 10, 50)[4]).toBe(255)
+    expect(pixelOf(none, 190, 90)[4]).toBe(255)
+  end)
+
+  suite.it('refuses a size past 8192 pixels instead of shrinking the picture', function()
+    expect(function()
+      svg.import '<svg width="9000" height="10"/>'
+    end).toThrow 'magick: svg size 9000x10 is outside 1..8192 pixels a side'
+
+    expect(function()
+      svg.import '<svg viewBox="0 0 20000 100"/>'
+    end).toThrow 'is outside 1..8192 pixels a side'
+  end)
+
+  suite.it('reads absolute units, and stands the viewBox in for a percentage size, with a warning', function()
+    expect(svg.import('<svg width="1in" height="2.54cm"/>').document.width).toBe(96)
+
+    local relative = svg.import '<svg width="100%" height="50" viewBox="0 0 30 50"/>'
+
+    expect(relative.document.width).toBe(30)
+    expect(#relative.warnings).toBe(1)
+  end)
+end)
+
+suite.describe('interoperability', function()
+  suite.it('clips a single shape by its clip-path, in that shape\'s own space', function()
+    local image = drawn [[<svg width="40" height="40">
+      <defs><clipPath id="c"><rect width="10" height="10"/></clipPath></defs>
+      <rect width="40" height="40" fill="#fff" transform="translate(20 20)" clip-path="url(#c)"/>
+    </svg>]]
+
+    expect(pixelOf(image, 25, 25)[4]).toBe(255)
+    expect(pixelOf(image, 35, 35)[4]).toBe(0)
+    expect(pixelOf(image, 5, 5)[4]).toBe(0)
+  end)
+
+  suite.it('takes colors as CSS names them: #rgb, rgb() with percentages, rgba() alpha, keywords, currentColor', function()
+    local image = drawn [[<svg width="5" height="1" color="#00ff00">
+      <rect x="0" width="1" height="1" fill="#f00"/>
+      <rect x="1" width="1" height="1" fill="rgb(0%, 100%, 0%)"/>
+      <rect x="2" width="1" height="1" fill="rgba(0, 0, 255, 0.5)"/>
+      <rect x="3" width="1" height="1" fill="cornflowerblue"/>
+      <rect x="4" width="1" height="1" fill="currentColor"/>
+    </svg>]]
+
+    expect(pixelOf(image, 0, 0)).toEqual { 255, 0, 0, 255 }
+    expect(pixelOf(image, 1, 0)).toEqual { 0, 255, 0, 255 }
+    expect(pixelOf(image, 2, 0)).toEqual { 0, 0, 255, 128 }
+    expect(pixelOf(image, 3, 0)).toEqual { 100, 149, 237, 255 }
+    expect(pixelOf(image, 4, 0)).toEqual { 0, 255, 0, 255 }
+  end)
+
+  suite.it('leaves out display none and visibility hidden, and reads opacity from style', function()
+    local image = drawn [[<svg width="3" height="1">
+      <rect x="0" width="1" height="1" fill="#fff" display="none"/>
+      <g style="display:none"><rect x="1" width="1" height="1" fill="#fff"/></g>
+      <rect x="2" width="1" height="1" fill="#fff" style="opacity:0.5"/>
+    </svg>]]
+
+    expect(pixelOf(image, 0, 0)[4]).toBe(0)
+    expect(pixelOf(image, 1, 0)[4]).toBe(0)
+    expect(pixelOf(image, 2, 0)[4]).toBe(128)
+  end)
+
+  suite.it('follows a gradient href for its stops, and reads percentages and #rgb stops', function()
+    local image = drawn [[<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10">
+      <linearGradient id="a"><stop offset="0%" stop-color="#f00"/><stop offset="100%" stop-color="#00f"/></linearGradient>
+      <linearGradient id="b" xlink:href="#a" x2="0%" y2="100%"/>
+      <rect width="10" height="10" fill="url(#b)"/>
+    </svg>]]
+
+    -- Down, not across: the top row is red, the bottom blue, along every column.
+    expect(pixelOf(image, 0, 0)[1] > 200).toBe(true)
+    expect(pixelOf(image, 9, 0)[1] > 200).toBe(true)
+    expect(pixelOf(image, 0, 9)[3] > 200).toBe(true)
+  end)
+end)
+
+return suite

@@ -1,0 +1,1364 @@
+--!strict
+--[[
+@magick/svg: a bounded subset of SVG 1.1, out of a scene and into one (MAG-043).
+
+`export` writes a document as SVG: paths from their retained commands (lines, quadratic and cubic
+curves, elliptical arcs), solid, linear and radial paints as fills and strokes with every stroke
+setting, images as embedded PNG, and groups with their transform, opacity, blend, clip, mask and
+blur or shadow filter. What SVG cannot say the way this package draws it (conic, field, pattern,
+mix and shader paints, brush strokes) is refused by name rather than written approximately.
+
+`import` reads `svg`, `g`, `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`,
+`linearGradient`, `radialGradient` (with `href` inheritance) and `clipPath` (on groups and shapes,
+in user space or the shape's bounding box, one outline clipped exactly by its clip-rule and several
+as their union), with presentation attributes, `style` declarations, CSS colors (every keyword,
+`#rgb`, `rgb()`/`rgba()` with percentages and alpha, `currentColor`), absolute units, transforms,
+inheritance, `display` and `visibility`, and a viewBox fitted by `preserveAspectRatio` (meet by
+default). Anything else is skipped and named in the warnings it returns.
+
+The input is untrusted: its length, element count, nesting and path commands are capped, every
+number list is read in order to its last character, and what cannot be read (a malformed number,
+a step short of its arguments, an arc flag other than 0 or 1, a size past 8192 pixels) is refused
+by name rather than dropped, clamped or guessed at. `tests/svg` holds it to librsvg's renders.
+]]
+local bytes = require '@dream/bytes'
+local color = require '@magick/color'
+local magick = require '@magick'
+local paint = require '@magick/paint'
+local path = require '@magick/path'
+local scene = require '@magick/scene'
+local transform = require '@magick/transform'
+
+type Matrix = transform.Matrix
+
+local Module = {}
+
+Module.MaxSvgBytes = 16 * 1024 * 1024
+Module.MaxElements = 65536
+Module.MaxDepth = 32
+Module.MaxPathCommands = 1048576
+
+-- Export ------------------------------------------------------------------------------------------
+
+local function number(value: number): string
+  if value == math.floor(value) and math.abs(value) < 1e15 then return string.format('%d', value) end
+
+  local text = string.gsub(string.format('%.6f', value), '0+$', '')
+
+  text = string.gsub(text, '%.$', '')
+
+  return if text == '-0' then '0' else text
+end
+
+local function matrixText(matrix: Matrix): string
+  return `matrix({number(matrix.scaleX)} {number(matrix.skewY)} {number(matrix.skewX)} {number(matrix.scaleY)} {number(matrix.offsetX)} {number(matrix.offsetY)})`
+end
+
+local function escape(text: string): string
+  return (string.gsub(text, '[<>&"]', { ['<'] = '&lt;', ['>'] = '&gt;', ['&'] = '&amp;', ['"'] = '&quot;' }))
+end
+
+--- A straight color in 0..1 channels as `#rrggbb` and its alpha.
+local function hex(red: number, green: number, blue: number): string
+  local function byte(value: number): number
+    return math.floor(math.clamp(value, 0, 1) * 255 + 0.5)
+  end
+
+  return string.format('#%02x%02x%02x', byte(red), byte(green), byte(blue))
+end
+
+--- The `d` of a path's contours, each from its commands, moved by its own matrix. A contour under a
+--- matrix that bends an arc, or one wound reversed, is written as its flattened outline instead.
+local function pathData(shape: path.Path): string
+  local parts: { string } = {}
+  local description = path.describe(shape)
+
+  local function points(contour: path.ContourDescription)
+    local single = path.fromDescription { tolerance = description.tolerance, contours = { contour }, lines = {} }
+    local outline = path.flatten(single, description.tolerance)[1]
+
+    for index = 1, #outline - 1, 2 do
+      table.insert(parts, `{if index == 1 then 'M' else 'L'}{number(outline[index])} {number(outline[index + 1])}`)
+    end
+
+    if contour.closed then table.insert(parts, 'Z') end
+  end
+
+  local function each(contour: path.ContourDescription)
+    local commands = contour.commands
+    local hasArc = false
+
+    for index = 1, #commands do
+      if commands[index] == 4 or commands[index] == 5 then hasArc = true end
+    end
+
+    if contour.reverse or (contour.matrix and hasArc) then
+      points(contour)
+
+      return
+    end
+
+    local fields = contour.matrix
+    local matrix = if fields then transform.matrix(fields[1], fields[2], fields[3], fields[4], fields[5], fields[6]) else nil
+
+    local function at(pointX: number, pointY: number): string
+      if matrix then pointX, pointY = transform.apply(matrix, pointX, pointY) end
+
+      return `{number(pointX)} {number(pointY)}`
+    end
+
+    local index, started = 1, false
+
+    while index <= #commands do
+      local command = commands[index]
+
+      if command == 1 then
+        table.insert(parts, `{if started then 'L' else 'M'}{at(commands[index + 1], commands[index + 2])}`)
+        started = true
+        index += 3
+      elseif command == 2 then
+        table.insert(parts, `Q{at(commands[index + 1], commands[index + 2])} {at(commands[index + 3], commands[index + 4])}`)
+        index += 5
+      elseif command == 3 then
+        table.insert(parts, `C{at(commands[index + 1], commands[index + 2])} {at(commands[index + 3], commands[index + 4])} {at(commands[index + 5], commands[index + 6])}`)
+        index += 7
+      else
+        local centerX, centerY, radiusX, radiusY = commands[index + 1], commands[index + 2], commands[index + 3], commands[index + 4]
+        local from, to = 0, 2 * math.pi
+
+        if command == 4 then
+          from, to = commands[index + 5], commands[index + 6]
+          index += 7
+        else
+          index += 5
+        end
+
+        local startX, startY = centerX + radiusX * math.cos(from), centerY + radiusY * math.sin(from)
+
+        table.insert(parts, `{if started then 'L' else 'M'}{at(startX, startY)}`)
+        started = true
+
+        -- An arc of a whole turn or more goes in two halves, since an SVG arc ending where it starts
+        -- draws nothing.
+        local pieces = if math.abs(to - from) > math.pi * 1.999 then 2 else 1
+
+        for piece = 1, pieces do
+          local finish = from + (to - from) * piece / pieces
+          local sweep = if to > from then 1 else 0
+          local large = if math.abs(to - from) / pieces > math.pi then 1 else 0
+
+          table.insert(parts, `A{number(radiusX)} {number(radiusY)} 0 {large} {sweep} {at(centerX + radiusX * math.cos(finish), centerY + radiusY * math.sin(finish))}`)
+        end
+      end
+    end
+
+    if contour.closed then table.insert(parts, 'Z') end
+  end
+
+  for _, contour in description.contours do
+    each(contour)
+  end
+
+  for _, line in description.lines do
+    each(line)
+  end
+
+  return table.concat(parts, ' ')
+end
+
+type Writer = { definitions: { string }, next: number }
+
+local function identifier(writer: Writer, prefix: string): string
+  writer.next += 1
+
+  return `{prefix}{writer.next}`
+end
+
+--- A paint as an SVG paint attribute value and an opacity, adding a gradient definition if need be.
+local function paintText(writer: Writer, value: paint.Paint, node: scene.Node): (string, number)
+  if value.kind == 'solid' then
+    local channels = value.channels
+
+    return hex(channels[1] / 255, channels[2] / 255, channels[3] / 255), channels[4] / 255 * value.opacity
+  end
+
+  if value.kind ~= 'linear' and value.kind ~= 'radial' then
+    error(`magick: svg export takes solid, linear and radial paints, not a {value.kind} paint (node #{node.id})`, 4)
+  end
+
+  local id = identifier(writer, 'paint')
+  local geometry = value.geometry
+  local stops: { string } = {}
+
+  for index, offset in value.offsets do
+    local at = (index - 1) * 4
+    local red, green, blue = value.colors[at + 1], value.colors[at + 2], value.colors[at + 3]
+
+    if value.interpolation == 'linear' then red, green, blue = color.encode(red), color.encode(green), color.encode(blue) end
+
+    table.insert(stops, `<stop offset="{number(offset)}" stop-color="{hex(red, green, blue)}" stop-opacity="{number(value.colors[at + 4])}"/>`)
+  end
+
+  local common = `id="{id}" gradientUnits="userSpaceOnUse" gradientTransform="{matrixText(value.transform)}" spreadMethod="{value.spread}"{if value.interpolation == 'linear' then ' color-interpolation="linearRGB"' else ''}`
+
+  if value.kind == 'linear' then
+    table.insert(writer.definitions, `<linearGradient {common} x1="{number(geometry[1])}" y1="{number(geometry[2])}" x2="{number(geometry[3])}" y2="{number(geometry[4])}">{table.concat(stops)}</linearGradient>`)
+  else
+    table.insert(writer.definitions, `<radialGradient {common} cx="{number(geometry[1])}" cy="{number(geometry[2])}" r="{number(geometry[3])}" fx="{number(geometry[4])}" fy="{number(geometry[5])}">{table.concat(stops)}</radialGradient>`)
+  end
+
+  return `url(#{id})`, value.opacity
+end
+
+local function nodeAttributes(node: scene.Node, isolate: boolean?): string
+  local parts: { string }, styles: { string } = {}, {}
+
+  if not transform.isIdentity(node.transform) then table.insert(parts, `transform="{matrixText(node.transform)}"`) end
+  if node.opacity < 1 then table.insert(parts, `opacity="{number(node.opacity)}"`) end
+  if node.blend ~= 'normal' then table.insert(styles, `mix-blend-mode:{node.blend}`) end
+  if isolate then table.insert(styles, 'isolation:isolate') end
+  if #styles > 0 then table.insert(parts, `style="{table.concat(styles, ';')}"`) end
+  if node.name then table.insert(parts, `data-name="{escape(node.name :: string)}"`) end
+
+  return if #parts > 0 then ' ' .. table.concat(parts, ' ') else ''
+end
+
+local function writeNode(writer: Writer, node: scene.Node, out: { string })
+  if node.kind == 'stroke' then
+    error(`magick: svg export does not take brush strokes (node #{node.id}); render them to an image node first`, 3)
+  end
+
+  if node.kind == 'shape' then
+    local attributes: { string } = { `d="{pathData(node.geometry :: path.Path)}"` }
+
+    if node.fill then
+      local fill, opacity = paintText(writer, node.fill :: paint.Paint, node)
+
+      table.insert(attributes, `fill="{fill}"`)
+      if opacity < 1 then table.insert(attributes, `fill-opacity="{number(opacity)}"`) end
+      if node.fillRule == 'evenodd' then table.insert(attributes, 'fill-rule="evenodd"') end
+    else
+      table.insert(attributes, 'fill="none"')
+    end
+
+    local style = node.strokeStyle
+
+    if node.stroke and style then
+      local stroke, opacity = paintText(writer, node.stroke :: paint.Paint, node)
+
+      table.insert(attributes, `stroke="{stroke}" stroke-width="{number(style.width)}"`)
+      if opacity < 1 then table.insert(attributes, `stroke-opacity="{number(opacity)}"`) end
+      table.insert(attributes, `stroke-linejoin="{style.join or 'miter'}" stroke-linecap="{style.cap or 'butt'}" stroke-miterlimit="{number(style.miterLimit or 4)}"`)
+
+      if style.dashes and #style.dashes > 0 then
+        local lengths: { string } = {}
+
+        for _, length in style.dashes do
+          table.insert(lengths, number(length))
+        end
+
+        table.insert(attributes, `stroke-dasharray="{table.concat(lengths, ' ')}" stroke-dashoffset="{number(style.dashOffset or 0)}"`)
+      end
+    end
+
+    table.insert(out, `<path{nodeAttributes(node)} {table.concat(attributes, ' ')}/>`)
+
+    return
+  end
+
+  if node.kind == 'image' then
+    local image = node.image :: magick.Image
+    local rendering = if node.sampling == 'nearest' then ' style="image-rendering:pixelated"' else ''
+
+    table.insert(out, `<image{nodeAttributes(node)} width="{image.width}" height="{image.height}"{rendering} href="data:image/png;base64,{bytes.toBase64(magick.png(image))}"/>`)
+
+    return
+  end
+
+  local extra: { string } = {}
+
+  if node.clip then
+    local clip = node.clip :: scene.Clip
+    local id = identifier(writer, 'clip')
+
+    table.insert(writer.definitions, `<clipPath id="{id}"><path d="{pathData(clip.path)}" clip-rule="{clip.fillRule or 'nonzero'}"/></clipPath>`)
+    table.insert(extra, `clip-path="url(#{id})"`)
+  end
+
+  if node.mask then
+    local mask = node.mask :: scene.Mask
+    local id = identifier(writer, 'mask')
+    local inner: { string } = {}
+
+    writeNode(writer, mask.node, inner)
+    table.insert(writer.definitions, `<mask id="{id}" mask-type="{mask.kind or 'alpha'}">{table.concat(inner)}</mask>`)
+    table.insert(extra, `mask="url(#{id})"`)
+  end
+
+  if #node.filters > 0 then
+    local id = identifier(writer, 'filter')
+    local primitives: { string } = {}
+
+    for _, filter in node.filters do
+      if filter.kind == 'blur' then
+        table.insert(primitives, `<feGaussianBlur stdDeviation="{number(filter.radius)}"/>`)
+      else
+        local channels = magick.color(filter.color)
+
+        table.insert(primitives, `<feDropShadow dx="{number(filter.offsetX)}" dy="{number(filter.offsetY)}" stdDeviation="{number(filter.radius)}" flood-color="{hex(channels[1] / 255, channels[2] / 255, channels[3] / 255)}" flood-opacity="{number(channels[4] / 255)}"/>`)
+      end
+    end
+
+    table.insert(writer.definitions, `<filter id="{id}">{table.concat(primitives)}</filter>`)
+    table.insert(extra, `filter="url(#{id})"`)
+  end
+
+  table.insert(out, `<g{nodeAttributes(node, true)}{if #extra > 0 then ' ' .. table.concat(extra, ' ') else ''}>`)
+
+  for _, child in node.children do
+    writeNode(writer, child, out)
+  end
+
+  table.insert(out, '</g>')
+end
+
+--- A document as SVG text: the same document always gives the same text.
+function Module.export(document: scene.Document): string
+  local writer: Writer = { definitions = {}, next = 0 }
+  local body: { string } = {}
+
+  if document.background then
+    local channels = magick.color(document.background :: magick.Color)
+
+    table.insert(body, `<rect width="{document.width}" height="{document.height}" fill="{hex(channels[1] / 255, channels[2] / 255, channels[3] / 255)}" fill-opacity="{number(channels[4] / 255)}"/>`)
+  end
+
+  writeNode(writer, document.root, body)
+
+  local interpolation = if document.space == 'linear' then ' color-interpolation="linearRGB"' else ''
+
+  return table.concat {
+    `<svg xmlns="http://www.w3.org/2000/svg" width="{document.width}" height="{document.height}" viewBox="0 0 {document.width} {document.height}"{interpolation}>\n`,
+    if #writer.definitions > 0 then `<defs>{table.concat(writer.definitions, '\n')}</defs>\n` else '',
+    table.concat(body, '\n'),
+    '\n</svg>\n',
+  }
+end
+
+-- Import ------------------------------------------------------------------------------------------
+
+type Element = { name: string, attributes: { [string]: string }, children: { Element } }
+
+--- Parses the XML subset SVG files use: elements, attributes in either quote, self-closing tags,
+--- and comments, declarations and processing instructions skipped. Text content is ignored.
+local function parse(source: string): Element
+  local root: Element = { name = '#document', attributes = {}, children = {} }
+  local stack = { root }
+  local at, count = 1, 0
+  local length = #source
+
+  while at <= length do
+    local open = string.find(source, '<', at, true)
+
+    if not open then break end
+
+    if string.sub(source, open, open + 3) == '<!--' then
+      local close = string.find(source, '-->', open + 4, true)
+
+      if not close then error('magick: an svg comment never ends', 4) end
+
+      at = close + 3
+      continue
+    end
+
+    local nextChar = string.sub(source, open + 1, open + 1)
+
+    if nextChar == '?' or nextChar == '!' then
+      local close = string.find(source, '>', open, true)
+
+      if not close then error('magick: an svg declaration never ends', 4) end
+
+      at = close + 1
+      continue
+    end
+
+    local close = string.find(source, '>', open, true)
+
+    if not close then error('magick: an svg tag never ends', 4) end
+
+    local tag = string.sub(source, open + 1, close - 1)
+
+    at = close + 1
+
+    if string.sub(tag, 1, 1) == '/' then
+      if #stack > 1 then table.remove(stack) end
+
+      continue
+    end
+
+    count += 1
+    if count > Module.MaxElements then error(`magick: MaxElements {Module.MaxElements} exceeded`, 4) end
+
+    local selfClosing = string.sub(tag, -1) == '/'
+
+    if selfClosing then tag = string.sub(tag, 1, -2) end
+
+    local name = string.match(tag, '^%s*([%w:_%-]+)') or ''
+    local element: Element = { name = name, attributes = {}, children = {} }
+
+    for key, value in string.gmatch(tag, '([%w:_%-]+)%s*=%s*"([^"]*)"') do
+      element.attributes[key] = value
+    end
+
+    for key, value in string.gmatch(tag, "([%w:_%-]+)%s*=%s*'([^']*)'") do
+      element.attributes[key] = value
+    end
+
+    table.insert(stack[#stack].children, element)
+
+    if not selfClosing then
+      table.insert(stack, element)
+      if #stack > Module.MaxDepth + 2 then error(`magick: MaxDepth {Module.MaxDepth} exceeded`, 4) end
+    end
+  end
+
+  return root
+end
+
+local function finite(value: number?): boolean
+  return value ~= nil and value == value and value > -math.huge and value < math.huge
+end
+
+--- The numbers of an SVG number list, in order, every character accounted for: each is a sign, digits
+--- with an optional point (or a point and digits), and an optional exponent; between two there is
+--- whitespace, one comma, or nothing where the next one's sign or point begins it (`1-2`, `.5.5`).
+--- With `flags`, the 4th and 5th of every seven (an arc's flags) are one character, 0 or 1, so
+--- `a1 1 0 00 1 1` reads as SVG says. Anything else, a malformed exponent included, is refused
+--- naming `what`, rather than skipped.
+local function scanNumbers(text: string, what: string, flags: boolean?): { number }
+  local out: { number } = {}
+  local at, length = 1, #text
+
+  while true do
+    local _, skipped = string.find(text, '^%s*,?%s*', at)
+
+    at = (skipped :: number) + 1
+
+    if at > length then break end
+
+    if flags and (#out % 7 == 3 or #out % 7 == 4) then
+      local flag = string.sub(text, at, at)
+
+      if flag ~= '0' and flag ~= '1' then error(`magick: svg {what} has an arc flag {flag} that is not 0 or 1`, 4) end
+
+      table.insert(out, if flag == '1' then 1 else 0)
+      at += 1
+      continue
+    end
+
+    local token = string.match(text, '^[-+]?%d+%.?%d*', at) or string.match(text, '^[-+]?%.%d+', at)
+
+    if not token then error(`magick: svg {what} has {string.sub(text, at, at + 11)} where a number belongs`, 4) end
+
+    at += #token
+
+    local exponent = string.match(text, '^[eE][-+]?%d+', at)
+
+    if exponent then
+      token ..= exponent
+      at += #exponent
+    elseif string.match(text, '^[eE]', at) then
+      error(`magick: svg {what} has a malformed exponent after {token}`, 4)
+    end
+
+    local value = tonumber(token)
+
+    if not finite(value) then error(`magick: svg {what} has {token}, which is not a finite number`, 4) end
+
+    table.insert(out, value :: number)
+  end
+
+  return out
+end
+
+--- Absolute CSS units in pixels (96 to the inch); relative ones (em, ex, %) have no size here.
+local Units: { [string]: number } = { [''] = 1, px = 1, ['in'] = 96, cm = 96 / 2.54, mm = 96 / 25.4, pt = 96 / 72, pc = 16 }
+
+--- A length attribute, or `default` when it is absent: a number with an absolute unit, or with `%`
+--- when `percentOf` gives what 100% is. Refused when it is not finite or its unit has no size here.
+local function attribute(element: Element, name: string, default: number, percentOf: number?): number
+  local text = element.attributes[name]
+
+  if not text then return default end
+
+  local number, unit = string.match(text, '^%s*([-+]?[%d%.]+[eE]?[-+]?%d*)%s*(%a*%%?)%s*$')
+  local value = tonumber(number or '')
+
+  if not finite(value) then error(`magick: svg attribute {name} is not a finite number`, 4) end
+
+  if unit == '%' then
+    if not percentOf then error(`magick: svg attribute {name} is a percentage, which has no size here`, 4) end
+
+    return (value :: number) / 100 * percentOf
+  end
+
+  local scale = Units[unit :: string]
+
+  if not scale then error(`magick: svg attribute {name} has the unit {unit}, which has no size here`, 4) end
+
+  return (value :: number) * scale
+end
+
+--- An SVG transform list as one matrix.
+--- How many numbers each SVG transform function takes.
+local TransformArguments: { [string]: { number } } = {
+  matrix = { 6 },
+  translate = { 1, 2 },
+  scale = { 1, 2 },
+  rotate = { 1, 3 },
+  skewX = { 1 },
+  skewY = { 1 },
+}
+
+local function parseTransform(text: string?): Matrix
+  local matrix = transform.identity()
+
+  if not text then return matrix end
+
+  -- What is left once every function is taken out must be separators only.
+  local rest = string.gsub(text, '(%a+)%s*%(([^)]*)%)', '')
+
+  if string.match(rest, '[^%s,]') then error(`magick: svg transform {text} is not a list of transform functions`, 4) end
+
+  for name, arguments in string.gmatch(text, '(%a+)%s*%(([^)]*)%)') do
+    local values = scanNumbers(arguments :: string, `transform {name}`)
+    local counts = TransformArguments[name :: string]
+
+    if counts and not table.find(counts, #values) then
+      error(`magick: svg transform {name} takes {table.concat(counts, ' or ')} numbers, not {#values}`, 4)
+    end
+
+    local step: Matrix
+
+    if name == 'matrix' then
+      step = transform.matrix(values[1], values[2], values[3], values[4], values[5], values[6])
+    elseif name == 'translate' then
+      step = transform.translate(values[1] or 0, values[2] or 0)
+    elseif name == 'scale' then
+      step = transform.scale(values[1] or 1, values[2] or values[1] or 1)
+    elseif name == 'rotate' then
+      local turn = transform.rotate(math.rad(values[1] or 0))
+
+      step = if values[2] then transform.compose(transform.translate(values[2], values[3] or 0), turn, transform.translate(-values[2], -(values[3] or 0))) else turn
+    elseif name == 'skewX' then
+      step = transform.skew(math.tan(math.rad(values[1] or 0)), 0)
+    elseif name == 'skewY' then
+      step = transform.skew(0, math.tan(math.rad(values[1] or 0)))
+    else
+      error(`magick: unknown svg transform {name}`, 4)
+    end
+
+    matrix = transform.multiply(matrix, step)
+  end
+
+  return matrix
+end
+
+--- The CSS Color 3 keywords SVG 1.1 names.
+local Named: { [string]: string } = {
+  aliceblue = 'f0f8ff', antiquewhite = 'faebd7', aqua = '00ffff', aquamarine = '7fffd4', azure = 'f0ffff', beige = 'f5f5dc',
+  bisque = 'ffe4c4', black = '000000', blanchedalmond = 'ffebcd', blue = '0000ff', blueviolet = '8a2be2', brown = 'a52a2a',
+  burlywood = 'deb887', cadetblue = '5f9ea0', chartreuse = '7fff00', chocolate = 'd2691e', coral = 'ff7f50',
+  cornflowerblue = '6495ed', cornsilk = 'fff8dc', crimson = 'dc143c', cyan = '00ffff', darkblue = '00008b', darkcyan = '008b8b',
+  darkgoldenrod = 'b8860b', darkgray = 'a9a9a9', darkgreen = '006400', darkgrey = 'a9a9a9', darkkhaki = 'bdb76b',
+  darkmagenta = '8b008b', darkolivegreen = '556b2f', darkorange = 'ff8c00', darkorchid = '9932cc', darkred = '8b0000',
+  darksalmon = 'e9967a', darkseagreen = '8fbc8f', darkslateblue = '483d8b', darkslategray = '2f4f4f', darkslategrey = '2f4f4f',
+  darkturquoise = '00ced1', darkviolet = '9400d3', deeppink = 'ff1493', deepskyblue = '00bfff', dimgray = '696969',
+  dimgrey = '696969', dodgerblue = '1e90ff', firebrick = 'b22222', floralwhite = 'fffaf0', forestgreen = '228b22',
+  fuchsia = 'ff00ff', gainsboro = 'dcdcdc', ghostwhite = 'f8f8ff', gold = 'ffd700', goldenrod = 'daa520', gray = '808080',
+  grey = '808080', green = '008000', greenyellow = 'adff2f', honeydew = 'f0fff0', hotpink = 'ff69b4', indianred = 'cd5c5c',
+  indigo = '4b0082', ivory = 'fffff0', khaki = 'f0e68c', lavender = 'e6e6fa', lavenderblush = 'fff0f5', lawngreen = '7cfc00',
+  lemonchiffon = 'fffacd', lightblue = 'add8e6', lightcoral = 'f08080', lightcyan = 'e0ffff', lightgoldenrodyellow = 'fafad2',
+  lightgray = 'd3d3d3', lightgreen = '90ee90', lightgrey = 'd3d3d3', lightpink = 'ffb6c1', lightsalmon = 'ffa07a',
+  lightseagreen = '20b2aa', lightskyblue = '87cefa', lightslategray = '778899', lightslategrey = '778899',
+  lightsteelblue = 'b0c4de', lightyellow = 'ffffe0', lime = '00ff00', limegreen = '32cd32', linen = 'faf0e6', magenta = 'ff00ff',
+  maroon = '800000', mediumaquamarine = '66cdaa', mediumblue = '0000cd', mediumorchid = 'ba55d3', mediumpurple = '9370db',
+  mediumseagreen = '3cb371', mediumslateblue = '7b68ee', mediumspringgreen = '00fa9a', mediumturquoise = '48d1cc',
+  mediumvioletred = 'c71585', midnightblue = '191970', mintcream = 'f5fffa', mistyrose = 'ffe4e1', moccasin = 'ffe4b5',
+  navajowhite = 'ffdead', navy = '000080', oldlace = 'fdf5e6', olive = '808000', olivedrab = '6b8e23', orange = 'ffa500',
+  orangered = 'ff4500', orchid = 'da70d6', palegoldenrod = 'eee8aa', palegreen = '98fb98', paleturquoise = 'afeeee',
+  palevioletred = 'db7093', papayawhip = 'ffefd5', peachpuff = 'ffdab9', peru = 'cd853f', pink = 'ffc0cb', plum = 'dda0dd',
+  powderblue = 'b0e0e6', purple = '800080', red = 'ff0000', rosybrown = 'bc8f8f', royalblue = '4169e1', saddlebrown = '8b4513',
+  salmon = 'fa8072', sandybrown = 'f4a460', seagreen = '2e8b57', seashell = 'fff5ee', sienna = 'a0522d', silver = 'c0c0c0',
+  skyblue = '87ceeb', slateblue = '6a5acd', slategray = '708090', slategrey = '708090', snow = 'fffafa', springgreen = '00ff7f',
+  steelblue = '4682b4', tan = 'd2b48c', teal = '008080', thistle = 'd8bfd8', tomato = 'ff6347', turquoise = '40e0d0',
+  violet = 'ee82ee', wheat = 'f5deb3', white = 'ffffff', whitesmoke = 'f5f5f5', yellow = 'ffff00', yellowgreen = '9acd32',
+}
+
+--- One channel of `rgb()`: a number 0..255 or a percentage, as a byte.
+local function channelByte(text: string): number
+  local number, percent = string.match(text, '^%s*([-+]?[%d%.]+)%s*(%%?)%s*$')
+  local value = tonumber(number or '')
+
+  if not finite(value) then error(`magick: svg color channel {text} is not a number`, 5) end
+
+  return math.floor(math.clamp(if percent == '%' then (value :: number) * 2.55 else value :: number, 0, 255) + 0.5)
+end
+
+--- An SVG color as `#rrggbb` text and an alpha in 0..1, or nil for `none`. `current` is what
+--- `currentColor` names. `#rgb` is widened to `#rrggbb`, and `rgba()` carries its alpha.
+local function parseColor(text: string, current: string?): (string?, number)
+  local value = string.lower((string.gsub(text, '^%s*(.-)%s*$', '%1')))
+
+  if value == 'none' or value == 'transparent' then return nil, 0 end
+  if value == 'currentcolor' then return parseColor(current or 'black', nil) end
+  if Named[value] then return '#' .. Named[value], 1 end
+  if string.match(value, '^#%x%x%x%x%x%x$') then return value, 1 end
+
+  local short = string.match(value, '^#(%x%x%x)$')
+
+  if short then
+    return `#{string.rep(string.sub(short, 1, 1), 2)}{string.rep(string.sub(short, 2, 2), 2)}{string.rep(string.sub(short, 3, 3), 2)}`, 1
+  end
+
+  local inside = string.match(value, '^rgba?%((.*)%)$')
+
+  if inside then
+    local parts = string.split(inside, ',')
+
+    if #parts ~= 3 and #parts ~= 4 then error(`magick: svg color {text} needs three channels and maybe an alpha`, 4) end
+
+    local alpha = 1
+
+    if parts[4] then
+      local number, percent = string.match(parts[4], '^%s*([-+]?[%d%.]+)%s*(%%?)%s*$')
+      local parsed = tonumber(number or '')
+
+      if not finite(parsed) then error(`magick: svg color {text} has an alpha that is not a number`, 4) end
+
+      alpha = math.clamp(if percent == '%' then (parsed :: number) / 100 else parsed :: number, 0, 1)
+    end
+
+    return string.format('#%02x%02x%02x', channelByte(parts[1]), channelByte(parts[2]), channelByte(parts[3])), alpha
+  end
+
+  error(`magick: svg color {text} is not one this reads`, 4)
+end
+
+--- The commands of an SVG path `d`, drawn into a path, arcs as cubic curves.
+local function parsePathData(data: string, budget: { number }): path.Path
+  local out = path.new()
+  local currentX, currentY, startX, startY = 0, 0, 0, 0
+  local lastControlX, lastControlY, lastCommand = 0, 0, ''
+  local tokens: { string } = {}
+
+  for token in string.gmatch(data, '[MmLlHhVvCcSsQqTtAaZz]') do
+    table.insert(tokens, token)
+  end
+
+  local position = 1
+  local commandIndex = 0
+
+  local function arcTo(radiusX: number, radiusY: number, rotation: number, large: boolean, sweep: boolean, toX: number, toY: number)
+    -- SVG's endpoint arc as cubic curves, by the center parameterization of the SVG implementation notes.
+    -- An arc to where it starts draws nothing (SVG 1.1 F.6.2); its center would be undefined.
+    if toX == currentX and toY == currentY then return end
+
+    if radiusX == 0 or radiusY == 0 then
+      out:lineTo(toX, toY)
+
+      return
+    end
+
+    radiusX, radiusY = math.abs(radiusX), math.abs(radiusY)
+
+    local cosine, sine = math.cos(math.rad(rotation)), math.sin(math.rad(rotation))
+    local halfX, halfY = (currentX - toX) / 2, (currentY - toY) / 2
+    local primeX, primeY = cosine * halfX + sine * halfY, -sine * halfX + cosine * halfY
+    local lambda = primeX ^ 2 / radiusX ^ 2 + primeY ^ 2 / radiusY ^ 2
+
+    if lambda > 1 then radiusX, radiusY = radiusX * math.sqrt(lambda), radiusY * math.sqrt(lambda) end
+
+    local numerator = radiusX ^ 2 * radiusY ^ 2 - radiusX ^ 2 * primeY ^ 2 - radiusY ^ 2 * primeX ^ 2
+    local denominator = radiusX ^ 2 * primeY ^ 2 + radiusY ^ 2 * primeX ^ 2
+    local factor = math.sqrt(math.max(0, numerator / denominator)) * (if large == sweep then -1 else 1)
+    local centerPrimeX, centerPrimeY = factor * radiusX * primeY / radiusY, -factor * radiusY * primeX / radiusX
+    local centerX = cosine * centerPrimeX - sine * centerPrimeY + (currentX + toX) / 2
+    local centerY = sine * centerPrimeX + cosine * centerPrimeY + (currentY + toY) / 2
+    local startAngle = math.atan2((primeY - centerPrimeY) / radiusY, (primeX - centerPrimeX) / radiusX)
+    local endAngle = math.atan2((-primeY - centerPrimeY) / radiusY, (-primeX - centerPrimeX) / radiusX)
+    local delta = endAngle - startAngle
+
+    if sweep and delta < 0 then delta += 2 * math.pi end
+    if not sweep and delta > 0 then delta -= 2 * math.pi end
+
+    local pieces = math.max(1, math.ceil(math.abs(delta) / (math.pi / 2)))
+    local step = delta / pieces
+    local handle = 4 / 3 * math.tan(step / 4)
+
+    for piece = 0, pieces - 1 do
+      local from, to = startAngle + piece * step, startAngle + (piece + 1) * step
+      local function point(angle: number, scale: number, along: number): (number, number)
+        local unitX = math.cos(angle) - scale * math.sin(angle) * along
+        local unitY = math.sin(angle) + scale * math.cos(angle) * along
+
+        return centerX + cosine * radiusX * unitX - sine * radiusY * unitY, centerY + sine * radiusX * unitX + cosine * radiusY * unitY
+      end
+      local firstX, firstY = point(from, handle, 1)
+      local secondX, secondY = point(to, handle, -1)
+      local endX, endY = point(to, 0, 0)
+
+      out:cubicTo(firstX, firstY, secondX, secondY, endX, endY)
+    end
+  end
+
+  local values = {}
+  local function load(segment: string)
+    values = scanNumbers(string.sub(segment, 2), `path command {string.sub(segment, 1, 1)}`, string.upper(string.sub(segment, 1, 1)) == 'A')
+  end
+
+  local stream = string.gsub(data, '([MmLlHhVvCcSsQqTtAaZz])', '\0%1')
+  local before = string.match(stream, '^([^%z]*)') :: string
+
+  if string.match(before, '%S') then error(`magick: svg path data starts with {string.sub(before, 1, 12)} before any command`, 4) end
+
+  for segment in string.gmatch(stream, '%z([^%z]*)') do
+    local command = string.sub(segment, 1, 1)
+    local relative = command == string.lower(command)
+    local upper = string.upper(command)
+    local index = 1
+
+    load(segment)
+
+    if upper == 'Z' and #values > 0 then error(`magick: svg path command {command} takes no numbers`, 4) end
+
+    for _, value in values do
+      if not finite(value) or math.abs(value) > transform.MaxCoordinate then error('magick: svg path numbers must be finite and within MaxCoordinate', 4) end
+    end
+
+    local function take(count: number): { number }?
+      if index + count - 1 > #values then
+        error(`magick: svg path command {command} needs {count} numbers a step, and {#values - index + 1} are left`, 5)
+      end
+
+      local out: { number } = table.move(values, index, index + count - 1, 1, {}) :: { number }
+
+      index += count
+
+      return out
+    end
+
+    repeat
+      commandIndex += 1
+      budget[1] += 1
+      if budget[1] > Module.MaxPathCommands then error(`magick: MaxPathCommands {Module.MaxPathCommands} exceeded`, 4) end
+
+      local baseX, baseY = if relative then currentX else 0, if relative then currentY else 0
+
+      if upper == 'Z' then
+        out:close()
+        currentX, currentY = startX, startY
+        break
+      elseif upper == 'M' or upper == 'L' or upper == 'T' then
+        local args = take(2)
+
+        if not args then break end
+
+        local toX, toY = baseX + args[1], baseY + args[2]
+
+        if upper == 'M' and lastCommand ~= 'M' then
+          out:moveTo(toX, toY)
+          startX, startY = toX, toY
+          upper = 'L'
+        elseif upper == 'T' then
+          local controlX = if lastCommand == 'Q' or lastCommand == 'T' then 2 * currentX - lastControlX else currentX
+          local controlY = if lastCommand == 'Q' or lastCommand == 'T' then 2 * currentY - lastControlY else currentY
+
+          out:quadTo(controlX, controlY, toX, toY)
+          lastControlX, lastControlY = controlX, controlY
+        else
+          out:lineTo(toX, toY)
+        end
+
+        currentX, currentY = toX, toY
+      elseif upper == 'H' or upper == 'V' then
+        local args = take(1)
+
+        if not args then break end
+
+        if upper == 'H' then currentX = baseX + args[1] else currentY = (if relative then currentY else 0) + args[1] end
+
+        out:lineTo(currentX, currentY)
+      elseif upper == 'C' or upper == 'S' then
+        local args = take(if upper == 'C' then 6 else 4)
+
+        if not args then break end
+
+        local firstX, firstY
+
+        if upper == 'C' then
+          firstX, firstY = baseX + args[1], baseY + args[2]
+          table.remove(args, 1)
+          table.remove(args, 1)
+        else
+          local smooth = lastCommand == 'C' or lastCommand == 'S'
+
+          firstX, firstY = if smooth then 2 * currentX - lastControlX else currentX, if smooth then 2 * currentY - lastControlY else currentY
+        end
+
+        local secondX, secondY, toX, toY = baseX + args[1], baseY + args[2], baseX + args[3], baseY + args[4]
+
+        out:cubicTo(firstX, firstY, secondX, secondY, toX, toY)
+        lastControlX, lastControlY, currentX, currentY = secondX, secondY, toX, toY
+      elseif upper == 'Q' then
+        local args = take(4)
+
+        if not args then break end
+
+        local controlX, controlY = baseX + args[1], baseY + args[2]
+
+        out:quadTo(controlX, controlY, baseX + args[3], baseY + args[4])
+        lastControlX, lastControlY, currentX, currentY = controlX, controlY, baseX + args[3], baseY + args[4]
+      elseif upper == 'A' then
+        local args = take(7)
+
+        if not args then break end
+
+        local toX, toY = baseX + args[6], baseY + args[7]
+
+        arcTo(args[1], args[2], args[3], args[4] ~= 0, args[5] ~= 0, toX, toY)
+        currentX, currentY = toX, toY
+      else
+        error(`magick: unknown svg path command {command}`, 4)
+      end
+
+      lastCommand = upper
+    until index > #values
+
+    if upper == 'Z' then lastCommand = 'Z' end
+  end
+
+  if #tokens == 0 and #data > 0 and string.match(data, '%S') then error('magick: an svg path has no commands', 4) end
+
+  return out:finish()
+end
+
+type Style = { [string]: string }
+
+--- Properties an element passes to its children, and those it keeps to itself; both are read from
+--- presentation attributes and then `style` declarations, which win.
+local Inherited = {
+  fill = true,
+  stroke = true,
+  color = true,
+  visibility = true,
+  ['stroke-width'] = true,
+  ['fill-rule'] = true,
+  ['clip-rule'] = true,
+  ['fill-opacity'] = true,
+  ['stroke-opacity'] = true,
+  ['stroke-linecap'] = true,
+  ['stroke-linejoin'] = true,
+  ['stroke-miterlimit'] = true,
+  ['stroke-dasharray'] = true,
+  ['stroke-dashoffset'] = true,
+}
+local Own = { opacity = true, display = true, ['clip-path'] = true, ['stop-color'] = true, ['stop-opacity'] = true }
+
+--- An element's presentation: what it inherits, then its attributes, then its `style` declarations.
+local function styleOf(element: Element, inherited: Style): Style
+  local out: Style = {}
+
+  for key, value in inherited do
+    out[key] = value
+  end
+
+  for key, value in element.attributes do
+    if Inherited[key] or Own[key] then out[key] = value end
+  end
+
+  for key, value in string.gmatch(element.attributes.style or '', '([%w%-]+)%s*:%s*([^;]+)') do
+    if Inherited[key] or Own[key] then out[key] = (string.gsub(value :: string, '%s+$', '')) end
+  end
+
+  return out
+end
+
+--- What children inherit: an element's style less what it keeps to itself.
+local function inheritable(style: Style): Style
+  local out: Style = {}
+
+  for key, value in style do
+    if Inherited[key] then out[key] = value end
+  end
+
+  return out
+end
+
+--- A number property (an opacity, a width), or `default` when it is absent; a percentage is of 1.
+local function property(style: Style, name: string, default: number): number
+  local text = style[name]
+
+  if not text then return default end
+
+  local number, unit = string.match(text, '^%s*([-+]?[%d%.]+[eE]?[-+]?%d*)%s*(%a*%%?)%s*$')
+  local value = tonumber(number or '')
+
+  if not finite(value) then error(`magick: svg {name} {text} is not a number`, 4) end
+  if unit == '%' then return (value :: number) / 100 end
+
+  local scale = Units[unit :: string]
+
+  if not scale then error(`magick: svg {name} has the unit {unit}, which has no size here`, 4) end
+
+  return (value :: number) * scale
+end
+
+--- Elements by id, for gradient, clip and `href` references.
+type Ids = { [string]: Element }
+
+--- What a document's percentages and gradients are measured against.
+type Viewport = { width: number, height: number }
+
+--- The href an element names, `#id` only.
+local function hrefOf(element: Element): string?
+  local text = element.attributes.href or element.attributes['xlink:href']
+
+  return if text then string.match(text, '^%s*#(.+)$') else nil
+end
+
+--- A gradient attribute, taken from the first gradient along the `href` chain that sets it, as SVG
+--- gradients inherit their attributes and stops from the gradient they name.
+local function gradientChain(gradient: Element, ids: Ids): { Element }
+  local chain = { gradient }
+
+  while #chain < 16 do
+    local reference = hrefOf(chain[#chain])
+    local next = if reference then ids[reference] else nil
+
+    if not next or (next.name ~= 'linearGradient' and next.name ~= 'radialGradient') or table.find(chain, next) then break end
+
+    table.insert(chain, next)
+  end
+
+  return chain
+end
+
+local function inherited(chain: { Element }, name: string): Element
+  for _, element in chain do
+    if element.attributes[name] then return element end
+  end
+
+  return chain[1]
+end
+
+--- A paint from an SVG paint value: a color, or a gradient by `url(#id)` in its own space.
+local function paintFrom(value: string?, opacity: number, ids: Ids, shape: path.Path, style: Style, viewport: Viewport, warnings: { string }): paint.Paint?
+  if not value then return nil end
+
+  local reference, fallback = string.match(value, '^%s*url%(%s*#([^)%s]+)%s*%)%s*(.-)%s*$')
+
+  if not reference then
+    local hexColor, alpha = parseColor(value, style.color)
+
+    if not hexColor then return nil end
+
+    return paint.solid(hexColor, { opacity = math.clamp(opacity * alpha, 0, 1) })
+  end
+
+  local gradient = ids[reference :: string]
+
+  if not gradient or (gradient.name ~= 'linearGradient' and gradient.name ~= 'radialGradient') then
+    -- SVG draws the fallback after the url, or nothing when it has none.
+    if fallback and fallback ~= '' then return paintFrom(fallback, opacity, ids, shape, style, viewport, warnings) end
+
+    table.insert(warnings, `paint url(#{reference}) names no gradient; not drawn`)
+
+    return nil
+  end
+
+  local chain = gradientChain(gradient, ids)
+  local stops: { paint.Stop } = {}
+  local holder: Element? = nil
+
+  for _, element in chain do
+    for _, child in element.children do
+      if child.name == 'stop' then holder = element end
+    end
+
+    if holder then break end
+  end
+
+  local previous = 0
+
+  for _, stop in if holder then holder.children else {} do
+    if stop.name ~= 'stop' then continue end
+
+    local stopStyle = styleOf(stop, style)
+    local stopColor, alpha = parseColor(stopStyle['stop-color'] or 'black', style.color)
+    local stopOpacity = math.clamp(property(stopStyle, 'stop-opacity', 1), 0, 1) * alpha
+    -- Offsets never go back (SVG 1.1 13.2.4): one before the last is taken as the last.
+    local offset = math.max(previous, math.clamp(property(stop.attributes, 'offset', 0), 0, 1))
+
+    previous = offset
+    table.insert(stops, { offset = offset, color = string.format('%s%02x', stopColor or '#000000', math.floor((if stopColor then stopOpacity else 0) * 255 + 0.5)) })
+  end
+
+  -- No stops paints nothing; one paints its color (SVG 1.1 13.2.4).
+  if #stops == 0 then return nil end
+  if #stops == 1 then table.insert(stops, { offset = 1, color = stops[1].color }) end
+
+  local matrix = parseTransform(inherited(chain, 'gradientTransform').attributes.gradientTransform)
+  local units = inherited(chain, 'gradientUnits').attributes.gradientUnits
+  local bounding = units ~= 'userSpaceOnUse'
+
+  -- objectBoundingBox (SVG's default) is the unit square over the shape's box.
+  if bounding then
+    local left, top, right, bottom = shape:deviceBounds()
+
+    if right - left <= 0 or bottom - top <= 0 then return nil end
+
+    matrix = transform.multiply(transform.matrix(right - left, 0, 0, bottom - top, left, top), matrix)
+  end
+
+  local spread = inherited(chain, 'spreadMethod').attributes.spreadMethod or 'pad'
+  local options: paint.GradientOptions = {
+    transform = matrix,
+    opacity = math.clamp(opacity, 0, 1),
+    spread = if spread == 'repeat' or spread == 'reflect' then spread else 'pad',
+  }
+  local across = if bounding then 1 else viewport.width
+  local down = if bounding then 1 else viewport.height
+  local diagonal = if bounding then 1 else math.sqrt((viewport.width ^ 2 + viewport.height ^ 2) / 2)
+
+  local function length(name: string, default: number, of: number): number
+    return attribute(inherited(chain, name), name, default, of)
+  end
+
+  if gradient.name == 'linearGradient' then
+    return paint.linear(length('x1', 0, across), length('y1', 0, down), length('x2', across, across), length('y2', 0, down), stops, options)
+  end
+
+  local centerX, centerY = length('cx', 0.5 * across, across), length('cy', 0.5 * down, down)
+
+  options.focusX, options.focusY = length('fx', centerX, across), length('fy', centerY, down)
+
+  return paint.radial(centerX, centerY, length('r', 0.5 * diagonal, diagonal), stops, options)
+end
+
+--- An element's outline as a path, or nil when it is not a shape.
+local function outlineOf(element: Element, budget: { number }): path.Path?
+  local name = element.name
+
+  if name == 'path' then return parsePathData(element.attributes.d or '', budget) end
+
+  if name == 'rect' then
+    local left, top = attribute(element, 'x', 0), attribute(element, 'y', 0)
+    local width, height = attribute(element, 'width', 0), attribute(element, 'height', 0)
+    local radius = math.min(attribute(element, 'rx', attribute(element, 'ry', 0)), width / 2, height / 2)
+
+    if width < 0 or height < 0 then error('magick: svg rect has a negative size', 4) end
+    if width == 0 or height == 0 then return path.new() end
+
+    return if radius > 0 then path.new():roundRect(left, top, left + width, top + height, radius) else path.new():rect(left, top, left + width, top + height)
+  end
+
+  if name == 'circle' or name == 'ellipse' then
+    local radiusX = attribute(element, if name == 'circle' then 'r' else 'rx', 0)
+    local radiusY = if name == 'circle' then radiusX else attribute(element, 'ry', 0)
+
+    if radiusX < 0 or radiusY < 0 then error(`magick: svg {name} has a negative radius`, 4) end
+    if radiusX == 0 or radiusY == 0 then return path.new() end
+
+    return path.new():circle(attribute(element, 'cx', 0), attribute(element, 'cy', 0), radiusX, radiusY)
+  end
+
+  if name == 'line' then return path.new():moveTo(attribute(element, 'x1', 0), attribute(element, 'y1', 0)):lineTo(attribute(element, 'x2', 0), attribute(element, 'y2', 0)):finish() end
+
+  if name == 'polyline' or name == 'polygon' then
+    local values = scanNumbers(element.attributes.points or '', `{name} points`)
+    local out = path.new()
+
+    if #values % 2 == 1 then error(`magick: svg {name} points have an odd count, {#values}`, 4) end
+
+    for index = 1, #values - 1, 2 do
+      if index == 1 then out:moveTo(values[index], values[index + 1]) else out:lineTo(values[index], values[index + 1]) end
+    end
+
+    return if name == 'polygon' then out:close() else out:finish()
+  end
+
+  return nil
+end
+
+--- What `import` returns besides the document: what it skipped, and why.
+export type ImportResult = { document: scene.Document, warnings: { string } }
+
+--- The scale and offset that fit a viewBox into a viewport, by `preserveAspectRatio` (SVG 1.1 7.8):
+--- `none` stretches; otherwise one scale, the smaller (`meet`, the default) or the larger (`slice`,
+--- whose overflow the canvas edge cuts), aligned by xMin/xMid/xMax and yMin/yMid/yMax.
+local function fitViewBox(viewBox: { number }, width: number, height: number, text: string?): Matrix
+  local scaleX, scaleY = width / viewBox[3], height / viewBox[4]
+  local value = string.gsub(text or 'xMidYMid meet', '^%s*defer%s+', '')
+  local align, mode = string.match(value, '^%s*(%a+)%s*(%a*)%s*$')
+
+  if not align then error(`magick: svg preserveAspectRatio {value} is not one this reads`, 4) end
+  if mode ~= '' and mode ~= 'meet' and mode ~= 'slice' then error(`magick: svg preserveAspectRatio {value} is not one this reads`, 4) end
+
+  if align == 'none' then
+    return transform.compose(transform.scale(scaleX, scaleY), transform.translate(-viewBox[1], -viewBox[2]))
+  end
+
+  local horizontal, vertical = string.match(align :: string, '^x(M%a%a)Y(M%a%a)$')
+  local places: { [string]: number } = { Min = 0, Mid = 0.5, Max = 1 }
+
+  if not horizontal or not places[horizontal :: string] or not places[vertical :: string] then
+    error(`magick: svg preserveAspectRatio {value} is not one this reads`, 4)
+  end
+
+  local scale = if mode == 'slice' then math.max(scaleX, scaleY) else math.min(scaleX, scaleY)
+  local offsetX = places[horizontal :: string] * (width - viewBox[3] * scale)
+  local offsetY = places[vertical :: string] * (height - viewBox[4] * scale)
+
+  return transform.compose(transform.translate(offsetX, offsetY), transform.scale(scale), transform.translate(-viewBox[1], -viewBox[2]))
+end
+
+--- Elements that are never drawn where they stand: definitions, and what they hold.
+local Undrawn = {
+  defs = true,
+  linearGradient = true,
+  radialGradient = true,
+  clipPath = true,
+  mask = true,
+  symbol = true,
+  marker = true,
+  pattern = true,
+  title = true,
+  desc = true,
+  metadata = true,
+  style = true,
+  script = true,
+}
+
+--- A document from SVG text, read as untrusted input (see the module notes).
+function Module.import(source: string): ImportResult
+  if #source > Module.MaxSvgBytes then error(`magick: MaxSvgBytes {Module.MaxSvgBytes} exceeded`, 2) end
+
+  local tree = parse(source)
+  local root: Element? = nil
+
+  for _, child in tree.children do
+    if child.name == 'svg' then root = child end
+  end
+
+  if not root then error('magick: no svg element', 2) end
+
+  local svg = root :: Element
+  local warnings: { string } = {}
+  local viewBox = scanNumbers(svg.attributes.viewBox or '', 'viewBox')
+  local hasViewBox = #viewBox == 4 and viewBox[3] > 0 and viewBox[4] > 0
+
+  if #viewBox ~= 0 and #viewBox ~= 4 then error(`magick: svg viewBox has {#viewBox} numbers, not 4`, 2) end
+  if #viewBox == 4 and not hasViewBox then error('magick: svg viewBox has no area', 2) end
+
+  local function size(name: string, fallback: number): number
+    local text = svg.attributes[name]
+
+    -- A percentage of a viewport this standalone file doesn't have: the viewBox's size stands in.
+    if text and string.match(text, '%%%s*$') then
+      table.insert(warnings, `svg {name} {text} is relative to no viewport; the viewBox's size is used`)
+
+      return fallback
+    end
+
+    return attribute(svg, name, fallback)
+  end
+
+  local width = math.floor(size('width', if hasViewBox then viewBox[3] else 300) + 0.5)
+  local height = math.floor(size('height', if hasViewBox then viewBox[4] else 150) + 0.5)
+
+  -- A canvas is whole pixels in 1..8192: an image outside that is refused, never silently resized.
+  if width < 1 or height < 1 or width > 8192 or height > 8192 then
+    error(`magick: svg size {width}x{height} is outside 1..8192 pixels a side; give a width and height within it`, 2)
+  end
+
+  local document = scene.new(width, height)
+  local ids: Ids = {}
+  local budget = { 0 }
+  local viewport: Viewport = { width = if hasViewBox then viewBox[3] else width, height = if hasViewBox then viewBox[4] else height }
+
+  local function collect(element: Element)
+    local id = element.attributes.id
+
+    if id and not ids[id] then ids[id] = element end
+
+    for _, child in element.children do
+      collect(child)
+    end
+  end
+
+  collect(svg)
+
+  local top = document.root
+
+  if hasViewBox then
+    top = document:add(document:group { transform = fitViewBox(viewBox, width, height, svg.attributes.preserveAspectRatio), name = 'viewBox' })
+  end
+
+  --- A clip from `clip-path="url(#id)"`, in the user space of the element that names it, sized to
+  --- `shape`'s box for `clipPathUnits="objectBoundingBox"`. One outline is an exact clip by its
+  --- clip-rule; several are their union, drawn as an alpha mask, since one fill rule cannot union
+  --- outlines that each have their own.
+  local function clipOf(reference: string, bounds: path.Path?, inheritedStyle: Style): (scene.Clip?, scene.Mask?)
+    local clipElement = ids[reference]
+
+    if not clipElement or clipElement.name ~= 'clipPath' then
+      table.insert(warnings, `clip-path url(#{reference}) names no clipPath; not clipped`)
+
+      return nil, nil
+    end
+
+    local units = parseTransform(clipElement.attributes.transform)
+
+    if clipElement.attributes.clipPathUnits == 'objectBoundingBox' then
+      if not bounds then
+        table.insert(warnings, `clipPath #{reference} in objectBoundingBox units on a group is not read; not clipped`)
+
+        return nil, nil
+      end
+
+      local left, top, right, bottom = bounds:deviceBounds()
+
+      units = transform.multiply(transform.matrix(right - left, 0, 0, bottom - top, left, top), units)
+    end
+
+    local parts: { { shape: path.Path, rule: path.FillRule } } = {}
+    local clipStyle = styleOf(clipElement, inheritedStyle)
+
+    for _, part in clipElement.children do
+      local partStyle = styleOf(part, inheritable(clipStyle))
+
+      if partStyle.display == 'none' or partStyle.visibility == 'hidden' then continue end
+
+      local shape = outlineOf(part, budget)
+
+      if not shape then
+        if not Undrawn[part.name] then table.insert(warnings, `skipped <{part.name}> in clipPath #{reference}: not in the subset this reads`) end
+
+        continue
+      end
+
+      if part.attributes['clip-path'] then table.insert(warnings, `clip-path on a child of clipPath #{reference} is not read`) end
+
+      local rule: path.FillRule = if partStyle['clip-rule'] == 'evenodd' then 'evenodd' else 'nonzero'
+
+      table.insert(parts, { shape = shape:transformBy(transform.multiply(units, parseTransform(part.attributes.transform))), rule = rule })
+    end
+
+    -- Nothing in a clip path clips everything away.
+    if #parts == 0 then return { path = path.new(), fillRule = 'nonzero' }, nil end
+    if #parts == 1 then return { path = parts[1].shape, fillRule = parts[1].rule }, nil end
+
+    local union = document:group { name = `clipPath #{reference}` }
+
+    for _, part in parts do
+      union:add(document:shape(part.shape, { fill = paint.solid '#ffffff', fillRule = part.rule }))
+    end
+
+    return nil, { node = union, kind = 'alpha' }
+  end
+
+  local function walk(element: Element, parent: scene.Node, inheritedStyle: Style)
+    for _, child in element.children do
+      local name = child.name
+      local style = styleOf(child, inheritedStyle)
+
+      if Undrawn[name] or style.display == 'none' then continue end
+
+      local matrix = parseTransform(child.attributes.transform)
+      local opacity = math.clamp(property(style, 'opacity', 1), 0, 1)
+      local clipReference = string.match(style['clip-path'] or '', '^%s*url%(%s*#([^)%s]+)%s*%)')
+
+      if name == 'g' or name == 'a' then
+        local options: scene.GroupOptions = { transform = matrix, opacity = opacity }
+
+        if clipReference then options.clip, options.mask = clipOf(clipReference :: string, nil, style) end
+
+        walk(child, parent:add(document:group(options)), inheritable(style))
+        continue
+      end
+
+      local shape = outlineOf(child, budget)
+
+      if not shape then
+        table.insert(warnings, `skipped <{name}>: not in the subset this reads`)
+        continue
+      end
+
+      if style.visibility == 'hidden' or style.visibility == 'collapse' then continue end
+
+      local fill = paintFrom(if name == 'line' or name == 'polyline' then (style.fill or 'none') else (style.fill or 'black'), math.clamp(property(style, 'fill-opacity', 1), 0, 1), ids, shape, style, viewport, warnings)
+      local stroke = paintFrom(style.stroke, math.clamp(property(style, 'stroke-opacity', 1), 0, 1), ids, shape, style, viewport, warnings)
+      local options: scene.ShapeOptions = {
+        fill = if name == 'line' then nil else fill,
+        fillRule = if style['fill-rule'] == 'evenodd' then 'evenodd' else 'nonzero',
+        stroke = stroke,
+      }
+      local strokeWidth = property(style, 'stroke-width', 1)
+
+      if stroke and strokeWidth > 0 then
+        local dashes: { number }? = nil
+
+        if style['stroke-dasharray'] and style['stroke-dasharray'] ~= 'none' then
+          dashes = scanNumbers(style['stroke-dasharray'], 'stroke-dasharray')
+
+          -- An odd list repeats to an even one; a list of zeros draws the line whole (SVG 1.1 11.4).
+          if #(dashes :: { number }) % 2 == 1 then table.move(dashes :: { number }, 1, #(dashes :: { number }), #(dashes :: { number }) + 1) end
+
+          local total = 0
+
+          for _, dash in dashes :: { number } do
+            if dash < 0 then error('magick: svg stroke-dasharray has a negative length', 2) end
+
+            total += dash
+          end
+
+          if total == 0 then dashes = nil end
+        end
+
+        options.strokeStyle = {
+          width = strokeWidth,
+          join = if style['stroke-linejoin'] == 'round' or style['stroke-linejoin'] == 'bevel' then style['stroke-linejoin'] :: path.Join else 'miter',
+          cap = if style['stroke-linecap'] == 'round' or style['stroke-linecap'] == 'square' then style['stroke-linecap'] :: path.Cap else 'butt',
+          miterLimit = math.max(1, property(style, 'stroke-miterlimit', 4)),
+          dashes = dashes,
+          dashOffset = property(style, 'stroke-dashoffset', 0),
+        }
+      else
+        options.stroke = nil
+      end
+
+      if not options.fill and not options.stroke then continue end
+
+      if clipReference then
+        -- A clipped shape: a group in the shape's own user space carries the clip, as SVG resolves
+        -- `clip-path` in the space of the element that names it.
+        local clip, mask = clipOf(clipReference :: string, shape, style)
+        local group = parent:add(document:group { transform = matrix, opacity = opacity, clip = clip, mask = mask, name = child.attributes.id })
+
+        group:add(document:shape(shape, options))
+      else
+        options.transform = matrix
+        options.opacity = opacity
+        options.name = child.attributes.id
+        parent:add(document:shape(shape, options))
+      end
+    end
+  end
+
+  walk(svg, top, inheritable(styleOf(svg, {})))
+
+  return { document = document, warnings = warnings }
+end
+
+return Module

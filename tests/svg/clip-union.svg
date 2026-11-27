@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80">
+  <defs>
+    <clipPath id="pair"><circle cx="40" cy="40" r="28"/><rect x="55" y="15" width="50" height="50" transform="rotate(10 80 40)"/></clipPath>
+    <clipPath id="box" clipPathUnits="objectBoundingBox"><rect x="0.25" y="0.25" width="0.5" height="0.5"/></clipPath>
+  </defs>
+  <g clip-path="url(#pair)"><rect width="120" height="80" fill="#2a6"/></g>
+  <rect x="0" y="50" width="40" height="30" fill="#c33" clip-path="url(#box)"/>
+</svg>
