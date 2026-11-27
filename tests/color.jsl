@@ -1,0 +1,268 @@
+--!strict
+-- `@magick/color` (MAG-013): working tiles, the exact round trip of straight bytes through
+-- premultiplied f32 in both spaces, the transparent-RGB policy, and the twelve Porter-Duff operators
+-- against values worked out by hand from the W3C table, with zero and partial alpha on both sides.
+local color = require '@magick/color'
+local magick = require '@magick'
+local test = require '@jess/test'
+
+local expect = test.expect
+local suite = test.new()
+
+--- A one-pixel tile holding premultiplied values.
+local function pixelTile(red: number, green: number, blue: number, alpha: number): color.Tile
+  local tile = color.tile(1, 1)
+
+  buffer.writef32(tile.data, 0, red)
+  buffer.writef32(tile.data, 4, green)
+  buffer.writef32(tile.data, 8, blue)
+  buffer.writef32(tile.data, 12, alpha)
+
+  return tile
+end
+
+local function close(tile: color.Tile, expected: { number }): boolean
+  local red, green, blue, alpha = color.pixel(tile, 0, 0)
+
+  return math.abs(red - expected[1]) < 1e-6
+    and math.abs(green - expected[2]) < 1e-6
+    and math.abs(blue - expected[3]) < 1e-6
+    and math.abs(alpha - expected[4]) < 1e-6
+end
+
+--- Every straight byte at every alpha from 1 to 255, three distinct values in the three slots.
+local function everyByte(): magick.Image
+  local image = magick.new(256, 255)
+
+  for alpha = 1, 255 do
+    for value = 0, 255 do
+      local at = ((alpha - 1) * 256 + value) * 4
+
+      buffer.writeu8(image.data, at, value)
+      buffer.writeu8(image.data, at + 1, 255 - value)
+      buffer.writeu8(image.data, at + 2, (7 * value) % 256)
+      buffer.writeu8(image.data, at + 3, alpha)
+    end
+  end
+
+  return image
+end
+
+suite.describe('conversions', function()
+  suite.it('round-trips every straight byte at alpha 1..255 exactly, in sRGB and in linear light', function()
+    local image = everyByte()
+
+    for _, space in { 'srgb', 'linear' } :: { color.Space } do
+      local back = color.toImage(color.fromImage(image, { space = space }))
+
+      expect(buffer.tostring(back.data) == buffer.tostring(image.data)).toBe(true)
+    end
+  end)
+
+  suite.it('writes a pixel of alpha byte 0 as 0, 0, 0, 0, whatever color it held', function()
+    local image = magick.fromRGBA(2, 1, buffer.fromstring '\200\100\50\0\10\20\30\255')
+    local back = color.toImage(color.fromImage(image))
+
+    expect(buffer.tostring(back.data)).toBe '\0\0\0\0\10\20\30\255'
+  end)
+
+  suite.it('premultiplies legacy colors in either space', function()
+    local red, green, blue, alpha = color.premultiplied('#ff800080', 'srgb')
+
+    expect(math.abs(red - 128 / 255) < 1e-12 and math.abs(green - 128 / 255 * 128 / 255) < 1e-12).toBe(true)
+    expect({ blue, alpha }).toEqual { 0, 128 / 255 }
+
+    local linearRed = color.premultiplied('#808080', 'linear')
+
+    -- 128 / 255 = 0.50196 decodes to ((0.50196 + 0.055) / 1.055) ^ 2.4 = 0.21586.
+    expect(math.abs(linearRed - 0.2158605) < 1e-6).toBe(true)
+  end)
+
+  suite.it('keeps the transfer functions inverse to each other', function()
+    for step = 0, 1000 do
+      local value = step / 1000
+
+      expect(math.abs(color.encode(color.decode(value)) - value) < 1e-12).toBe(true)
+    end
+  end)
+
+  suite.it('converts between spaces and back to the same bytes', function()
+    local image = everyByte()
+    local tile = color.fromImage(image)
+    local back = color.toImage(color.convert(color.convert(tile, 'linear'), 'srgb'))
+
+    expect(buffer.tostring(back.data) == buffer.tostring(image.data)).toBe(true)
+  end)
+
+  suite.it('reads a window of an image into a tile placed there, and writes it back in place', function()
+    local image = magick.new(6, 5, '#102030')
+
+    image:set(3, 2, 255, 0, 0, 255)
+
+    local tile = color.fromImage(image, { left = 2, top = 1 }, 3, 3)
+
+    expect({ tile.left, tile.top, tile.width, tile.height }).toEqual { 2, 1, 3, 3 }
+    expect({ color.pixel(tile, 1, 1) }).toEqual { 1, 0, 0, 1 }
+
+    local target = magick.new(6, 5, '#000000')
+
+    color.toImage(tile, target)
+    expect({ target:get(3, 2) }).toEqual { 255, 0, 0, 255 }
+    expect({ target:get(1, 1) }).toEqual { 0, 0, 0, 255 }
+    expect({ target:get(2, 1) }).toEqual { 16, 32, 48, 255 }
+  end)
+end)
+
+suite.describe('Porter-Duff', function()
+  -- Source 60% red, premultiplied (0.6, 0, 0, 0.6); backdrop 50% blue, (0, 0, 0.5, 0.5). Each row
+  -- is fa, fb from the W3C table at as = 0.6, ab = 0.5, and the result source * fa + backdrop * fb.
+  local expectations: { [string]: { number } } = {
+    clear = { 0, 0, 0, 0 },
+    ['src'] = { 0.6, 0, 0, 0.6 },
+    ['dst'] = { 0, 0, 0.5, 0.5 },
+    ['src-over'] = { 0.6, 0, 0.2, 0.8 },
+    ['dst-over'] = { 0.3, 0, 0.5, 0.8 },
+    ['src-in'] = { 0.3, 0, 0, 0.3 },
+    ['dst-in'] = { 0, 0, 0.3, 0.3 },
+    ['src-out'] = { 0.3, 0, 0, 0.3 },
+    ['dst-out'] = { 0, 0, 0.2, 0.2 },
+    ['src-atop'] = { 0.3, 0, 0.2, 0.5 },
+    ['dst-atop'] = { 0.3, 0, 0.3, 0.6 },
+    xor = { 0.3, 0, 0.2, 0.5 },
+  }
+
+  suite.it('composites every operator to its W3C value at partial alpha', function()
+    for operator, expected in expectations do
+      local backdrop = pixelTile(0, 0, 0.5, 0.5)
+
+      color.composite(backdrop, pixelTile(0.6, 0, 0, 0.6), { operator = operator :: color.Operator })
+      expect(close(backdrop, expected)).toBe(true)
+    end
+  end)
+
+  suite.it('keeps the alpha identities: union is out + out + in, and xor is out + out', function()
+    local function alphaOf(operator: color.Operator, source: number, backdrop: number): number
+      local fa, fb = color.factors(operator, source, backdrop)
+
+      return source * fa + backdrop * fb
+    end
+
+    for step = 0, 20 do
+      local source, backdrop = step / 20, (20 - step) / 25
+
+      local union = alphaOf('src-out', source, backdrop) + alphaOf('dst-out', source, backdrop) + alphaOf('src-in', source, backdrop)
+
+      expect(math.abs(alphaOf('src-over', source, backdrop) - union) < 1e-12).toBe(true)
+      expect(math.abs(alphaOf('xor', source, backdrop) - alphaOf('src-out', source, backdrop) - alphaOf('dst-out', source, backdrop)) < 1e-12).toBe(true)
+    end
+  end)
+
+  suite.it('leaves the backdrop under a transparent source, and gives the source over a transparent backdrop', function()
+    local backdrop = pixelTile(0.1, 0.2, 0.3, 0.4)
+
+    color.composite(backdrop, pixelTile(0, 0, 0, 0))
+    expect(close(backdrop, { 0.1, 0.2, 0.3, 0.4 })).toBe(true)
+
+    local empty = pixelTile(0, 0, 0, 0)
+
+    color.composite(empty, pixelTile(0.25, 0.5, 0, 0.5))
+    expect(close(empty, { 0.25, 0.5, 0, 0.5 })).toBe(true)
+  end)
+
+  suite.it('applies opacity once, to color and alpha alike', function()
+    local backdrop = pixelTile(1, 1, 1, 1)
+
+    -- Half of opaque red over white: (0.5 + 0.5, 0.5, 0.5, 1).
+    color.composite(backdrop, pixelTile(1, 0, 0, 1), { opacity = 0.5 })
+    expect(close(backdrop, { 1, 0.5, 0.5, 1 })).toBe(true)
+  end)
+
+  suite.it('clears the destination outside the source for operators that clear under transparency', function()
+    local destination = color.fromImage(magick.new(4, 4, '#ffffff'))
+    local source = color.fromImage(magick.new(2, 2, '#ff0000'), nil)
+
+    source.left, source.top = 1, 1
+    color.composite(destination, source, { operator = 'src-in' })
+
+    local image = color.toImage(destination)
+
+    expect({ image:get(0, 0) }).toEqual { 0, 0, 0, 0 }
+    expect({ image:get(1, 1) }).toEqual { 255, 0, 0, 255 }
+    expect({ image:get(3, 3) }).toEqual { 0, 0, 0, 0 }
+
+    local kept = color.fromImage(magick.new(4, 4, '#ffffff'))
+
+    color.composite(kept, source)
+    expect({ color.toImage(kept):get(0, 0) }).toEqual { 255, 255, 255, 255 }
+  end)
+end)
+
+suite.describe('halos', function()
+  suite.it('keeps a half-transparent edge its straight color, with no dark fringe', function()
+    local edge = magick.fromRGBA(1, 1, buffer.fromstring '\255\0\0\128')
+    local layer = color.tile(1, 1)
+
+    color.composite(layer, color.fromImage(edge))
+    expect({ color.toImage(layer):get(0, 0) }).toEqual { 255, 0, 0, 128 }
+
+    local white = color.fromImage(magick.new(1, 1, '#ffffff'))
+
+    color.composite(white, color.fromImage(edge))
+    -- Green: 1 * (1 - 128 / 255) = 0.498, 127 of 255.
+    expect({ color.toImage(white):get(0, 0) }).toEqual { 255, 127, 127, 255 }
+  end)
+
+  suite.it('composites in linear light when asked: half black over white is 187, not 127', function()
+    local black = magick.fromRGBA(1, 1, buffer.fromstring '\0\0\0\128')
+
+    for _, case in { { 'srgb', 127 }, { 'linear', 187 } } do
+      local space = case[1] :: color.Space
+      local white = color.fromImage(magick.new(1, 1, '#ffffff'), { space = space })
+
+      color.composite(white, color.fromImage(black, { space = space }))
+      expect((color.toImage(white):get(0, 0))).toBe(case[2])
+    end
+  end)
+end)
+
+suite.describe('refusals', function()
+  suite.it('refuses mixed spaces, unknown operators and options, and bad opacities', function()
+    local first, second = color.tile(1, 1), color.tile(1, 1, { space = 'linear' })
+
+    expect(function()
+      color.composite(first, second)
+    end).toThrow 'magick: tiles of different spaces do not composite; convert one first'
+
+    expect(function()
+      color.composite(first, first, { operator = 'plus' :: any })
+    end).toThrow 'magick: unknown operator plus'
+
+    expect(function()
+      color.composite(first, first, { opacity = 1.5 })
+    end).toThrow 'magick: opacity must be in 0..1'
+
+    expect(function()
+      color.composite(first, first, { blend = 'multiply' } :: any)
+    end).toThrow 'magick: unknown option blend'
+
+    expect(function()
+      color.tile(1, 1, { space = 'cmyk' :: any })
+    end).toThrow 'magick: unknown color space cmyk'
+  end)
+
+  suite.it('refuses tiles past their caps and windows outside the image', function()
+    expect(function()
+      color.tile(8193, 1)
+    end).toThrow 'magick: MaxImageEdge 8192 exceeded'
+
+    expect(function()
+      color.tile(8192, 4097)
+    end).toThrow 'magick: MaxWorkingPixels 16777216 exceeded'
+
+    expect(function()
+      color.fromImage(magick.new(4, 4), { left = 2 }, 3, 1)
+    end).toThrow 'magick: fromImage window must lie inside the image'
+  end)
+end)
+
+return suite

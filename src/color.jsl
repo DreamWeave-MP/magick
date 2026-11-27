@@ -1,0 +1,484 @@
+--!strict
+--[[
+@magick/color: premultiplied working tiles and Porter-Duff compositing (RFC-0001 section 8).
+
+A working tile is a rectangle of pixels at a place in device space, each four f32 values (red,
+green, blue, alpha), the colors premultiplied by alpha: 16 bytes a pixel, 256 KiB for a 128 tile.
+Its `space` says what its values mean: `srgb` composites the sRGB-encoded values as legacy `Image`
+and browsers do; `linear` takes the sRGB transfer off on the way in and puts it back on the way out,
+so light adds as light does. A tile's space never changes; `convert` makes a tile of the other.
+
+Legacy `Image`s enter and leave only through `fromImage` and `toImage`. Output bytes are
+`floor(clamp(x, 0, 1) * 255 + 0.5)`; a pixel whose alpha byte is 0 is written as 0, 0, 0, 0
+(RFC-0001 W6), and an sRGB round trip of every straight byte at every alpha from 1 to 255 is exact.
+
+The twelve Porter-Duff operators of W3C Compositing Level 1 are each `result = source * fa +
+backdrop * fb` on premultiplied values, with `fa` and `fb` from the W3C table.
+]]
+local magick = require '@magick'
+
+local Module = {}
+
+export type Space = 'srgb' | 'linear'
+
+--- A premultiplied working tile: `width * height` pixels of four f32 values whose top left pixel is
+--- (`left`, `top`) in device space.
+export type Tile = {
+  width: number,
+  height: number,
+  left: number,
+  top: number,
+  space: Space,
+  data: buffer,
+}
+
+export type Operator =
+  'clear'
+  | 'src'
+  | 'dst'
+  | 'src-over'
+  | 'dst-over'
+  | 'src-in'
+  | 'dst-in'
+  | 'src-out'
+  | 'dst-out'
+  | 'src-atop'
+  | 'dst-atop'
+  | 'xor'
+
+--- Where a tile goes and how it is made: its space, and its top left pixel in device space.
+export type TileOptions = { space: Space?, left: number?, top: number? }
+
+--- What `composite` takes: an operator (`src-over` by default) and an opacity in 0..1 (1).
+export type CompositeOptions = { operator: Operator?, opacity: number? }
+
+--- The widest or tallest tile, and the most pixels one tile holds: 4096 by 4096.
+Module.MaxImageEdge = 8192
+Module.MaxWorkingPixels = 16777216
+
+--- `fa = first + byBackdrop * backdropAlpha` and `fb = second + bySource * sourceAlpha`, per
+--- operator, from the W3C table.
+local Factors: { [string]: { number } } = {
+  clear = { 0, 0, 0, 0 },
+  ['src'] = { 1, 0, 0, 0 },
+  ['dst'] = { 0, 0, 1, 0 },
+  ['src-over'] = { 1, 0, 1, -1 },
+  ['dst-over'] = { 1, -1, 1, 0 },
+  ['src-in'] = { 0, 1, 0, 0 },
+  ['dst-in'] = { 0, 0, 0, 1 },
+  ['src-out'] = { 1, -1, 0, 0 },
+  ['dst-out'] = { 0, 0, 1, -1 },
+  ['src-atop'] = { 0, 1, 1, -1 },
+  ['dst-atop'] = { 1, -1, 0, 1 },
+  xor = { 1, -1, 1, -1 },
+}
+
+local function finite(value: number): boolean
+  return value == value and value > -math.huge and value < math.huge
+end
+
+local function checkSpace(space: string): Space
+  if space ~= 'srgb' and space ~= 'linear' then error(`magick: unknown color space {space}`, 4) end
+
+  return space
+end
+
+local function checkOptions(options: { [string]: unknown }?, known: { [string]: boolean })
+  if not options then return end
+
+  for name in options do
+    if not known[name] then error(`magick: unknown option {name}`, 4) end
+  end
+end
+
+--- The W3C factors of an operator as `fa` and `fb` for a source and backdrop alpha.
+function Module.factors(operator: Operator, sourceAlpha: number, backdropAlpha: number): (number, number)
+  local factor = Factors[operator]
+
+  if not factor then error(`magick: unknown operator {operator}`, 2) end
+
+  return factor[1] + factor[2] * backdropAlpha, factor[3] + factor[4] * sourceAlpha
+end
+
+--- An sRGB-encoded channel in 0..1 as linear light.
+function Module.decode(value: number): number
+  if value <= 0.04045 then return value / 12.92 end
+
+  return ((value + 0.055) / 1.055) ^ 2.4
+end
+
+--- A linear channel in 0..1 as sRGB-encoded.
+function Module.encode(value: number): number
+  if value <= 0.0031308 then return value * 12.92 end
+
+  return 1.055 * value ^ (1 / 2.4) - 0.055
+end
+
+--- Each sRGB byte as linear light, worked out once.
+local Decoded: { number } = table.create(256) :: { number }
+
+for byte = 0, 255 do
+  Decoded[byte + 1] = Module.decode(byte / 255)
+end
+
+--- Where each linear value starts rounding to the next byte: `Thresholds[byte + 1]` is the linear
+--- value whose encoding is `(byte + 0.5) / 255`. The encoding is monotonic, so the byte a linear
+--- value encodes to is how many thresholds lie at or below it, with no power taken per pixel.
+local Thresholds: { number } = table.create(255) :: { number }
+
+for byte = 0, 254 do
+  Thresholds[byte + 1] = Module.decode((byte + 0.5) / 255)
+end
+
+--- The byte at the start of each of 4096 equal bins of linear values: the least byte any value in
+--- the bin encodes to. No bin holds more than two thresholds.
+local Coarse: { number } = table.create(4097) :: { number }
+
+for bin = 0, 4096 do
+  local byte = 0
+
+  while byte < 255 and Thresholds[byte + 1] <= bin / 4096 do
+    byte += 1
+  end
+
+  Coarse[bin + 1] = byte
+end
+
+--- The byte a linear channel in 0..1 encodes to: its bin's least byte, stepped past the thresholds
+--- at or below it.
+@native
+local function linearByte(value: number): number
+  local byte = Coarse[math.floor(value * 4096) + 1]
+
+  while byte < 255 and Thresholds[byte + 1] <= value do
+    byte += 1
+  end
+
+  return byte
+end
+
+--- A straight channel in a space's terms, from its byte.
+local function channelIn(space: Space, byte: number): number
+  if space == 'linear' then return Decoded[byte + 1] end
+
+  return byte / 255
+end
+
+--- A legacy color as premultiplied values in a space: red, green, blue, alpha.
+function Module.premultiplied(color: magick.Color, space: Space?): (number, number, number, number)
+  local channels = magick.color(color)
+  local chosen = checkSpace(space or 'srgb')
+  local bytes = table.create(4) :: { number }
+
+  for index = 1, 4 do
+    local value = channels[index]
+
+    if not finite(value) then error('magick: color channels must be finite', 2) end
+
+    bytes[index] = math.floor(math.clamp(value, 0, 255) + 0.5)
+  end
+
+  local alpha = bytes[4] / 255
+
+  return channelIn(chosen, bytes[1]) * alpha, channelIn(chosen, bytes[2]) * alpha, channelIn(chosen, bytes[3]) * alpha, alpha
+end
+
+local function checkSize(width: number, height: number)
+  for _, value in { width, height } do
+    if not finite(value) or value ~= math.floor(value) or value < 0 then error('magick: tile size must be whole and not negative', 4) end
+    if value > Module.MaxImageEdge then error(`magick: MaxImageEdge {Module.MaxImageEdge} exceeded`, 4) end
+  end
+
+  if width * height > Module.MaxWorkingPixels then error(`magick: MaxWorkingPixels {Module.MaxWorkingPixels} exceeded`, 4) end
+end
+
+local function checkPlace(left: number, top: number)
+  if not finite(left) or not finite(top) or left ~= math.floor(left) or top ~= math.floor(top) then
+    error('magick: a tile must sit at whole pixels', 4)
+  end
+end
+
+local TileKeys = { space = true, left = true, top = true }
+
+--- A transparent tile.
+function Module.tile(width: number, height: number, options: TileOptions?): Tile
+  checkOptions((options :: unknown) :: { [string]: unknown }?, TileKeys)
+  checkSize(width, height)
+
+  local left, top = if options then options.left or 0 else 0, if options then options.top or 0 else 0
+
+  checkPlace(left, top)
+
+  return {
+    width = width,
+    height = height,
+    left = left,
+    top = top,
+    space = checkSpace(if options then options.space or 'srgb' else 'srgb'),
+    data = buffer.create(width * height * 16),
+  }
+end
+
+--- A tile's pixel at a place inside it, counted from its own top left: red, green, blue, alpha.
+function Module.pixel(tile: Tile, column: number, row: number): (number, number, number, number)
+  local at = (row * tile.width + column) * 16
+
+  return buffer.readf32(tile.data, at), buffer.readf32(tile.data, at + 4), buffer.readf32(tile.data, at + 8), buffer.readf32(tile.data, at + 12)
+end
+
+@native
+local function load(source: buffer, sourceWidth: number, data: buffer, width: number, height: number, column: number, row: number, linear: boolean)
+  for line = 0, height - 1 do
+    local from, to = ((row + line) * sourceWidth + column) * 4, line * width * 16
+
+    for _ = 1, width do
+      local alphaByte = buffer.readu8(source, from + 3)
+
+      if alphaByte ~= 0 then
+        local alpha = alphaByte / 255
+        local red, green, blue = buffer.readu8(source, from), buffer.readu8(source, from + 1), buffer.readu8(source, from + 2)
+
+        if linear then
+          buffer.writef32(data, to, Decoded[red + 1] * alpha)
+          buffer.writef32(data, to + 4, Decoded[green + 1] * alpha)
+          buffer.writef32(data, to + 8, Decoded[blue + 1] * alpha)
+        else
+          buffer.writef32(data, to, red / 255 * alpha)
+          buffer.writef32(data, to + 4, green / 255 * alpha)
+          buffer.writef32(data, to + 8, blue / 255 * alpha)
+        end
+
+        buffer.writef32(data, to + 12, alpha)
+      end
+
+      from += 4
+      to += 16
+    end
+  end
+end
+
+--- A tile of a legacy image's pixels: the whole image, or the window `width` by `height` whose top
+--- left pixel is (`left`, `top`), which must lie inside it. The tile sits at that place.
+function Module.fromImage(image: magick.Image, options: TileOptions?, width: number?, height: number?): Tile
+  checkOptions((options :: unknown) :: { [string]: unknown }?, TileKeys)
+
+  local left, top = if options then options.left or 0 else 0, if options then options.top or 0 else 0
+  local wide, tall = width or image.width - left, height or image.height - top
+
+  checkPlace(left, top)
+  checkSize(wide, tall)
+
+  if left < 0 or top < 0 or left + wide > image.width or top + tall > image.height then
+    error('magick: fromImage window must lie inside the image', 2)
+  end
+
+  local tile = Module.tile(wide, tall, { space = if options then options.space else nil, left = left, top = top })
+
+  load(image.data, image.width, tile.data, wide, tall, left, top, tile.space == 'linear')
+
+  return tile
+end
+
+@native
+local function store(
+  data: buffer,
+  stride: number,
+  fromX: number,
+  fromY: number,
+  width: number,
+  height: number,
+  target: buffer,
+  targetWidth: number,
+  column: number,
+  row: number,
+  linear: boolean
+)
+  for line = 0, height - 1 do
+    local from, to = ((fromY + line) * stride + fromX) * 16, ((row + line) * targetWidth + column) * 4
+
+    for _ = 1, width do
+      local alpha = math.clamp(buffer.readf32(data, from + 12), 0, 1)
+      local alphaByte = math.floor(alpha * 255 + 0.5)
+
+      if alphaByte == 0 then
+        buffer.writeu32(target, to, 0)
+      else
+        local red = math.clamp(buffer.readf32(data, from) / alpha, 0, 1)
+        local green = math.clamp(buffer.readf32(data, from + 4) / alpha, 0, 1)
+        local blue = math.clamp(buffer.readf32(data, from + 8) / alpha, 0, 1)
+
+        if linear then
+          buffer.writeu8(target, to, linearByte(red))
+          buffer.writeu8(target, to + 1, linearByte(green))
+          buffer.writeu8(target, to + 2, linearByte(blue))
+        else
+          buffer.writeu8(target, to, math.floor(red * 255 + 0.5))
+          buffer.writeu8(target, to + 1, math.floor(green * 255 + 0.5))
+          buffer.writeu8(target, to + 2, math.floor(blue * 255 + 0.5))
+        end
+        buffer.writeu8(target, to + 3, alphaByte)
+      end
+
+      from += 16
+      to += 4
+    end
+  end
+end
+
+--- Writes a tile into a legacy image as straight RGBA8, replacing the pixels where it sits (by its
+--- `left` and `top`); the part outside the image is left out. Without an image, a new one the
+--- tile's size. Returns the image.
+function Module.toImage(tile: Tile, image: magick.Image?): magick.Image
+  local target = image or magick.new(tile.width, tile.height)
+  local offsetX, offsetY = if image then tile.left else 0, if image then tile.top else 0
+  local fromX, fromY = math.max(0, -offsetX), math.max(0, -offsetY)
+  local toX, toY = math.min(tile.width, target.width - offsetX), math.min(tile.height, target.height - offsetY)
+
+  if toX <= fromX or toY <= fromY then return target end
+
+  store(tile.data, tile.width, fromX, fromY, toX - fromX, toY - fromY, target.data, target.width, offsetX + fromX, offsetY + fromY, tile.space == 'linear')
+
+  return target
+end
+
+--- A tile of the other space with the same pixels, as nearly as f32 holds them.
+function Module.convert(tile: Tile, space: Space): Tile
+  local chosen = checkSpace(space)
+  local out = Module.tile(tile.width, tile.height, { space = chosen, left = tile.left, top = tile.top })
+
+  if chosen == tile.space then
+    buffer.copy(out.data, 0, tile.data)
+
+    return out
+  end
+
+  local transfer = if chosen == 'linear' then Module.decode else Module.encode
+
+  for at = 0, tile.width * tile.height * 16 - 16, 16 do
+    local alpha = buffer.readf32(tile.data, at + 12)
+
+    if alpha <= 0 then continue end
+
+    for channel = 0, 8, 4 do
+      local straight = math.clamp(buffer.readf32(tile.data, at + channel) / alpha, 0, 1)
+
+      buffer.writef32(out.data, at + channel, transfer(straight) * alpha)
+    end
+
+    buffer.writef32(out.data, at + 12, alpha)
+  end
+
+  return out
+end
+
+@native
+local function blend(
+  destination: buffer,
+  destinationWidth: number,
+  source: buffer,
+  sourceWidth: number,
+  width: number,
+  height: number,
+  destinationX: number,
+  destinationY: number,
+  sourceX: number,
+  sourceY: number,
+  factor: { number },
+  opacity: number
+)
+  local first, byBackdrop, second, bySource = factor[1], factor[2], factor[3], factor[4]
+
+  for line = 0, height - 1 do
+    local to = ((destinationY + line) * destinationWidth + destinationX) * 16
+    local from = ((sourceY + line) * sourceWidth + sourceX) * 16
+
+    for _ = 1, width do
+      local sourceAlpha = buffer.readf32(source, from + 12) * opacity
+      local backdropAlpha = buffer.readf32(destination, to + 12)
+      local fa, fb = first + byBackdrop * backdropAlpha, second + bySource * sourceAlpha
+      local alpha = math.clamp(sourceAlpha * fa + backdropAlpha * fb, 0, 1)
+      local sourceFactor = fa * opacity
+
+      for channel = 0, 8, 4 do
+        local value = buffer.readf32(source, from + channel) * sourceFactor + buffer.readf32(destination, to + channel) * fb
+
+        buffer.writef32(destination, to + channel, math.clamp(value, 0, alpha))
+      end
+
+      buffer.writef32(destination, to + 12, alpha)
+      from += 16
+      to += 16
+    end
+  end
+end
+
+--- Scales every pixel of a tile outside a rectangle by `factor`: what an operator does to the
+--- backdrop where the source is transparent.
+local function outside(tile: Tile, left: number, top: number, right: number, bottom: number, factor: number)
+  if factor == 1 then return end
+
+  for line = 0, tile.height - 1 do
+    for place = 0, tile.width - 1 do
+      if line >= top and line < bottom and place >= left and place < right then continue end
+
+      local at = (line * tile.width + place) * 16
+
+      for channel = 0, 12, 4 do
+        buffer.writef32(tile.data, at + channel, buffer.readf32(tile.data, at + channel) * factor)
+      end
+    end
+  end
+end
+
+local CompositeKeys = { operator = true, opacity = true }
+
+--- Composites `source` onto `destination` where they overlap in device space, by an operator, its
+--- alpha first scaled by `opacity`. Where the source does not reach it is transparent, so an
+--- operator that clears under a transparent source (`src`, `src-in`, `dst-in`, `src-out`,
+--- `dst-atop`, `clear`) clears the rest of the destination. Both tiles must be of one space.
+--- Returns the destination.
+function Module.composite(destination: Tile, source: Tile, options: CompositeOptions?): Tile
+  checkOptions((options :: unknown) :: { [string]: unknown }?, CompositeKeys)
+
+  if destination.space ~= source.space then error('magick: tiles of different spaces do not composite; convert one first', 2) end
+
+  local operator: string = 'src-over'
+
+  if options and options.operator then operator = options.operator end
+
+  local factor = Factors[operator]
+
+  if not factor then error(`magick: unknown operator {operator}`, 2) end
+
+  local opacity = if options then options.opacity or 1 else 1
+
+  if not finite(opacity) or opacity < 0 or opacity > 1 then error('magick: opacity must be in 0..1', 2) end
+
+  local left = math.max(destination.left, source.left)
+  local top = math.max(destination.top, source.top)
+  local right = math.min(destination.left + destination.width, source.left + source.width)
+  local bottom = math.min(destination.top + destination.height, source.top + source.height)
+
+  if right > left and bottom > top then
+    blend(
+      destination.data,
+      destination.width,
+      source.data,
+      source.width,
+      right - left,
+      bottom - top,
+      left - destination.left,
+      top - destination.top,
+      left - source.left,
+      top - source.top,
+      factor,
+      opacity
+    )
+  end
+
+  outside(destination, left - destination.left, top - destination.top, right - destination.left, bottom - destination.top, factor[3])
+
+  return destination
+end
+
+return Module

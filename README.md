@@ -86,6 +86,29 @@ the path's own space (RFC-0001 SK1 to SK7):
 A subpath is closed for a stroke only when `close()` closed it; one ended by `moveTo`, `mask()` or `stroked()` is open,
 and fills as closed, as in SVG. A subpath of two points is kept for strokes; it never filled and still does not.
 
+### `@magick/color`: working tiles and Porter-Duff
+
+A working tile is `{ width, height, left, top, space, data }`: premultiplied RGBA as f32, 16 bytes a pixel, placed at
+(`left`, `top`) in device space. `space` is `srgb` (the default; composites encoded values, as legacy `Image` and
+browsers do) or `linear` (the sRGB transfer taken off on entry and put back on output).
+
+- `color.tile(width, height, { space?, left?, top? })`: transparent. Caps: `MaxImageEdge` 8192 a side and
+  `MaxWorkingPixels` 2^24 a tile.
+- `color.fromImage(image, { space?, left?, top? }?, width?, height?)` and `color.toImage(tile, image?)`: the only way
+  in and out of legacy `Image`s. Output bytes are `floor(clamp(x, 0, 1) * 255 + 0.5)`, in linear space through exact
+  rounding thresholds; a pixel whose alpha byte is 0 is written `0, 0, 0, 0`. Every straight byte at every alpha
+  1..255 round-trips exactly in both spaces (`tests/color.jsl`).
+- `color.convert(tile, space)`, `color.premultiplied(color, space?)`, `color.decode`, `color.encode`,
+  `color.pixel(tile, column, row)`.
+- `color.composite(destination, source, { operator?, opacity? })`: the twelve W3C Porter-Duff operators (`clear`,
+  `src`, `dst`, `src-over` (default), `dst-over`, `src-in`, `dst-in`, `src-out`, `dst-out`, `src-atop`, `dst-atop`,
+  `xor`), aligned by device position. Where the source does not reach it counts as transparent, so `src`, `src-in`,
+  `dst-in`, `src-out`, `dst-atop` and `clear` clear the rest of the destination. `opacity` scales the source once.
+  `color.factors(operator, as, ab)` gives the W3C `fa, fb`. Tiles of different spaces are refused.
+
+Legacy `Image:over`, `Image:screen`, `Image:darken` and the rest keep their straight-alpha RGBA8 arithmetic and their
+goldens; the working tile is a separate, opt-in substrate.
+
 ## Gates
 
 `tests/gate.jsl` holds the package to tiny exact fixtures (transparency, clipping, alpha, curves,

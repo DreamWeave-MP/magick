@@ -9,6 +9,7 @@
 -- other work, fails here instead of posting a time. With `record` the fingerprints are printed as
 -- lines of the table below instead of being checked.
 local bytes = require '@dream/bytes'
+local color = require '@magick/color'
 local fs = require '@dream/fs'
 local magick = require '@magick'
 local path = require '@magick/path'
@@ -107,6 +108,9 @@ local Expected: { [string]: string } = {
   ['path circle'] = '256x256:26ce06c3',
   ['path polyline'] = '256x256:27f77e3b',
   ['path ring mask'] = '502x502:0670b011',
+  ['color round trip srgb'] = '256x256:697e4511',
+  ['color round trip linear'] = '256x256:697e4511',
+  ['color composite src-over'] = '256x256:96da56e7',
   ['coverageIn ring nonzero'] = '512x512:a92f984b',
   ['coverageIn ring evenodd'] = '512x512:a92f984b',
   ['coverageIn ring tiles 128'] = '512x512:a92f984b',
@@ -425,6 +429,20 @@ local Zigzag = [for step in range(0, 8) => { 16 + step * 28, if step % 2 == 0 th
 workload('path circle', function() return path.new():circle(128, 128, 120):fill(freshHalf(half), '#da96e0') end)
 workload('path polyline', function() return path.new():polyline(Zigzag, 9, 'round'):fill(freshHalf(half), '#ffe6ff') end)
 workload('path ring mask', function() return (path.new():ring(256, 256, 250, 200):mask()) end)
+
+-- 0.2.0 working tiles: a 256 picture in and out of premultiplied f32 in each space, and one tile
+-- composited over another by src-over.
+local halfTile, otherTile = color.fromImage(half), color.fromImage(halfOther)
+
+workload('color round trip srgb', function() return color.toImage(color.fromImage(half)) end)
+workload('color round trip linear', function() return color.toImage(color.fromImage(half, { space = 'linear' })) end)
+workload('color composite src-over', function()
+  local destination = color.tile(halfTile.width, halfTile.height)
+
+  buffer.copy(destination.data, 0, otherTile.data)
+
+  return color.toImage(color.composite(destination, halfTile, { opacity = 0.75 }))
+end)
 
 -- The 0.2.0 coverage of the same ring, by each fill rule, single-shot and as 128-pixel tiles laid
 -- into one mask, which must give the single-shot bytes. Not comparable with the row above: that is
